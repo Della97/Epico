@@ -1,0 +1,19 @@
+# /Cargo.toml
+[workspace]
+members = [
+    "epico-cli",
+    "epico-sdk",
+    "epico-core/master",
+    "epico-core/dispatcher",
+    "epico-core/logger",
+    "epico-loadgen",
+]
+resolver = "2"
+
+# Generated stage crates (produced by `epico build` under target/epico/)
+# are a separate workspace because they target wasm32-wasip2.
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+debug = "line-tables-only"

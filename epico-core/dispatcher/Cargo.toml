@@ -1,0 +1,23 @@
+[package]
+name = "dispatcher"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "dispatcher"
+path = "src/dispatcher.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+parking_lot = "0.12"
+uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+zmq = "0.10"
+ctrlc = "3"
+epico-logger = { path = "../logger" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

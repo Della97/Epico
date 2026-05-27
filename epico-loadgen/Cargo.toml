@@ -1,0 +1,19 @@
+[package]
+name    = "epico-loadgen"
+version = "0.1.0"
+edition = "2021"
+description = "IoT sensor stream load generator for epico pipelines"
+
+[[bin]]
+name = "epico-loadgen"
+path = "src/main.rs"
+
+[dependencies]
+epico-logger = { path = "../epico-core/logger" }
+clap       = { version = "4", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+zmq        = "0.10"
+rand       = "0.8"
+ctrlc      = "3"
+anyhow     = "1"

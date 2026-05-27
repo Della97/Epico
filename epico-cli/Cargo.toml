@@ -1,0 +1,35 @@
+[package]
+name = "epico-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI for building and running Epico pipelines from a single YAML spec"
+
+[[bin]]
+name = "epico"
+path = "src/main.rs"
+
+[dependencies]
+# Argument parsing — subcommand-style with derive
+clap = { version = "4", features = ["derive"] }
+
+# YAML parsing for pipeline.yaml (both old and new format)
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+# Error handling
+anyhow = "1"
+
+# Signal handling for orchestrated runs (agent + loadgen).
+ctrlc = "3"
+
+# Temp paths for the readiness-file handshake between CLI and agent.
+tempfile = "3"
+
+# AOT precompilation — must use the same version as epico-core/master
+# so that Engine::precompile_component produces artifacts that
+# Component::deserialize_file in the agent will accept.
+wasmtime = { version = "26.0.1", features = ["cranelift", "component-model"] }
+
+# POSIX signal forwarding (SIGINT to child processes) for orchestrated runs.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

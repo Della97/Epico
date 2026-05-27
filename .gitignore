@@ -1,0 +1,46 @@
+# Compilation artifacts
+/target/
+target/
+
+# Plots - ignore everything except Python scripts
+/plots/*
+!/plots/*.py
+!/plots/ablation_test/
+plots/ablation_test/*
+!plots/ablation_test/plot.py
+!plots/ablation_test/ablation.sh
+
+# Deprecated code
+/deprecated/
+
+# Pub folder
+/publications/
+
+# Prog folder
+/prog/
+
+# Sweep datas
+/sweep/
+
+# Rust build artifacts
+**/*.rs.bk
+Cargo.lock
+
+# Logs and runtime output
+**/*.jsonl
+**/*.log
+examples/*/logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment files
+.env
+.env.*

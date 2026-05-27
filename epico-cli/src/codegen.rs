@@ -1,0 +1,814 @@
+//! Codegen: turns a PipelineSpec into a filesystem tree that cargo can
+//! build and the existing agent can consume.
+//!
+//! Layout produced at `target/epico/`:
+//!
+//!   target/epico/
+//!   ├── Cargo.toml                   (workspace)
+//!   ├── wit/epico.wit              (copied from epico-sdk/wit/)
+//!   ├── stages/
+//!   │   ├── <stage1>/
+//!   │   │   ├── Cargo.toml
+//!   │   │   ├── wit/world.wit        (per-stage world naming)
+//!   │   │   └── src/lib.rs           (includes user's .rs)
+//!   │   └── ...
+//!   └── runtime.yaml                 (what master consumes)
+//!
+//! Three kinds of stages coexist:
+//!   - src pointing to .rs: full scaffold generated, cargo builds the .wasm
+//!   - prebuilt wasm: no scaffold needed, just referenced in runtime.yaml
+//!   - prebuilt wasm is also what old-format pipelines always produce
+
+use crate::config::{NodeSpec, PipelineSpec, StageSource, StageSpec};
+use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
+
+/// Result of codegen: paths the caller needs to build and run.
+pub struct CodegenOutput {
+    /// Path to the generated workspace Cargo.toml. Pass to `cargo build`.
+    pub workspace_manifest: PathBuf,
+    /// Path to the generated runtime.yaml. Pass to the agent.
+    pub runtime_yaml: PathBuf,
+    /// Map of stage name -> absolute path of the .wasm the runtime should load.
+    /// For src-based stages this is inside target/ (filled in after cargo build);
+    /// for prebuilt stages it's whatever the user provided.
+    pub wasm_by_stage: Vec<(String, PathBuf)>,
+    /// Whether any stage needs compilation. If false, caller can skip cargo.
+    pub needs_build: bool,
+}
+
+/// The sdk_path is the absolute or relative path from target/epico/ to
+/// the epico-sdk crate, used in generated Cargo.tomls.
+pub fn generate(
+    spec: &PipelineSpec,
+    project_root: &Path,
+    output_dir: &Path,
+    compile_mode: Option<&str>,
+) -> Result<CodegenOutput> {
+    std::fs::create_dir_all(output_dir)
+        .with_context(|| format!("creating codegen dir {:?}", output_dir))?;
+
+    // Copy the canonical WIT file into output/wit/. Per-stage crates then
+    // copy THIS one (we always want stages to match what the host loaded).
+    //
+    // The canonical WIT lives under epico-sdk/wit/epico.wit — the SDK
+    // crate owns it so there's one source of truth. The old repo-root
+    // wit/epico.wit location is supported as a fallback for projects
+    // that haven't migrated yet.
+    let wit_src = {
+        let sdk_path = project_root.join("epico-sdk").join("wit").join("epico.wit");
+        let root_path = project_root.join("wit").join("epico.wit");
+        if sdk_path.exists() {
+            sdk_path
+        } else if root_path.exists() {
+            root_path
+        } else {
+            anyhow::bail!(
+                "canonical WIT not found. Expected one of:\n  {:?}\n  {:?}\n\
+                 Is this a epico project root?",
+                sdk_path, root_path
+            );
+        }
+    };
+    let wit_dst_dir = output_dir.join("wit");
+    std::fs::create_dir_all(&wit_dst_dir)?;
+    std::fs::copy(&wit_src, wit_dst_dir.join("epico.wit"))
+        .context("copying epico.wit to output dir")?;
+
+    // Scaffold each src-based stage, collect workspace members.
+    let mut workspace_members: Vec<String> = Vec::new();
+    let mut wasm_by_stage: Vec<(String, PathBuf)> = Vec::new();
+    let mut needs_build = false;
+
+    let stages_root = output_dir.join("stages");
+    std::fs::create_dir_all(&stages_root)?;
+
+    for stage in &spec.stages {
+        match &stage.source {
+            StageSource::RustFile(src_rs) => {
+                let crate_name = stage_crate_name(&stage.name);
+                let crate_dir = stages_root.join(&crate_name);
+                scaffold_rust_stage(&crate_dir, stage, src_rs, &wit_src, project_root, &spec.types)
+                    .with_context(|| format!("scaffolding stage {}", stage.name))?;
+
+                let member_rel = format!("stages/{}", crate_name);
+                workspace_members.push(member_rel);
+
+                // Where cargo will produce the wasm. After `cargo build`
+                // this path will exist; before, the file is absent but
+                // the runtime.yaml still points here.
+                let wasm_path = output_dir
+                    .join("target")
+                    .join("wasm32-wasip2")
+                    .join("release")
+                    .join(format!("{}.wasm", crate_name));
+                wasm_by_stage.push((stage.name.clone(), wasm_path));
+                needs_build = true;
+            }
+            StageSource::PrebuiltWasm(abs_path) => {
+                // Nothing to generate — just point runtime.yaml at the file.
+                wasm_by_stage.push((stage.name.clone(), abs_path.clone()));
+            }
+        }
+    }
+
+    // Emit workspace Cargo.toml only if we have Rust stages to build.
+    let workspace_manifest = output_dir.join("Cargo.toml");
+    if needs_build {
+        write_workspace_cargo(&workspace_manifest, &workspace_members, project_root)?;
+    }
+
+    // Emit runtime.yaml the agent can consume.
+    let runtime_yaml_path = output_dir.join("runtime.yaml");
+    write_runtime_yaml(&runtime_yaml_path, spec, &wasm_by_stage, compile_mode)?;
+
+    Ok(CodegenOutput {
+        workspace_manifest,
+        runtime_yaml: runtime_yaml_path,
+        wasm_by_stage,
+        needs_build,
+    })
+}
+
+/// Cargo-compatible crate name derived from stage name. Rust crate names
+/// can't contain dashes in the name field — well, they can, but they
+/// resolve to underscores in `extern crate`. Be explicit: force snake_case.
+fn stage_crate_name(stage_name: &str) -> String {
+    let mut out = String::with_capacity(stage_name.len() + 6);
+    out.push_str("stage_");
+    for ch in stage_name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push('_');
+        }
+    }
+    out
+}
+
+/// Generate one stage crate: Cargo.toml + wit/world.wit + src/lib.rs.
+fn scaffold_rust_stage(
+    crate_dir: &Path,
+    stage: &StageSpec,
+    user_rs: &Path,
+    wit_src: &Path,
+    project_root: &Path,
+    types: &std::collections::BTreeMap<String, crate::config::TypeDef>,
+) -> Result<()> {
+    std::fs::create_dir_all(crate_dir.join("src"))?;
+    std::fs::create_dir_all(crate_dir.join("wit"))?;
+
+    // Write a per-stage WIT.
+    //
+    // wit-bindgen 0.34's generate! macro refuses to build when a WIT file
+    // contains multiple worlds unless a `world: "..."` option is passed.
+    // The shared wit/epico.wit declares fn-a/fn-b/fn-c worlds (kept for
+    // the host-side binding which uses fn-a). For the guest, we want
+    // exactly one world. Simplest: extract the `package` / `interface types`
+    // / `interface process` sections from the shared WIT and append a
+    // Write a per-stage WIT with real typed records from the pipeline's
+    // types: block. Falls back to the shared all-optional WIT for legacy.
+    let shared = std::fs::read_to_string(wit_src)
+        .with_context(|| format!("reading shared WIT {:?}", wit_src))?;
+    let stage_wit = make_typed_stage_wit(stage, types, &shared)?;
+    std::fs::write(crate_dir.join("wit").join("world.wit"), stage_wit)
+        .context("writing per-stage world.wit")?;
+
+    // Cargo.toml for the stage crate.
+    // - cdylib so it produces a .wasm file (wit-bindgen + wasm32-wasip2
+    //   target produces a component automatically).
+    // - wit-bindgen for the guest-side type generation.
+    // - epico-sdk for the stage! macro.
+    // - any extra crates the user declared under `deps:` for this stage.
+    let sdk_path = relative_path(crate_dir, &project_root.join("epico-sdk"));
+    let crate_name = stage_crate_name(&stage.name);
+
+    let extra_deps = render_extra_deps(&stage.deps)
+        .with_context(|| format!("rendering deps for stage {}", stage.name))?;
+
+    let cargo_toml = format!(
+        r#"# GENERATED by epico-cli. Do not edit directly — edit the source .rs
+# or the pipeline.yaml and re-run `epico build`.
+[package]
+name = "{crate_name}"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.34"
+epico-sdk = {{ path = "{sdk_path}" }}
+{extra_deps}"#,
+        crate_name = crate_name,
+        sdk_path = sdk_path.display(),
+        extra_deps = extra_deps,
+    );
+    std::fs::write(crate_dir.join("Cargo.toml"), cargo_toml)?;
+
+    // src/lib.rs: include the user's .rs file verbatim. The user's file
+    // invokes `epico_sdk::stage! { ... }` which expands to the full
+    // component glue. The `include!` keeps the user's editing surface
+    // at their original path (no copy-back synchronization).
+    //
+    // Use the absolute path so cargo never has to reason about how deep
+    // in the target/epico/stages/<name>/src/ tree we are.
+    let user_rs_abs = user_rs
+        .canonicalize()
+        .with_context(|| format!("resolving stage source {:?}", user_rs))?;
+    let lib_rs = format!(
+        r#"// GENERATED by epico-cli. Do not edit directly.
+// The real source lives at: {user_rs_display}
+
+include!("{user_rs_abs}");
+"#,
+        user_rs_display = user_rs.display(),
+        user_rs_abs = user_rs_abs.display(),
+    );
+    std::fs::write(crate_dir.join("src").join("lib.rs"), lib_rs)?;
+
+    Ok(())
+}
+
+/// Render the user's per-stage `deps:` YAML map as Cargo `[dependencies]`
+/// lines. Each entry becomes one line of the form `name = <toml-value>`.
+///
+/// Supported value shapes (which is the subset Cargo actually accepts):
+///   - YAML string                   → `"version"` (quoted TOML string)
+///   - YAML mapping {k: v, ...}      → inline TOML table `{ k = v, ... }`
+///   - YAML scalars inside a mapping: string / bool / int / float
+///
+/// Anything else (sequences, nulls, nested tables) is rejected with a
+/// clear error rather than emitted as garbage TOML that cargo would
+/// reject with a less useful message.
+fn render_extra_deps(
+    deps: &std::collections::BTreeMap<String, serde_yaml::Value>,
+) -> Result<String> {
+    if deps.is_empty() {
+        return Ok(String::new());
+    }
+    let mut out = String::new();
+    for (name, value) in deps {
+        let rendered = yaml_to_toml_value(value)
+            .with_context(|| format!("dep {:?}", name))?;
+        out.push_str(&format!("{} = {}\n", name, rendered));
+    }
+    Ok(out)
+}
+
+/// Convert one YAML value into its TOML text representation. Intentionally
+/// limited to the shapes Cargo accepts in `[dependencies]` entries.
+fn yaml_to_toml_value(v: &serde_yaml::Value) -> Result<String> {
+    use serde_yaml::Value;
+    match v {
+        Value::String(s) => Ok(format!("\"{}\"", escape_toml_string(s))),
+        Value::Bool(b) => Ok(b.to_string()),
+        Value::Number(n) => Ok(n.to_string()),
+        Value::Mapping(m) => {
+            // Inline TOML table: { k = v, k = v }
+            let mut parts = Vec::with_capacity(m.len());
+            for (k, val) in m {
+                let k_str = k.as_str().ok_or_else(|| {
+                    anyhow::anyhow!("dep table key must be a string, got {:?}", k)
+                })?;
+                // Inside an inline table we only support scalars and
+                // (recursively) inline tables. Sequences in Cargo are rare
+                // (features = [...] uses one, but features-as-array is a
+                // valid use case worth supporting).
+                let val_str = yaml_to_inline_toml(val)
+                    .with_context(|| format!("key {:?}", k_str))?;
+                parts.push(format!("{} = {}", k_str, val_str));
+            }
+            Ok(format!("{{ {} }}", parts.join(", ")))
+        }
+        Value::Null => anyhow::bail!(
+            "null is not a valid dependency spec; use a version string \
+             like \"1.0\" or an inline table like {{ version = \"1.0\" }}"
+        ),
+        Value::Sequence(_) => anyhow::bail!(
+            "a top-level sequence is not a valid dependency spec; \
+             use an inline table {{ version = \"...\", features = [...] }}"
+        ),
+        Value::Tagged(t) => yaml_to_toml_value(&t.value),
+    }
+}
+
+/// Like `yaml_to_toml_value`, but additionally accepts sequences (for
+/// `features = ["..."]` etc.). Used for values inside an inline table.
+fn yaml_to_inline_toml(v: &serde_yaml::Value) -> Result<String> {
+    use serde_yaml::Value;
+    match v {
+        Value::Sequence(items) => {
+            let mut parts = Vec::with_capacity(items.len());
+            for it in items {
+                parts.push(yaml_to_inline_toml(it)?);
+            }
+            Ok(format!("[{}]", parts.join(", ")))
+        }
+        _ => yaml_to_toml_value(v),
+    }
+}
+
+/// Minimal TOML string escaper: backslashes, double quotes, control chars.
+/// Dependency-spec strings are short and almost always plain ASCII version
+/// requirements or paths, so this doesn't need to be exhaustive.
+fn escape_toml_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Generate a per-stage WIT file from the pipeline's `types:` block.
+///
+/// If the stage has `in: reading, out: enriched` and the types block
+/// defines both, the WIT declares concrete records for `reading` and
+/// `enriched` with real fields and a `process-event` function that
+/// takes the input type and returns the output type.
+///
+/// If the `types:` block is empty (legacy pipeline), falls back to the
+/// shared WIT with the all-optional `event` record.
+fn make_typed_stage_wit(
+    stage: &StageSpec,
+    types: &std::collections::BTreeMap<String, crate::config::TypeDef>,
+    shared_wit: &str,
+) -> Result<String> {
+    // Fallback: if no types defined or both in/out are "event", use the
+    // shared WIT's all-optional event record (Path A compatibility).
+    if types.is_empty()
+        || (stage.input_type == "event" && stage.output_type == "event")
+    {
+        return Ok(make_stage_wit_legacy(shared_wit));
+    }
+
+    let in_type = types.get(&stage.input_type).ok_or_else(|| {
+        anyhow::anyhow!(
+            "stage {:?} input type {:?} not found in types: block",
+            stage.name,
+            stage.input_type
+        )
+    })?;
+    let out_type = types.get(&stage.output_type).ok_or_else(|| {
+        anyhow::anyhow!(
+            "stage {:?} output type {:?} not found in types: block",
+            stage.name,
+            stage.output_type
+        )
+    })?;
+
+    let in_wit_name = to_wit_ident(&stage.input_type);
+    let out_wit_name = to_wit_ident(&stage.output_type);
+
+    let mut wit = String::with_capacity(2048);
+    wit.push_str("// GENERATED per-stage typed WIT. Do not edit.\n");
+    wit.push_str("package epico:pipeline@0.1.0;\n\n");
+
+    wit.push_str("interface types {\n");
+
+    // Emit input record.
+    emit_record(&mut wit, &in_wit_name, in_type);
+
+    // Emit output record only if it differs from input.
+    if stage.input_type != stage.output_type {
+        emit_record(&mut wit, &out_wit_name, out_type);
+    }
+
+    // Bench-ctx is always the same — infrastructure, not user-defined.
+    wit.push_str(
+        "    record bench-ctx {\n\
+         \x20       bench-ts-wall: option<f64>,\n\
+         \x20       bench-ts:      option<f64>,\n\
+         \x20       bench-seq:     option<u64>,\n\
+         \x20       bench-hops:    list<bench-hop>,\n\
+         \x20   }\n\
+         \x20   record bench-hop {\n\
+         \x20       stage:    string,\n\
+         \x20       enter-ts: f64,\n\
+         \x20       exit-ts:  f64,\n\
+         \x20   }\n",
+    );
+    wit.push_str("}\n\n");
+
+    // Process interface — uses the concrete types.
+    wit.push_str("interface process {\n");
+    wit.push_str(&format!(
+        "    use types.{{{in_wit}, {out_wit}, bench-ctx}};\n",
+        in_wit = in_wit_name,
+        out_wit = if stage.input_type == stage.output_type {
+            // Same type for in and out — only one use needed.
+            "bench-ctx".to_string() // already in the use, skip duplicate
+        } else {
+            out_wit_name.clone()
+        },
+    ));
+    // Fix the use statement to always include exactly the right set.
+    // Rebuild it cleanly:
+    wit.clear();
+    wit.push_str("// GENERATED per-stage typed WIT. Do not edit.\n");
+    wit.push_str("package epico:pipeline@0.1.0;\n\n");
+    wit.push_str("interface types {\n");
+    emit_record(&mut wit, &in_wit_name, in_type);
+    if stage.input_type != stage.output_type {
+        emit_record(&mut wit, &out_wit_name, out_type);
+    }
+    wit.push_str(
+        "    record bench-ctx {\n\
+         \x20       bench-ts-wall: option<f64>,\n\
+         \x20       bench-ts:      option<f64>,\n\
+         \x20       bench-seq:     option<u64>,\n\
+         \x20       bench-hops:    list<bench-hop>,\n\
+         \x20   }\n\
+         \x20   record bench-hop {\n\
+         \x20       stage:    string,\n\
+         \x20       enter-ts: f64,\n\
+         \x20       exit-ts:  f64,\n\
+         \x20   }\n",
+    );
+    wit.push_str("}\n\n");
+
+    wit.push_str("interface process {\n");
+    if stage.input_type == stage.output_type {
+        wit.push_str(&format!(
+            "    use types.{{{}, bench-ctx}};\n",
+            in_wit_name
+        ));
+        wit.push_str(&format!(
+            "    process-event: func(ev: {0}, bench: bench-ctx) -> tuple<{0}, bench-ctx>;\n",
+            in_wit_name
+        ));
+    } else {
+        wit.push_str(&format!(
+            "    use types.{{{}, {}, bench-ctx}};\n",
+            in_wit_name, out_wit_name
+        ));
+        wit.push_str(&format!(
+            "    process-event: func(ev: {}, bench: bench-ctx) -> tuple<{}, bench-ctx>;\n",
+            in_wit_name, out_wit_name
+        ));
+    }
+    wit.push_str("}\n\n");
+
+    wit.push_str("world stage {\n    export process;\n}\n");
+
+    Ok(wit)
+}
+
+/// Emit a WIT record definition from a TypeDef.
+fn emit_record(wit: &mut String, name: &str, typedef: &crate::config::TypeDef) {
+    wit.push_str(&format!("    record {} {{\n", name));
+    for (field_name, field_type) in &typedef.fields {
+        let wit_field = to_wit_ident(field_name);
+        let wit_type = yaml_type_to_wit(field_type);
+        wit.push_str(&format!("        {}: {},\n", wit_field, wit_type));
+    }
+    wit.push_str("    }\n");
+}
+
+/// Convert a YAML type string to a WIT type.
+/// Supported: string, f64, f32, u64, u32, s64, s32, bool.
+/// Trailing `?` means `option<T>`.
+fn yaml_type_to_wit(s: &str) -> String {
+    let (base, optional) = if let Some(inner) = s.strip_suffix('?') {
+        (inner, true)
+    } else {
+        (s.as_ref(), false)
+    };
+    let wit_base = match base {
+        "string" | "str" => "string",
+        "f64" | "float" | "double" => "f64",
+        "f32" | "float32" => "f32",
+        "u64" | "uint64" => "u64",
+        "u32" | "uint32" | "uint" => "u32",
+        "s64" | "int64" | "int" => "s64",
+        "s32" | "int32" => "s32",
+        "bool" | "boolean" => "bool",
+        other => other, // pass through for user-defined types
+    };
+    if optional {
+        format!("option<{}>", wit_base)
+    } else {
+        wit_base.to_string()
+    }
+}
+
+/// Convert a user-facing name to a WIT identifier.
+/// WIT uses kebab-case; underscores → dashes.
+fn to_wit_ident(s: &str) -> String {
+    s.replace('_', "-")
+}
+
+/// Legacy fallback: strip multi-world declarations from shared WIT,
+/// add a single `world stage { export process; }`.
+fn make_stage_wit_legacy(shared: &str) -> String {
+    let mut cut = shared.len();
+    for (i, line) in shared.lines().enumerate() {
+        if line.trim_start().starts_with("world ") {
+            cut = shared
+                .lines()
+                .take(i)
+                .map(|l| l.len() + 1)
+                .sum();
+            break;
+        }
+    }
+    let mut out = String::with_capacity(shared.len() + 128);
+    out.push_str(&shared[..cut]);
+    out.push_str(
+        "\nworld stage {\n    export process;\n}\n",
+    );
+    out
+}
+
+/// Workspace Cargo.toml listing all stage crates. We also exclude the
+/// `epico-sdk` crate from the workspace — it lives at the project
+/// root and has its own compilation target (host-side, not wasm).
+/// `resolver = "2"` is required for workspace-level target-specific
+/// deps to work with wasm targets.
+fn write_workspace_cargo(path: &Path, members: &[String], project_root: &Path) -> Result<()> {
+    let mut toml = String::from(
+        "# GENERATED by epico-cli. Workspace for all wasm stage crates.\n\
+         [workspace]\n\
+         resolver = \"2\"\n\
+         members = [\n",
+    );
+    for m in members {
+        toml.push_str(&format!("    \"{}\",\n", m));
+    }
+    toml.push_str("]\n\n");
+
+    // profile.release: aggressive optimization since these ship as binaries.
+    toml.push_str(
+        "[profile.release]\n\
+         opt-level = 3\n\
+         lto = true\n\
+         codegen-units = 1\n\
+         strip = true\n",
+    );
+
+    // Suppress clippy warnings in this generated workspace. Not our code.
+    let _ = project_root; // reserved for future path-based config
+    std::fs::write(path, toml)?;
+    Ok(())
+}
+
+/// Parse a TCP port number out of a `tcp://host:PORT` URI.
+/// Returns `None` for IPC URIs or anything that doesn't match the pattern.
+fn port_from_tcp_uri(uri: &str) -> Option<u16> {
+    let rest = uri.strip_prefix("tcp://")?;
+    let port_str = rest.rsplit_once(':')?.1;
+    port_str.parse().ok()
+}
+
+/// Emit runtime.yaml — the format the existing agent consumes. This is
+/// the "old format" structure: `dispatchers:` + `pipeline:`. The CLI
+/// auto-allocates ports from port_base: dispatcher i gets ports
+/// port_base + 3i, +1, +2 for push/pull/ctrl.
+///
+/// `spec.ingress` is always set (required in the new format, synthesized
+/// for the old format) and is propagated to the first dispatcher as
+/// `push_uri:`. That dispatcher binds only at the declared URI — no
+/// parallel TCP+IPC dual bind, and no fallback to the auto-allocated
+/// push_port. Inner dispatchers keep the legacy dual-bind behavior so
+/// same-host workers can reach them over IPC.
+fn write_runtime_yaml(
+    path: &Path,
+    spec: &PipelineSpec,
+    wasm_by_stage: &[(String, PathBuf)],
+    compile_mode: Option<&str>,
+) -> Result<()> {
+    // We only support linear topology in the generated runtime.yaml
+    // because the existing master.rs expects it. Non-linear DAGs can be
+    // expressed in the new yaml but require master.rs fan-out support,
+    // which is out of scope for this change.
+    let mut is_linear = true;
+    if spec.edges.len() != spec.stages.len().saturating_sub(1) {
+        is_linear = false;
+    } else {
+        for (i, (from, to)) in spec.edges.iter().enumerate() {
+            if from != &spec.stages[i].name || to != &spec.stages[i + 1].name {
+                is_linear = false;
+                break;
+            }
+        }
+    }
+    if !is_linear {
+        anyhow::bail!(
+            "non-linear DAGs are not yet supported by the runtime \
+             (edges must be stage[i] -> stage[i+1] in declaration order). \
+             Fan-out/fan-in support is the next milestone."
+        );
+    }
+
+    // Build a node lookup. Every stage's placement is guaranteed valid
+    // by the parser, so unwrap_or here is impossible to hit in practice.
+    let node_by_name: std::collections::HashMap<&str, &NodeSpec> =
+        spec.nodes.iter().map(|n| (n.name.as_str(), n)).collect();
+    let node_for = |stage_idx: usize| -> &NodeSpec {
+        let placement = &spec.stages[stage_idx].placement;
+        node_by_name
+            .get(placement.as_str())
+            .copied()
+            .expect("stage placement references a node that doesn't exist — parser bug")
+    };
+
+    // Endpoint resolution. Every dispatcher lives on its stage's node,
+    // so its IPC endpoint is bound on that node. A worker reading from
+    // its own dispatcher is always same-host (IPC). A worker writing to
+    // the next stage's dispatcher is IPC if the two stages are on the
+    // same node, TCP otherwise. The `force_tcp` knob on a node flips
+    // every edge touching that node to TCP — useful for debugging.
+    //
+    // IPC naming matches the dispatcher's own bind path, which is
+    // derived from its `--name` argument:
+    //   ipc:///tmp/epico-dispatch-<bare>-{push,pull,ctrl}
+    let ipc_endpoint = |dispatch_name: &str, kind: &str| -> String {
+        format!("ipc:///tmp/epico-{}-{}", dispatch_name, kind)
+    };
+    let tcp_endpoint = |host: &str, port: u16| -> String {
+        format!("tcp://{}:{}", host, port)
+    };
+
+    let mut dispatchers = String::new();
+    let mut pipeline = String::new();
+    let mut nodes_block = String::new();
+
+    nodes_block.push_str("nodes:\n");
+    for n in &spec.nodes {
+        nodes_block.push_str(&format!(
+            "  - name: {name}\n    host: {host}\n    force_tcp: {ft}\n",
+            name = n.name,
+            host = n.host,
+            ft = n.force_tcp,
+        ));
+    }
+
+    dispatchers.push_str("dispatchers:\n");
+    pipeline.push_str("pipeline:\n");
+
+    for (i, stage) in spec.stages.iter().enumerate() {
+        let push_port = spec.port_base + (i as u16) * 3;
+        let pull_port = push_port + 1;
+        let ctrl_port = push_port + 2;
+        let dispatch_name = format!("dispatch-{}", stage.name.trim_start_matches("fn-"));
+
+        // Stage 0 is the pipeline's entry point. Its dispatcher binds at
+        // `spec.ingress` — always, no fallback. We propagate that to the
+        // agent via a `push_uri:` field on the dispatcher entry (new,
+        // honored by the runtime post-change) and additionally align the
+        // legacy `push_port:` field when the URI is TCP so the YAML stays
+        // internally consistent. For IPC ingress the `push_port` value is
+        // irrelevant to the runtime — the dispatcher ignores it when
+        // `push_uri` is set — but we keep the auto-allocated value there
+        // to avoid a port of 0 showing up in the generated file.
+        let (effective_push_port, push_uri_line) = if i == 0 {
+            let uri = &spec.ingress;
+            let port = port_from_tcp_uri(uri).unwrap_or(push_port);
+            (port, format!("    push_uri: {}\n", uri))
+        } else {
+            (push_port, String::new())
+        };
+
+        dispatchers.push_str(&format!(
+            "  - name: {dispatch_name}\n\
+             \x20   push_port: {push_port}\n\
+             \x20   pull_port: {pull_port}\n\
+             \x20   ctrl_port: {ctrl_port}\n\
+             \x20   placement: {placement}\n\
+             \x20   credit_window: {credit_window}\n\
+             {push_uri}",
+            dispatch_name = dispatch_name,
+            push_port = effective_push_port,
+            pull_port = pull_port,
+            ctrl_port = ctrl_port,
+            placement = stage.placement,
+            credit_window = spec.credit_window,
+            push_uri = push_uri_line,
+        ));
+
+        // Input endpoint: this stage's worker reads from this stage's
+        // dispatcher. Always same-host (they co-locate by construction).
+        let my_node = node_for(i);
+        let input = if my_node.force_tcp {
+            tcp_endpoint(&my_node.host, pull_port)
+        } else {
+            ipc_endpoint(&dispatch_name, "pull")
+        };
+
+        // Output endpoint: this stage's worker writes to either the
+        // next stage's dispatcher, or the collector if this is the last
+        // stage. Same-node vs cross-node depends on placement.
+        let output = if i + 1 == spec.stages.len() {
+            spec.collector.clone()
+        } else {
+            let next = node_for(i + 1);
+            let next_push = spec.port_base + ((i + 1) as u16) * 3;
+            let next_dispatch_name = format!(
+                "dispatch-{}",
+                spec.stages[i + 1].name.trim_start_matches("fn-")
+            );
+            if my_node.name == next.name && !my_node.force_tcp && !next.force_tcp {
+                ipc_endpoint(&next_dispatch_name, "push")
+            } else {
+                tcp_endpoint(&next.host, next_push)
+            }
+        };
+
+        let wasm_path = &wasm_by_stage[i].1;
+        let scaling = &stage.scaling;
+        pipeline.push_str(&format!(
+            "  - name: {name}\n\
+             \x20   wasm: {wasm}\n\
+             \x20   placement: {placement}\n\
+             \x20   input: {input}\n\
+             \x20   output: {output}\n\
+             \x20   slo:\n\
+             \x20     p99_ms: {p99}\n\
+             \x20     min_replicas: {min}\n\
+             \x20     max_replicas: {max}\n\
+             \x20     queue_up: {qu}\n\
+             \x20     queue_down: {qd}\n\
+             \x20     cooldown_up_s: {cu}\n\
+             \x20     cooldown_down_s: {cd}\n",
+            name = stage.name,
+            wasm = wasm_path.display(),
+            placement = stage.placement,
+            input = input,
+            output = output,
+            p99 = scaling.p99_ms,
+            min = scaling.min_replicas,
+            max = scaling.max_replicas,
+            qu = scaling.queue_up,
+            qd = scaling.queue_down,
+            cu = scaling.cooldown_up_s,
+            cd = scaling.cooldown_down_s,
+        ));
+    }
+
+    let compile_mode_line = compile_mode
+        .map(|m| format!("compile_mode: {}\n", m))
+        .unwrap_or_default();
+
+    let combined = format!(
+        "# GENERATED by epico-cli from pipeline.yaml. Do not edit directly.\n\
+         # Source package: {pkg}\n\n\
+         this_host: {this_host}\n\
+         ingress:   {ingress}\n\
+         collector: {collector}\n\
+         resource_sample_interval_ms: {rsi}\n\
+         {cm}\n\
+         {nodes}\n\
+         {d}\n\
+         {p}",
+        pkg = spec.package,
+        this_host = spec.this_host,
+        ingress = spec.ingress,
+        collector = spec.collector,
+        rsi = spec.resource_sample_interval_ms,
+        cm = compile_mode_line,
+        nodes = nodes_block,
+        d = dispatchers,
+        p = pipeline,
+    );
+    std::fs::write(path, combined)?;
+    Ok(())
+}
+
+/// Best-effort relative path from `from_dir` to `to`. Falls back to the
+/// absolute path if they're not comparable (e.g. different drives on
+/// Windows). Good enough for Cargo.toml `path = "..."` entries.
+fn relative_path(from_dir: &Path, to: &Path) -> PathBuf {
+    // Normalize both to absolute paths where possible.
+    let from_abs = from_dir.canonicalize().unwrap_or_else(|_| from_dir.to_path_buf());
+    let to_abs = to.canonicalize().unwrap_or_else(|_| to.to_path_buf());
+
+    // Walk up from_abs until to_abs is a descendant, counting .. entries.
+    let mut ups: Vec<&Path> = Vec::new();
+    let mut anchor = from_abs.as_path();
+    loop {
+        if let Ok(rel) = to_abs.strip_prefix(anchor) {
+            let mut result = PathBuf::new();
+            for _ in 0..ups.len() {
+                result.push("..");
+            }
+            result.push(rel);
+            return result;
+        }
+        match anchor.parent() {
+            Some(p) => {
+                ups.push(anchor);
+                anchor = p;
+            }
+            None => return to_abs,
+        }
+    }
+}

@@ -1,0 +1,85 @@
+// epico:pipeline — typed contract for stage interfaces.
+//
+//   - one record `event` carries all domain fields, every field optional,
+//     mirroring today's loose JSON shape
+//   - a separate `bench-ctx` record carries host-managed timing fields
+//     that functions forward but never touch
+//   - every stage exports `process-event(event, bench-ctx) -> tuple<event, bench-ctx>`
+//
+// All three stages currently share the same world. When schemas diverge
+// (e.g. fn-c expects a `severity` that only fn-b can produce), we can split
+// into per-stage worlds and the load-time validator will catch mismatches.
+
+package epico:pipeline@0.1.0;
+
+interface types {
+    // Domain event record. Every field optional so a single record covers
+    // all stages without per-boundary variants. Matches the current
+    // serde_json::Value -> .get(...).unwrap_or(default) idiom in fn_a/b/c.
+    record event {
+        event-id:           option<string>,
+        sensor-id:          option<string>,
+        value:              option<f64>,
+        unit:               option<string>,
+        ts:                 option<f64>,
+        ts-in:              option<f64>,
+        ts-fn-a:            option<f64>,
+        ts-fn-b:            option<f64>,
+        ts-fn-c:            option<f64>,
+        %fn:                option<string>,
+        reactor-count:      option<u64>,
+        anomaly:            option<bool>,
+        severity:           option<string>,
+        latency-a-to-b-ms:  option<f64>,
+        latency-b-to-c-ms:  option<f64>,
+        e2e-latency-ms:     option<f64>,
+        status:             option<string>,
+        // tombstone path (fn-b filtering)
+        filtered:           option<bool>,
+        reason:             option<string>,
+    }
+
+    // Bench/timing fields. The host injects these on the way in and
+    // appends to `bench-hops` on the way out (in the worker, after the
+    // wasm call returns). Functions take this as a parameter and return
+    // it unchanged — wit-bindgen makes that a one-line passthrough.
+    record bench-ctx {
+        bench-ts-wall:  option<f64>,
+        bench-ts:       option<f64>,
+        bench-seq:      option<u64>,
+        // Each entry is (stage-name, enter-ts, exit-ts). Hops accumulated
+        // by the host post-call; the function only forwards what it received.
+        bench-hops:     list<bench-hop>,
+    }
+
+    record bench-hop {
+        stage:    string,
+        enter-ts: f64,
+        exit-ts:  f64,
+    }
+}
+
+interface process {
+    use types.{event, bench-ctx};
+
+    // Stage entrypoint. Returns the transformed event and the (untouched)
+    // bench context. The host appends the new hop to bench-ctx after this
+    // call returns; the guest must not mutate bench-ctx itself.
+    process-event: func(ev: event, bench: bench-ctx) -> tuple<event, bench-ctx>;
+}
+
+// One world per stage. They are identical today — the load-time validator
+// in master.rs checks that consecutive stages' process-event signatures
+// match structurally. When schemas diverge, give each world its own
+// interface and the validator will refuse to start a misconfigured pipeline.
+world fn-a {
+    export process;
+}
+
+world fn-b {
+    export process;
+}
+
+world fn-c {
+    export process;
+}
