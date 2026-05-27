@@ -1,72 +1,58 @@
-![Alt text](assets/logo.png)
+<div align="center">
+
+<img src="assets/logo.png" alt="Epico" width="220"/>
 
 # Epico
 
-A broker-free stream-processing runtime. Each stage of your
-pipeline is a WebAssembly component; the runtime autoscales replicas per
-stage from 0 to N against a queue-depth SLO, and stages talk over
-ZeroMQ. No Redis, no Kafka, no Kubernetes.
+**A broker-free stream-processing runtime where every stage is a WebAssembly component.**
 
-You write:
-- **one YAML** describing the DAG and scaling policy,
-- **one `.rs` file per stage** containing the transformation logic.
+No Kafka. No Redis. No Kubernetes. One binary, one YAML, one `.rs` file per stage.
 
-`epico run` does the rest: compiles the runtime if needed, compiles
-your stages to `wasm32-wasip2`, launches the dispatchers, starts the
-master, and terminates the pipeline in a built-in collector that records
-per-event e2e latency and writes a run summary on shutdown.
+[![Build](https://img.shields.io/badge/build-passing-brightgreen)](#)
+[![Rust](https://img.shields.io/badge/rust-2024-orange)](#)
+[![WASI](https://img.shields.io/badge/wasi-p2-purple)](https://github.com/WebAssembly/WASI)
+[![Paper](https://img.shields.io/badge/paper-arXiv-b31b1b)](#citation)
+
+---
+
+## Why Epico
+
+Modern stream-processing stacks bolt application code onto a fleet of brokers, schedulers, and JVMs. Epico inverts the model: **one Rust host, WebAssembly stages, ZeroMQ between them.** The host autoscales replicas per stage against a queue-depth SLO; stages are sandboxed `wasm32-wasip2` components dispatched dynamically — no host rebuild when stages or types change.
+
+This makes Epico a **research vehicle for serverless stream processing on a single node** (Pi-class edge → multi-core server), with the lowest plausible operational surface area: no message broker, no orchestrator, no control plane.
+
+| | Epico | Flink | Kafka Streams | AWS Lambda + SQS |
+|---|---|---|---|---|
+| Broker required | ❌ | ✅ (Kafka) | ✅ (Kafka) | ✅ (SQS) |
+| Per-stage isolation | WASM component | JVM thread | JVM thread | container |
+| Dynamic stage dispatch | ✅ (WIT introspection) | ❌ (recompile job) | ❌ | ✅ |
+| Scale-to-zero per stage | ✅ | ❌ | ❌ | ✅ |
+| Single-host footprint | ~2 100 LOC Rust | JVM + ZK | JVM + ZK | cloud-only |
 
 ---
 
 ## Quickstart
 
 ```bash
-# One-time setup (or just run ./setup.sh from the repo root — it does all three)
-rustup target add wasm32-wasip2
-cargo install --path epico-cli        # installs the `epico` CLI
-epico bootstrap                       # pre-builds the master + dispatcher
-
-# Run the demo
+./setup.sh                # rustup target + install CLI + bootstrap binaries
 cd examples/temps
 epico run
 ```
 
-That's it. First run takes a minute or two (cold cargo build for the
-master, dispatcher, and the stage components). Subsequent runs are
-near-instant — cargo's incremental compilation handles the no-op case.
+First run takes ~1–2 min (cold build of the host + stage components). Subsequent runs are near-instant via Cargo incremental.
 
-Press `Ctrl+C` to stop; the master tears down its dispatchers cleanly
-and writes `master_<timestamp>_summary.json` to the log directory with
-e2e latency percentiles and throughput data.
+`Ctrl+C` cleanly tears down dispatchers and writes `master_<ts>_summary.json` with per-event e2e latency percentiles and throughput.
 
 ---
 
-## The CLI subcommands
+## A pipeline in two files
 
-| Command | What it does |
-|---|---|
-| `epico build` | Scaffolds stage crates + compiles stages to `.wasm`. Does NOT launch anything. |
-| `epico run` | `build`, then launch. Auto-bootstraps the runtime binaries on first use. |
-| `epico validate` | Parses the YAML, verifies every referenced `.wasm` exists. Quick sanity check. |
-| `epico clean` | Removes the entire `target/` tree — stage wasm, master/dispatcher binaries, cargo caches. Forces a full clean rebuild. |
-| `epico bootstrap` | Pre-builds the master + dispatcher binaries (useful in CI). Normally not needed. |
-
-All commands accept `--config <path>` (defaults to `./pipeline.yaml`)
-and `--project-root <path>` (auto-detected by walking up from the
-config file looking for `epico-sdk/Cargo.toml`). `epico run` also
-accepts `--log-dir <path>` (defaults to `./logs`) for where the master
-and dispatchers write structured JSONL logs and the run summary.
-
----
-
-## Writing a pipeline
-
-### Pipeline YAML
+**`pipeline.yaml`** — the DAG, types, and scaling policy:
 
 ```yaml
 package: epico:temps@1.0.0
 
-types:                             # Typed records — drive per-stage WIT codegen
+types:
   reading:
     sensor_id: string
     value:     f64
@@ -75,51 +61,59 @@ types:                             # Typed records — drive per-stage WIT codeg
     value:     f64
     anomaly:   bool?
 
-stages:                            # The DAG
+stages:
   - name: normalize
     in:  reading
     out: reading
     src: ./stages/normalize.rs
-    scaling:
-      max: 4
-      queue_up: 50
+    scaling: { max: 4, queue_up: 50 }
 
   - name: detect
     in:  reading
     out: enriched
     src: ./stages/detect.rs
-    scaling:
-      max: 8
-      queue_up: 100
+    scaling: { max: 8, queue_up: 100 }
 
 deploy:
   collector: tcp://localhost:9999
-  port_base: 9100                  # dispatcher ports auto-allocated from here
+  port_base: 9100
 ```
 
-Only linear DAGs are supported today. Fan-out/fan-in is on the roadmap.
-
-### A stage source file
+**`stages/normalize.rs`** — the transform:
 
 ```rust
 use epico_sdk::stage;
 
 stage! {
     fn normalize(ev: Reading) -> Reading {
-        Reading {
-            value: ev.value.clamp(-50.0, 150.0),
-            ..ev
-        }
+        Reading { value: ev.value.clamp(-50.0, 150.0), ..ev }
     }
 }
 ```
 
-The `stage!` macro expands into the full `wit_bindgen::generate!` +
-`Guest` impl + `export!` glue. Field updates use Rust's struct-update
-syntax — whatever you don't override is inherited from the input event.
+The `stage!` macro expands into the full `wit_bindgen::generate!` + `Guest` impl + `export!` glue. Field updates use Rust's struct-update syntax.
 
-See `DEVELOPER_GUIDE.md` for the alternate function shape (explicit
-bench-ctx access) and the full list of scaling knobs.
+---
+
+## WebAssembly Component Model, used properly
+
+Epico does not embed WASM as a glorified plugin format. The runtime uses the **Component Model (WASIp2)** with **dynamic WIT-introspected dispatch**: the master inspects each component's exported interface at load time and routes typed records through ZeroMQ without any host-side codegen.
+
+The cost is a known ~12× per-call overhead vs. hardcoded `bindgen` — paid intentionally in exchange for **YAML-configurable pipelines without master recompilation**. One master binary runs any pipeline. See [ARCHITECTURE.md § 6](ARCHITECTURE.md) for the dispatch design.
+
+---
+
+## CLI
+
+| Command | What it does |
+|---|---|
+| `epico build` | Scaffolds stage crates, compiles them to `.wasm`. Does not launch. |
+| `epico run` | `build` + launch. Auto-bootstraps host binaries on first use. |
+| `epico validate` | Parses YAML, verifies every referenced `.wasm` exists. |
+| `epico clean` | Wipes `target/`. Forces a full rebuild. |
+| `epico bootstrap` | Pre-builds master + dispatcher (useful in CI). |
+
+Flags: `--config <path>` (default `./pipeline.yaml`), `--project-root <path>` (auto-detected), `--log-dir <path>` (default `./logs`).
 
 ---
 
@@ -127,51 +121,27 @@ bench-ctx access) and the full list of scaling knobs.
 
 ```
 epico/
-├── Cargo.toml                     # Root workspace
-├── setup.sh                       # First-time setup helper (rustup + install + bootstrap)
-├── epico-sdk/
-│   ├── wit/epico.wit            # Canonical WIT (single source of truth)
-│   └── src/lib.rs                 # The `stage!` macro
-├── epico-cli/                   # `epico build|run|validate|clean|bootstrap`
+├── epico-sdk/           # `stage!` macro + canonical WIT
+├── epico-cli/           # build | run | validate | clean | bootstrap
 ├── epico-core/
-│   ├── master/                    # Node master: autoscaler + wasm host + dispatcher supervisor + built-in collector
-│   ├── dispatcher/                # Per-stage ZeroMQ broker
-│   └── logger/                    # Shared structured JSONL logger (used by master, dispatcher, loadgen)
-├── epico-loadgen/               # Rust IoT load generator (replaces the old Python loadgen)
-├── examples/
-│   └── temps/                     # Demo pipeline: one YAML + three .rs files
-└── deprecated/                    # Previous-generation artifacts (fn_a/b/c, Python loadgen, old dags) — kept for reference
+│   ├── master/          # autoscaler + wasm host + dispatcher supervisor + collector
+│   ├── dispatcher/      # per-stage ZeroMQ broker
+│   └── logger/          # structured JSONL
+├── epico-loadgen/       # Rust IoT load generator
+└── examples/
+    └── temps/           # demo pipeline
 ```
 
-For the full architectural story — ZeroMQ topology, the autoscaler's
-vote-with-cooldown controller, the Wasm execution model, end-to-end
-data flow, concurrency guarantees — see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
-
-For the author's-eye view — writing stages, the `stage!` macro, tuning
-scaling knobs — see **[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)**.
+The full architectural story — ZeroMQ topology, the vote-with-cooldown autoscaler, Wasm execution model, concurrency guarantees — lives in **[ARCHITECTURE.md](ARCHITECTURE.md)**. Author's-eye view of writing stages and tuning scaling knobs in **[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)**.
 
 ---
 
-## Building without the CLI
+## Status & roadmap
 
-If you want to build the runtime by hand (e.g. in CI before running
-`epico build` explicitly):
+Actively developed. Core runtime is ~2 100 LOC of Rust.
 
-```bash
-cargo build --release --workspace
-```
+**Supported today:** linear DAGs · WASIp2 components · per-stage autoscaling · credit-based flow control · structured JSONL telemetry · single-host deployment.
 
-That produces `target/release/master` (the master),
-`target/release/dispatcher`, and `target/release/epico-loadgen`. The
-CLI normally handles this for you the first time `epico run` is
-invoked.
+**On the roadmap:** fan-out / fan-in topologies · multi-host deployment · at-least-once delivery during scale-down · end-to-end typed pipeline validation · OpenTelemetry export · Hailo-8L AI Hat+ offload.
 
 ---
-
-## Status
-
-Actively developed. The core runtime is ~2100 LOC of Rust across the
-master and dispatcher crates; the component-model + dynamic-dispatch
-design means one master binary runs any pipeline — no recompilation of
-the host when stages or types change. See `ARCHITECTURE.md` § 6 for
-the details.
