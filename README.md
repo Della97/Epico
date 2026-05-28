@@ -98,7 +98,7 @@ The `stage!` macro expands into the full `wit_bindgen::generate!` + `Guest` impl
 
 Epico does not embed WASM as a glorified plugin format. The runtime uses the **Component Model (WASIp2)** with **dynamic WIT-introspected dispatch**: the master inspects each component's exported interface at load time and routes typed records through ZeroMQ without any host-side codegen.
 
-The cost is a known ~12× per-call overhead vs. hardcoded `bindgen` — paid intentionally in exchange for **YAML-configurable pipelines without master recompilation**. One master binary runs any pipeline. See [ARCHITECTURE.md § 6](ARCHITECTURE.md) for the dispatch design.
+The cost is a known ~12× per-call overhead vs. hardcoded `bindgen` — paid intentionally in exchange for **YAML-configurable pipelines without master recompilation**. One master binary runs any pipeline.
 
 ---
 
@@ -131,7 +131,7 @@ epico/
     └── temps/           # demo pipeline
 ```
 
-The full architectural story — ZeroMQ topology, the vote-with-cooldown autoscaler, Wasm execution model, concurrency guarantees — lives in **[ARCHITECTURE.md](ARCHITECTURE.md)**. Author's-eye view of writing stages and tuning scaling knobs in **[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)**.
+The full architectural story — ZeroMQ topology, the vote-with-cooldown autoscaler, Wasm execution model, concurrency guarantees.
 
 ---
 
