@@ -1,7 +1,7 @@
 <div align="center">
 
 <img src="assets/logo.png" alt="Epico" width="220"/>
-
+</div>
 # Epico
 
 **A broker-free stream-processing runtime where every stage is a WebAssembly component.**
@@ -11,7 +11,6 @@ No Kafka. No Redis. No Kubernetes. One binary, one YAML, one `.rs` file per stag
 [![Build](https://img.shields.io/badge/build-passing-brightgreen)](#)
 [![Rust](https://img.shields.io/badge/rust-2024-orange)](#)
 [![WASI](https://img.shields.io/badge/wasi-p2-purple)](https://github.com/WebAssembly/WASI)
-[![Paper](https://img.shields.io/badge/paper-arXiv-b31b1b)](#citation)
 
 ---
 
