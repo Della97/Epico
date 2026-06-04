@@ -93,6 +93,15 @@ pub struct PipelineSpec {
     /// `epico-loadgen` binary). If absent, the agent is launched alone
     /// and the user is expected to push events in from a separate process.
     pub source: Option<SourceSpec>,
+    /// Native source node (option A): `source: { placement, src: ./x.rs }`.
+    /// Distinct from the loadgen `source: { kind: ... }` above — when this is
+    /// set, the CLI compiles the `.rs` into the per-pipeline agent and the
+    /// runtime drives it as an in-process `EventSource`. Mutually exclusive
+    /// with the loadgen `source` in practice.
+    pub source_node: Option<BoundaryNode>,
+    /// Native sink node (option A): `sink: { placement, src: ./x.rs }`. Compiled
+    /// into the agent and driven as an in-process `EventSink`.
+    pub sink_node: Option<BoundaryNode>,
     /// Interval between agent-process resource samples (CPU + RSS), in ms.
     /// Default is 1000 ms — the cadence used in baseline evaluations. Set
     /// to 0 to disable the sampler entirely; this skips the kernel calls
@@ -108,6 +117,18 @@ pub struct PipelineSpec {
     /// backpressure to per-window. Reasonable values: 1 (legacy), 16
     /// (typical sweet spot), 64 (high-throughput, looser backpressure).
     pub credit_window: u32,
+    /// Events per ROUTER message to a worker. Default 1. Amortises the
+    /// per-message zmq poll/command overhead; orthogonal to credit_window.
+    pub batch_events: usize,
+}
+
+/// A native boundary node (source or sink) compiled into the per-pipeline
+/// agent. `src` is the resolved absolute path to a `.rs` implementing the
+/// `EventSource`/`EventSink` contract.
+#[derive(Debug, Clone)]
+pub struct BoundaryNode {
+    pub placement: String,
+    pub src: PathBuf,
 }
 
 /// Declarative source specification from the pipeline YAML. Today only
@@ -229,13 +250,30 @@ struct NewFormat {
     /// Optional event source launched alongside the agent. See `SourceSpec`.
     #[serde(default)]
     source: Option<RawSource>,
+    /// Optional native sink node compiled into the agent. See `BoundaryNode`.
+    #[serde(default)]
+    sink: Option<RawBoundary>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawSource {
-    kind: String,
+    /// Loadgen form: `kind: loadgen`. Absent when this is a native source node.
+    #[serde(default)]
+    kind: Option<String>,
+    /// Native-node form: `src: ./x.rs`. Absent for the loadgen form.
+    #[serde(default)]
+    src: Option<String>,
+    #[serde(default)]
+    placement: Option<String>,
     #[serde(flatten)]
     params: BTreeMap<String, serde_yaml::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawBoundary {
+    src: String,
+    #[serde(default)]
+    placement: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -304,6 +342,10 @@ struct DeploySpec {
     resource_sample_interval_ms: Option<u64>,
     /// Credit window for dispatcher↔worker flow control. Default 1.
     credit_window: Option<u32>,
+    /// Events packed into one ROUTER message to a worker. Default 1 (one
+    /// event per message). Larger values amortise per-message zmq overhead;
+    /// orthogonal to credit_window (credits are still counted in events).
+    batch_events: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -591,15 +633,54 @@ fn from_new_format(raw: NewFormat, yaml_dir: &Path) -> Result<PipelineSpec> {
     // new format — the first dispatcher binds here and the loadgen (or any
     // external producer) connects here. Omitting it would leave the entry
     // endpoint implicit, which is the ambiguity we're moving away from.
-    let ingress = raw.deploy.ingress.ok_or_else(|| {
-        anyhow!(
-            "deploy.ingress: is required. Declare the pipeline entry URI \
-             explicitly, e.g.\n  \
-             deploy:\n    \
-               ingress:   tcp://localhost:9100   # or ipc:///tmp/my-pipeline-push\n    \
-               collector: tcp://localhost:9999"
-        )
-    })?;
+    // A native source node generates events in-process, so there's no ingress
+    // URI to bind — only require one otherwise.
+    let has_native_source = raw.source.as_ref().map(|s| s.src.is_some()).unwrap_or(false);
+    let ingress = match raw.deploy.ingress.clone() {
+        Some(uri) => uri,
+        None if has_native_source => "inproc://source".to_string(),
+        None => {
+            return Err(anyhow!(
+                "deploy.ingress: is required. Declare the pipeline entry URI \
+                 explicitly, e.g.\n  \
+                 deploy:\n    \
+                   ingress:   tcp://localhost:9100   # or ipc:///tmp/my-pipeline-push\n    \
+                   collector: tcp://localhost:9999"
+            ));
+        }
+    };
+
+    // Source can be either the loadgen declaration (`kind: loadgen`) or a
+    // native source node (`src: ./x.rs`). The presence of `src` selects the
+    // native node; otherwise it's the legacy loadgen source.
+    let (loadgen_source, source_node) = match raw.source {
+        Some(s) => {
+            if let Some(src_rel) = s.src {
+                let abs = yaml_dir.join(&src_rel);
+                if !abs.exists() {
+                    bail!("source: src file not found: {:?}", abs);
+                }
+                let placement = s.placement.unwrap_or_else(|| this_host.clone());
+                (None, Some(BoundaryNode { placement, src: abs }))
+            } else if let Some(kind) = s.kind {
+                (Some(SourceSpec { kind, params: s.params }), None)
+            } else {
+                bail!("source: needs either `kind: loadgen` or `src: ./file.rs`");
+            }
+        }
+        None => (None, None),
+    };
+    let sink_node = match raw.sink {
+        Some(b) => {
+            let abs = yaml_dir.join(&b.src);
+            if !abs.exists() {
+                bail!("sink: src file not found: {:?}", abs);
+            }
+            let placement = b.placement.unwrap_or_else(|| this_host.clone());
+            Some(BoundaryNode { placement, src: abs })
+        }
+        None => None,
+    };
 
     Ok(PipelineSpec {
         package: raw.package,
@@ -615,9 +696,12 @@ fn from_new_format(raw: NewFormat, yaml_dir: &Path) -> Result<PipelineSpec> {
         port_base: raw.deploy.port_base.unwrap_or(9000),
         host: raw.deploy.host.unwrap_or_else(|| "localhost".to_string()),
         types: raw.types,
-        source: raw.source.map(|s| SourceSpec { kind: s.kind, params: s.params }),
+        source: loadgen_source,
+        source_node,
+        sink_node,
         resource_sample_interval_ms: raw.deploy.resource_sample_interval_ms.unwrap_or(1000),
         credit_window: raw.deploy.credit_window.unwrap_or(1),
+        batch_events: raw.deploy.batch_events.unwrap_or(1),
     })
 }
 
@@ -712,11 +796,15 @@ fn from_old_format(raw: OldFormat, yaml_dir: &Path) -> Result<PipelineSpec> {
         host: "localhost".to_string(),
         types: BTreeMap::new(),
         source: None,
+        source_node: None,
+        sink_node: None,
         // Old-format YAMLs predate this knob; keep the historical 1 Hz cadence
         // so existing legacy pipelines produce identical resource plots.
         resource_sample_interval_ms: 1000,
         // Old-format YAMLs predate flow control too; keep the strict
         // request/reply protocol that they were designed against.
         credit_window: 1,
+        // Old-format YAMLs predate batching; one event per message.
+        batch_events: 1,
     })
 }

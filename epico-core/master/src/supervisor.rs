@@ -86,6 +86,7 @@ pub(crate) fn spawn_dispatchers(
         // no-op compatibility-wise but it keeps the agent and the
         // dispatcher subprocess in agreement on the protocol contract.
         cmd.arg("--credit-window").arg(d.credit_window.to_string());
+        cmd.arg("--batch-events").arg(d.batch_events.to_string());
 
         let child = cmd.spawn().unwrap_or_else(|e| {
             log.error("failed to spawn dispatcher", &[

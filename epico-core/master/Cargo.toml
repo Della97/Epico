@@ -3,9 +3,13 @@ name = "master"
 version = "0.2.0"
 edition = "2021"
 
+[lib]
+name = "epico_master"
+path = "src/master.rs"
+
 [[bin]]
 name = "master"
-path = "src/master.rs"
+path = "src/main.rs"
 
 [features]
 cold-start-opt = []
@@ -41,3 +45,6 @@ epico-logger = { path = "../logger" }
 # Process CPU + RSS sampling for the run summary. Cross-platform
 # (Linux/macOS/Windows); refresh cost is negligible at 1 Hz.
 sysinfo = "0.30"
+
+# MPMC
+crossbeam-queue = "0.3"

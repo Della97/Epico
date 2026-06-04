@@ -37,7 +37,42 @@ pub fn build_stages(workspace_manifest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Precompile each stage's .wasm into a .cwasm AOT artifact next to it.
+/// Build the generated per-pipeline agent crate for the host target and return
+/// the path to its binary. This is the agent that has the pipeline's native
+/// source/sink compiled in (option A); `epico run` launches it instead of the
+/// stock `master`. Built into the agent crate's own target/ dir.
+pub fn build_agent(agent_manifest: &Path) -> Result<PathBuf> {
+    println!("==> Building per-pipeline agent (native source/sink, host target)");
+    println!("    manifest: {}", agent_manifest.display());
+
+    let status = Command::new("cargo")
+        .arg("build")
+        .arg("--release")
+        .arg("--manifest-path")
+        .arg(agent_manifest)
+        .status()
+        .context("failed to invoke `cargo` — is it installed and on PATH?")?;
+
+    if !status.success() {
+        bail!(
+            "agent build failed (exit code {:?}). Inspect the output above. \
+             Common causes: a source.rs/sink.rs that doesn't implement \
+             epico_master::EventSource / EventSink, or a missing dependency.",
+            status.code()
+        );
+    }
+
+    let bin = agent_manifest
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("target")
+        .join("release")
+        .join("epico-agent");
+    if !bin.exists() {
+        bail!("agent built but binary not found at {}", bin.display());
+    }
+    Ok(bin)
+}
 /// At runtime the agent prefers the .cwasm if present and skips Cranelift
 /// entirely (Component::deserialize_file instead of Component::from_file).
 ///

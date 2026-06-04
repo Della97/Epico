@@ -6,6 +6,10 @@
 
 package: epico:temps@1.0.0
 
+variables:
+  default_min: &min_replicas 1
+  default_max: &max_replicas 1
+
 # Physical nodes. Each node has a name (referenced by `placement` below
 # and by `deploy.this_host`) and an IP/hostname.
 nodes:
@@ -36,15 +40,23 @@ types:
 
 # source:
 #   kind: loadgen
-#   rate: 500
+#   rate: 5000
 #   duration: 180
 #   profile: steady
 #   sensors: 50
 
+# source:
+#   kind: loadgen
+#   profile: tp
+#   count: 5000000
+
+sink:
+  placement: local
+  src: ./stages/sink.rs
+
 source:
-  kind: loadgen
-  profile: tp
-  count: 1000000
+  placement: local
+  src: ./stages/source.rs
 
 # The pipeline. `warmup` is an identity pass-through whose only job is to
 # absorb the first-stage process warmup costs (page-cache miss on the
@@ -58,8 +70,8 @@ stages:
     out: reading
     src: ./stages/normalize.rs
     scaling:
-      min: 0
-      max: 1
+      min: *min_replicas
+      max: *max_replicas
       queue_up: 50
       cooldown_up_s: 20
       cooldown_down_s: 20
@@ -70,8 +82,8 @@ stages:
     out: enriched
     src: ./stages/detect.rs
     scaling:
-      min: 0
-      max: 1
+      min: *min_replicas
+      max: *max_replicas
       queue_up: 50
       cooldown_up_s: 20
       cooldown_down_s: 20
@@ -82,8 +94,8 @@ stages:
     out: enriched
     src: ./stages/finalize.rs
     scaling:
-      min: 0
-      max: 1
+      min: *min_replicas
+      max: *max_replicas
       queue_up: 50
       cooldown_up_s: 20
       cooldown_down_s: 20
@@ -93,10 +105,5 @@ edges:
   - detect -> finalize
 
 deploy:
-  ingress: ipc:///tmp/epico-dispatch-normalize-push
-  collector: tcp://localhost:9999
-  credit_window: 16
-  port_base: 9100
   host: localhost
   this_host: local
-  resource_sample_interval_ms: 0

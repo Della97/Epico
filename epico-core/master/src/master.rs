@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::collections::{HashMap, HashSet};
 
 use clap::Parser;
 use epico_logger::Logger;
@@ -17,19 +18,29 @@ mod autoscaler;
 mod config;
 mod conversion;
 mod host;
+mod inproc;
 mod pipeline_validator;
 mod resources;
 mod supervisor;
 mod worker;
 
 use crate::config::{default_wasm_path, stage_owned_by, Config};
+use crate::inproc::Edge;
+
+/// In-flight bound for an in-process edge (prototype). Plays the role
+/// `credit_window` plays on the zmq path; promote to per-edge config later.
+const INPROC_EDGE_CAPACITY: usize = 1;
+/// Substring every EOS marker contains; the collector scans for it (cheap)
+/// before the confirming JSON parse. Must be matched with a window of its own
+/// length — a wrong window size silently never matches and the run never ends.
+const EOS_NEEDLE: &[u8] = b"__epico_eos";
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
 #[command(name = "epico-master")]
 #[command(about = "Epico node master — autoscaler + wasm worker host")]
-struct Args {
+pub struct Args {
     config: PathBuf,
 
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -135,13 +146,15 @@ pub(crate) struct RunTelemetry {
     pub resource_samples: Vec<ResourceSample>,
 
     // ── Worker timing breakdown ────────────────────────────────────────────
-    /// Per-stage total worker iteration time in µs (recv → deser → wasm →
-    /// ser → push). Keyed by stage name. Populated by autoscaler polling
-    /// the dispatcher ctrl socket and forwarding consumer metrics.
+    /// Per-stage total worker iteration time in NANOSECONDS (recv → deser →
+    /// wasm → ser → push). Keyed by stage name. Populated by autoscaler polling
+    /// the dispatcher ctrl socket and forwarding consumer metrics. (Field name
+    /// kept `_us` for churn reasons; values are ns since the worker switched to
+    /// as_nanos. Converted to µs floats in build_worker_timing_block.)
     pub total_us_samples: std::collections::HashMap<String, Vec<u64>>,
 
-    /// Per-stage serialization time in µs (JSON parse + JSON serialize,
-    /// but NOT the wasm call). Subset of total_us.
+    /// Per-stage serialization time in NANOSECONDS (JSON parse + JSON serialize,
+    /// but NOT the wasm call). Subset of total_us_samples.
     pub serde_us_samples: std::collections::HashMap<String, Vec<u64>>,
 
     // ── Dispatcher queue depth time-series ────────────────────────────────
@@ -152,9 +165,24 @@ pub(crate) struct RunTelemetry {
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
-fn main() {
-    let args = Args::parse();
+/// Parse the agent CLI args. Exposed so a generated per-pipeline binary can
+/// build `Args` without depending on `clap` directly.
+pub fn parse_args() -> Args {
+    use clap::Parser;
+    Args::parse()
+}
 
+// ── Entry ──────────────────────────────────────────────────────────────────
+
+/// Run the agent. The binary calls this with `None, None` (built-in source via
+/// `EPICO_SOURCE_GEN`, or the PULL ingress); a generated per-pipeline binary
+/// passes a user-compiled `EventSource`/`EventSink` so source and sink logic is
+/// native code linked into the agent rather than a separate process or wasm.
+pub fn run_agent(
+    args: Args,
+    custom_source: Option<SourceFactory>,
+    custom_sink:   Option<Box<dyn EventSink>>,
+) {
     let log = Logger::new("master", &args.log_dir)
         .unwrap_or_else(|e| { eprintln!("[master] log open failed: {e}"); std::process::exit(1); });
 
@@ -185,6 +213,80 @@ fn main() {
     validate_pipeline(&config, &log);
     apply_placement_filter(&mut config, &log);
 
+    // ── In-process edges + ingress/egress (prototype) ─────────────────────────
+    // EPICO_INPROC_EDGES=1 collapses every consecutive stage→stage hop onto a
+    // shared bounded queue, skipping the consumer-side dispatcher for that hop.
+    // EPICO_INPROC_INGRESS=1 additionally replaces the ingress dispatcher with a
+    // single source pump (PULL → first stage's Edge) and the egress collector
+    // PULL with the collector draining the last stage's Edge in-process — so on
+    // one host there are zero dispatchers and the only socket left is the
+    // source's ingestion from the external producer. Ingress implies edges.
+    // Single-host assumption: all stages are co-located. In-process stages keep
+    // min_replicas > 0 (workers spawn via the min-replica path).
+    let source_gen = std::env::var("EPICO_SOURCE_GEN")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let inproc_ingress = custom_source.is_some()
+        || source_gen
+        || std::env::var("EPICO_INPROC_INGRESS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    let inproc_edges = inproc_ingress
+        || std::env::var("EPICO_INPROC_EDGES")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    let mut input_edges:  HashMap<String, Edge> = HashMap::new();
+    let mut output_edges: HashMap<String, Edge> = HashMap::new();
+    let mut skip_dispatchers: HashSet<String> = HashSet::new();
+    let mut ingress_source_edge: Option<Edge> = None;
+    let mut egress_sink_edge:    Option<Edge> = None;
+    // Edge capacity is a throughput/latency knob in the in-process regime, so
+    // make it sweepable without a recompile. Falls back to the compiled default.
+    let edge_cap = std::env::var("EPICO_EDGE_CAP")
+        .ok().and_then(|v| v.parse::<usize>().ok()).filter(|&c| c > 0)
+        .unwrap_or(INPROC_EDGE_CAPACITY);
+    if inproc_edges {
+        for pair in config.pipeline.windows(2) {
+            let (prod, cons) = (&pair[0], &pair[1]);
+            let edge = Edge::new(edge_cap);
+            output_edges.insert(prod.name.clone(), edge.clone());
+            input_edges.insert(cons.name.clone(), edge);
+            let bare = cons.name.strip_prefix("fn-").unwrap_or(&cons.name);
+            skip_dispatchers.insert(format!("dispatch-{}", bare));
+            log.info("in-process edge", &[
+                ("from", &prod.name),
+                ("to",   &cons.name),
+                ("cap",  &edge_cap.to_string()),
+            ]);
+        }
+    }
+    if inproc_ingress {
+        // Source → first stage: replace the ingress dispatcher with a single
+        // PULL pump feeding the first stage's Edge. Skip that dispatcher.
+        if let Some(first) = config.pipeline.first() {
+            let edge = Edge::new(edge_cap);
+            input_edges.insert(first.name.clone(), edge.clone());
+            ingress_source_edge = Some(edge);
+            let bare = first.name.strip_prefix("fn-").unwrap_or(&first.name);
+            skip_dispatchers.insert(format!("dispatch-{}", bare));
+            log.info("in-process ingress (source pump)", &[
+                ("to",  &first.name),
+                ("cap", &edge_cap.to_string()),
+            ]);
+        }
+        // Last stage → sink: the collector drains the last stage's Edge in
+        // process instead of binding a PULL socket. No egress socket on a host.
+        if let Some(last) = config.pipeline.last() {
+            let edge = Edge::new(edge_cap);
+            output_edges.insert(last.name.clone(), edge.clone());
+            egress_sink_edge = Some(edge);
+            log.info("in-process egress (sink drain)", &[
+                ("from", &last.name),
+                ("cap",  &edge_cap.to_string()),
+            ]);
+        }
+    }
+
     supervisor::install_shutdown_handler();
 
     if args.launch_dispatchers {
@@ -193,7 +295,11 @@ fn main() {
                 log.error("dispatcher binary not found", &[("err", &e.to_string())]);
                 std::process::exit(1);
             });
-        supervisor::spawn_dispatchers(&config.dispatchers, &bin, &log);
+        let dispatchers_to_spawn: Vec<_> = config.dispatchers.iter()
+            .filter(|d| !skip_dispatchers.contains(&d.name))
+            .cloned()
+            .collect();
+        supervisor::spawn_dispatchers(&dispatchers_to_spawn, &bin, &log);
     }
 
     let total_max: usize = config.pipeline.iter().map(|s| s.slo.max_replicas).sum();
@@ -265,10 +371,49 @@ fn main() {
     let col_running   = Arc::new(AtomicBool::new(true));
     let col_running2  = col_running.clone();
     let col_log       = log.with_component("master/collector");
+    let col_egress    = egress_sink_edge;
 
     std::thread::spawn(move || {
-        run_collector(&last_stage_output, col_telemetry, col_running2, col_log, test_start);
+        run_collector(&last_stage_output, col_telemetry, col_running2, col_log, test_start, col_egress, custom_sink);
     });
+
+    // ── Source (in-process ingress) ───────────────────────────────────────────
+    // EPICO_SOURCE_GEN=1: the source generates events in-process (no socket, no
+    // loadgen) for a pure pipeline-ceiling measurement. Otherwise it owns a PULL
+    // where an external producer pushes. Either way it feeds the first Edge with
+    // no credits — the Edge capacity is the flow control.
+    if let Some(edge) = ingress_source_edge {
+        let src_log = log.with_component("master/source");
+        // Fan the source out across K threads on the (MPMC) ingress edge. One
+        // thread by default; raise EPICO_SOURCE_THREADS to feed faster than a
+        // single generate-plus-serialize thread can, to find the pipeline's
+        // drain ceiling rather than the source's rate.
+        let threads = std::env::var("EPICO_SOURCE_THREADS")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(1usize).max(1);
+        if let Some(factory) = custom_source {
+            // Native source logic linked into the agent (option A).
+            std::thread::spawn(move || {
+                run_source_native(edge, factory, threads, src_log);
+            });
+        } else if source_gen {
+            let count = std::env::var("EPICO_SOURCE_COUNT")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(5_000_000u64);
+            let sensors = std::env::var("EPICO_SOURCE_SENSORS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(100usize);
+            std::thread::spawn(move || {
+                run_source_gen(edge, count, sensors, threads, src_log);
+            });
+        } else {
+            let ingress_uri = config.dispatchers.iter()
+                .find_map(|d| d.push_uri.clone())
+                .unwrap_or_else(|| "ipc:///tmp/epico-ingress".to_string());
+            std::thread::spawn(move || {
+                run_source(ingress_uri, edge, src_log);
+            });
+        }
+    } else if custom_source.is_some() {
+        log.warn("custom source ignored: no in-process ingress edge", &[]);
+    }
 
     // ── Resource sampler thread ───────────────────────────────────────────────
     // Samples the master process's CPU and RSS. Cadence is configurable via
@@ -336,11 +481,13 @@ fn main() {
         let stage_log   = log.with_component(&format!("autoscaler/{}", stage.name));
         let tel_c       = telemetry.clone();
         let compile_mode_c = config.compile_mode.clone();
+        let in_edge_c   = input_edges.get(&stage.name).cloned();
+        let out_edge_c  = output_edges.get(&stage.name).cloned();
 
         handles.push(std::thread::spawn(move || {
             autoscaler::run_autoscaler_loop(
-                stage_c, ctrl_port, cw, engine_c, stage_log, tel_c, test_start_instant,
-                compile_mode_c,
+                stage_c, ctrl_port, cw, in_edge_c, out_edge_c, engine_c, stage_log, tel_c,
+                test_start_instant, compile_mode_c,
             );
         }));
     }
@@ -384,7 +531,47 @@ fn main() {
         .as_secs_f64();
     let test_duration = test_end - test_start;
 
-    let summary = build_summary(&log, telemetry, test_start, test_duration, &stage_names);
+    // Run configuration snapshot so post-hoc comparison scripts can group
+    // and label runs (credit-window sweeps, replica caps, transport). Each
+    // stage's credit_window lives on its matching DispatcherConfig; the
+    // replica caps live on the stage SLO. A top-level `credit_window`
+    // scalar is emitted only when uniform across stages (the common sweep
+    // case); otherwise it's null and callers read the per-stage list.
+    let run_config = {
+        let mut stages: Vec<serde_json::Value> = Vec::new();
+        let mut cws: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        for st in &config.pipeline {
+            // Dispatchers are named `dispatch-<bare>` where bare is the stage
+            // name with any `fn-` prefix stripped — mirror the lookup the
+            // autoscaler setup uses, otherwise the match silently fails and
+            // every stage reports the default window of 1.
+            let bare = st.name.strip_prefix("fn-").unwrap_or(&st.name);
+            let dispatch_name = format!("dispatch-{}", bare);
+            let disp = config.dispatchers.iter().find(|d| d.name == dispatch_name);
+            let cw = disp.map(|d| d.credit_window).unwrap_or(1);
+            let batch = disp.map(|d| d.batch_events).unwrap_or(1);
+            let transport = disp.and_then(|d| d.push_uri.clone());
+            cws.insert(cw);
+            stages.push(serde_json::json!({
+                "stage":         st.name,
+                "credit_window": cw,
+                "batch_events":  batch,
+                "min_replicas":  st.slo.min_replicas,
+                "max_replicas":  st.slo.max_replicas,
+                "push_uri":      transport,
+            }));
+        }
+        serde_json::json!({
+            "credit_window": if cws.len() == 1 {
+                serde_json::json!(*cws.iter().next().unwrap())
+            } else {
+                serde_json::Value::Null
+            },
+            "stages": stages,
+        })
+    };
+
+    let summary = build_summary(&log, telemetry, test_start, test_duration, &stage_names, run_config);
     if let Err(e) = log.finalize(&summary) {
         log.error("failed to write summary", &[("err", &e.to_string())]);
     }
@@ -454,12 +641,257 @@ fn derive_pub_addr(bind_addr: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Native source / sink contract (option A)
+// ---------------------------------------------------------------------------
+
+/// A native event source linked into the agent. The runtime calls `next_event`
+/// on a dedicated thread and pushes each result into the first stage's Edge.
+/// Returning `None` ends the stream; the runtime then emits the EOS marker so
+/// the collector finalizes the run. Bytes must be a serialized event carrying
+/// `bench_ts_wall` (use [`wall_now`]) for e2e accounting.
+pub trait EventSource: Send {
+    fn next_event(&mut self) -> Option<Vec<u8>>;
+
+    /// Called once on each replica before generation when the source is fanned
+    /// out across `total` threads (`EPICO_SOURCE_THREADS`). A partition-aware
+    /// source should emit a disjoint slice — e.g. only sequence numbers where
+    /// `seq % total == index`. The default is a no-op, in which case every
+    /// replica emits the same stream: fine for a throughput-ceiling measurement
+    /// (the pipeline still drains K× the events), but it duplicates logical
+    /// events, so override this when per-event identity matters.
+    fn set_partition(&mut self, _index: usize, _total: usize) {}
+}
+
+/// Builds a fresh [`EventSource`]. The agent calls it once per source thread so
+/// a native source can be fanned out across `EPICO_SOURCE_THREADS` replicas on
+/// the shared (MPMC) ingress edge. The generated per-pipeline `main.rs` passes
+/// `Some(Box::new(|| Box::new(source::Source::new())))`.
+pub type SourceFactory = Box<dyn FnMut() -> Box<dyn EventSource> + Send>;
+
+/// A native sink linked into the agent. `consume` is called for every finished
+/// event (after the EOS marker is filtered out, before host-side e2e
+/// accounting). Side-effects only — the runtime keeps doing the telemetry.
+pub trait EventSink: Send {
+    fn consume(&mut self, event: &[u8]);
+}
+
+/// Drive a native [`EventSource`] across `threads` replicas on the shared
+/// ingress Edge (MPMC, so multiple producers are safe), then emit a single EOS
+/// marker once all replicas drain so the collector finalizes the run exactly as
+/// for any source. Each replica gets its own instance from the factory and is
+/// told its `(index, total)` via [`EventSource::set_partition`].
+fn run_source_native(out_edge: Edge, mut factory: SourceFactory, threads: usize, log: Logger) {
+    let k = threads.max(1);
+    let deadline = source_deadline();
+    log.info("source driver started (native, in-process)", &[
+        ("threads", &k.to_string()),
+        ("seconds", &deadline.map(|_| std::env::var("EPICO_SOURCE_SECONDS")
+            .unwrap_or_default()).unwrap_or_else(|| "∞".into())),
+    ]);
+
+    let total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut handles = Vec::with_capacity(k);
+    for i in 0..k {
+        let mut source = factory();
+        source.set_partition(i, k);
+        let edge = out_edge.clone();
+        let total = total.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut n: u64 = 0;
+            loop {
+                if supervisor::SHUTDOWN.load(Ordering::Relaxed) { break; }
+                if let Some(dl) = deadline { if std::time::Instant::now() >= dl { break; } }
+                match source.next_event() {
+                    Some(bytes) => {
+                        if !edge.push(bytes, &supervisor::SHUTDOWN) { break; }
+                        n += 1;
+                    }
+                    None => break,
+                }
+            }
+            total.fetch_add(n, Ordering::Relaxed);
+        }));
+    }
+    for h in handles { let _ = h.join(); }
+
+    let n = total.load(Ordering::Relaxed);
+    let eos = serde_json::to_vec(&serde_json::json!({
+        "__epico_eos":     true,
+        "loadgen_sent":    n,
+        "expected_count":  n,
+        "loadgen_done_ts": wall_now(),
+    })).unwrap_or_default();
+    let _ = out_edge.push(eos, &supervisor::SHUTDOWN);
+    log.info("source driver done", &[("count", &n.to_string()), ("threads", &k.to_string())]);
+}
+
+/// Generating source. Produces events in-process — no socket, no loadgen — and
+/// pushes them into the first stage's Edge as fast as the pipeline drains, so
+/// the only thing in the path is the in-process fabric. This measures the
+/// pipeline's intrinsic ceiling. Events match the loadgen's schema so the stages
+/// parse them unchanged, and an EOS marker follows the last event so the
+/// collector finalizes the run exactly as in the socket-fed case.
+///
+/// `bench_ts_wall` is stamped per event at emission, so e2e latency stays
+/// meaningful. If generation itself ever becomes the limit (source thread pegged,
+/// throughput flat, util still low), the next step is a pre-serialized event
+/// pool or sharding the source — but per-event serde is typically well above the
+/// stage ceiling, so the workers should bind first.
+fn run_source_gen(out_edge: Edge, count: u64, sensors: usize, threads: usize, log: Logger) {
+    let k = threads.max(1);
+    let deadline = source_deadline();
+    log.info("source generating (in-process, no socket)", &[
+        ("count",   &count.to_string()),
+        ("sensors", &sensors.max(1).to_string()),
+        ("threads", &k.to_string()),
+        ("seconds", &deadline.map(|_| std::env::var("EPICO_SOURCE_SECONDS")
+            .unwrap_or_default()).unwrap_or_else(|| "∞".into())),
+    ]);
+
+    let total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut handles = Vec::with_capacity(k);
+    for i in 0..k {
+        let edge  = out_edge.clone();
+        let total = total.clone();
+        handles.push(std::thread::spawn(move || {
+            let n = gen_partition(&edge, count, sensors, i, k, deadline);
+            total.fetch_add(n, Ordering::Relaxed);
+        }));
+    }
+    for h in handles { let _ = h.join(); }
+    let sent = total.load(Ordering::Relaxed);
+
+    // EOS marker — same shape the collector keys on to finalize the run.
+    let eos = serde_json::to_vec(&serde_json::json!({
+        "__epico_eos":     true,
+        "loadgen_sent":    sent,
+        "expected_count":  sent,
+        "loadgen_done_ts": wall_now(),
+    })).unwrap_or_default();
+    let _ = out_edge.push(eos, &supervisor::SHUTDOWN);
+    log.info("source done (generated)", &[("count", &sent.to_string()), ("threads", &k.to_string())]);
+}
+
+/// Optional wall-clock cap shared by both source paths. When
+/// `EPICO_SOURCE_SECONDS` is set the source stops after that long and emits EOS,
+/// so a run terminates on its own regardless of whether the source would ever
+/// return `None` (an unbounded generator, or a very large count). Unset = run
+/// until the source is exhausted or shutdown is raised.
+fn source_deadline() -> Option<std::time::Instant> {
+    std::env::var("EPICO_SOURCE_SECONDS").ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|&s| s > 0.0)
+        .map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s))
+}
+
+/// One generator replica. Produces the events assigned to partition `index` of
+/// `stride` (sequence numbers `index, index+stride, index+2*stride, …` below
+/// `count`) and pushes them into the shared ingress Edge. No EOS — the
+/// coordinator emits one after all replicas join. Returns the count pushed.
+fn gen_partition(out_edge: &Edge, count: u64, sensors: usize, index: usize, stride: usize,
+                 deadline: Option<std::time::Instant>) -> u64 {
+    // (type_name, unit, base_value) — mirrors the loadgen's sensor table.
+    const TYPES: &[(&str, &str, f64)] = &[
+        ("temperature", "\u{00b0}C", 22.0),
+        ("vibration",   "mm/s",       1.2),
+        ("pressure",    "kPa",      101.3),
+        ("humidity",    "%",         45.0),
+        ("current",     "A",          3.5),
+    ];
+    const LOCATIONS: &[&str] = &["zone-A", "zone-B", "zone-C", "zone-D"];
+
+    let n = sensors.max(1);
+    // Pre-build static per-sensor descriptors so the hot loop allocates only the
+    // serialized event itself (no per-event id formatting).
+    let descriptors: Vec<(String, &'static str, &'static str, &'static str, f64)> =
+        (0..n).map(|idx| {
+            let (tn, unit, base) = TYPES[idx % TYPES.len()];
+            (format!("sensor-{:04}", idx), tn, unit, LOCATIONS[idx % LOCATIONS.len()], base)
+        }).collect();
+
+    let stride = stride.max(1) as u64;
+    let mut seq: u64 = index as u64;
+    let mut pushed: u64 = 0;
+    while seq < count {
+        if supervisor::SHUTDOWN.load(Ordering::Relaxed) { break; }
+        if let Some(dl) = deadline { if std::time::Instant::now() >= dl { break; } }
+        let (id, type_name, unit, location, base) = &descriptors[(seq as usize) % n];
+        let value      = base + ((seq % 211) as f64) * 0.01;
+        let is_anomaly = seq % 500 == 0;
+        let now_wall   = wall_now();
+
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "bench_ts":      now_wall,
+            "bench_ts_wall": now_wall,
+            "bench_seq":     seq,
+            "sensor_id":     id.as_str(),
+            "sensor_type":   *type_name,
+            "location":      *location,
+            "unit":          *unit,
+            "value":         (value * 10_000.0).round() / 10_000.0,
+            "is_anomaly":    is_anomaly,
+        })).unwrap_or_default();
+
+        if !out_edge.push(bytes, &supervisor::SHUTDOWN) { break; }
+        pushed += 1;
+        seq    += stride;
+    }
+    pushed
+}
+
+pub fn wall_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+/// Single-owner ingress pump (the "source"). Binds a PULL where the external
+/// producer pushes (loadgen now, an upstream node's egress later) and forwards
+/// each event into the first stage's in-process Edge. There is no credit
+/// protocol: the Edge's bounded capacity is the flow control, and when it fills
+/// this loop blocks on `push`, which stops draining the socket and backpressures
+/// the producer. On one host this is the only socket left in the data path.
+fn run_source(ingress_uri: String, out_edge: Edge, log: Logger) {
+    let ctx  = zmq::Context::new();
+    let pull = match ctx.socket(zmq::PULL) {
+        Ok(s)  => s,
+        Err(e) => { log.error("source socket failed", &[("err", &e.to_string())]); return; }
+    };
+    // Short timeout so the loop can observe shutdown; large recv HWM so the
+    // socket can buffer ahead of the Edge without stalling the producer early.
+    pull.set_rcvtimeo(100).ok();
+    pull.set_rcvhwm(100_000).ok();
+    if let Err(e) = pull.bind(&ingress_uri) {
+        log.error("source bind failed", &[("addr", &ingress_uri), ("err", &e.to_string())]);
+        return;
+    }
+    log.info("source bound (in-process ingress)", &[("addr", &ingress_uri)]);
+
+    loop {
+        if supervisor::SHUTDOWN.load(Ordering::Relaxed) { break; }
+        match pull.recv_bytes(0) {
+            Ok(b) => {
+                // push() blocks under backpressure and returns false only if
+                // shutdown was raised while waiting.
+                if !out_edge.push(b, &supervisor::SHUTDOWN) { break; }
+            }
+            Err(zmq::Error::EAGAIN) => continue,
+            Err(_)                  => break,
+        }
+    }
+    log.info("source stopped", &[]);
+}
+
 fn run_collector(
     output_endpoint: &str,
     telemetry: Arc<Mutex<RunTelemetry>>,
     running:   Arc<AtomicBool>,
     log:       Logger,
     test_start: f64,
+    egress_edge: Option<Edge>,
+    mut sink: Option<Box<dyn EventSink>>,
 ) {
     // The output endpoint from config is what workers connect to as PUSH.
     // We bind a PULL socket at the same address to receive those events.
@@ -474,69 +906,72 @@ fn run_collector(
         format!("tcp://0.0.0.0:{}", output_endpoint)
     };
 
-    let ctx  = zmq::Context::new();
-    let pull = match ctx.socket(zmq::PULL) {
-        Ok(s) => s,
-        Err(e) => { log.error("collector socket failed", &[("err", &e.to_string())]); return; }
-    };
-    pull.set_rcvtimeo(200).ok();
-    pull.set_rcvhwm(100_000).ok();
+    // Socket-backed egress binds a PULL (and a PUB tee). In-process egress
+    // (sink) skips both — the collector drains the Edge directly.
+    let (pull, pub_socket): (Option<zmq::Socket>, Option<zmq::Socket>) = if egress_edge.is_some() {
+        log.info("collector draining in-process egress edge (no socket)", &[]);
+        (None, None)
+    } else {
+        let ctx  = zmq::Context::new();
+        let pull = match ctx.socket(zmq::PULL) {
+            Ok(s) => s,
+            Err(e) => { log.error("collector socket failed", &[("err", &e.to_string())]); return; }
+        };
+        pull.set_rcvtimeo(200).ok();
+        pull.set_rcvhwm(100_000).ok();
 
-    if let Err(e) = pull.bind(&bind_addr) {
-        log.error("collector bind failed", &[("addr", &bind_addr), ("err", &e.to_string())]);
-        return;
-    }
-
-    log.info("collector bound", &[("addr", &bind_addr)]);
-
-    // Also bind a PUB socket on collector_port + 1 so external consumers
-    // (dashboards, recorders, anything wanting a copy of finished events)
-    // can SUB to it without competing with the master for the PULL socket.
-    // PUB/SUB has fan-out semantics — every subscriber gets every event,
-    // independently. If no subscriber is connected we drop messages on
-    // the floor, which is fine for a real-time dashboard: missing the
-    // last 200ms of detections during startup costs nothing.
-    //
-    // Choosing port_base+1 instead of a fixed offset keeps this co-
-    // located with the collector port. If the collector is on
-    // tcp://0.0.0.0:9999, the tee is on tcp://0.0.0.0:10000. For ipc://
-    // collectors we append "-pub" to the path.
-    let pub_addr = derive_pub_addr(&bind_addr);
-    let pub_socket = match ctx.socket(zmq::PUB) {
-        Ok(s) => s,
-        Err(e) => {
-            log.error("collector pub socket failed", &[("err", &e.to_string())]);
+        if let Err(e) = pull.bind(&bind_addr) {
+            log.error("collector bind failed", &[("addr", &bind_addr), ("err", &e.to_string())]);
             return;
         }
+
+        log.info("collector bound", &[("addr", &bind_addr)]);
+
+        // Also bind a PUB socket on collector_port + 1 so external consumers
+        // (dashboards, recorders, anything wanting a copy of finished events)
+        // can SUB to it without competing with the master for the PULL socket.
+        let pub_addr = derive_pub_addr(&bind_addr);
+        let pub_socket = match ctx.socket(zmq::PUB) {
+            Ok(s) => s,
+            Err(e) => {
+                log.error("collector pub socket failed", &[("err", &e.to_string())]);
+                return;
+            }
+        };
+        // Don't block the collector if no subscriber is keeping up. Drop
+        // events instead — telemetry is the primary purpose; the tee is a
+        // best-effort copy.
+        pub_socket.set_sndhwm(1000).ok();
+        pub_socket.set_sndtimeo(0).ok();
+        if let Err(e) = pub_socket.bind(&pub_addr) {
+            log.warn("collector pub bind failed (continuing without tee)",
+                     &[("addr", &pub_addr), ("err", &e.to_string())]);
+        } else {
+            log.info("collector pub bound", &[("addr", &pub_addr)]);
+        }
+        (Some(pull), Some(pub_socket))
     };
-    // Don't block the collector if no subscriber is keeping up. Drop
-    // events instead — telemetry is the primary purpose; the tee is a
-    // best-effort copy.
-    pub_socket.set_sndhwm(1000).ok();
-    pub_socket.set_sndtimeo(0).ok();
-    if let Err(e) = pub_socket.bind(&pub_addr) {
-        log.warn("collector pub bind failed (continuing without tee)",
-                 &[("addr", &pub_addr), ("err", &e.to_string())]);
-    } else {
-        log.info("collector pub bound", &[("addr", &pub_addr)]);
-    }
 
     let mut recv_count: u64 = 0;
     let mut eos_received = false;
 
     while running.load(Ordering::Relaxed) {
-        let bytes = match pull.recv_bytes(0) {
-            Ok(b)                   => b,
-            Err(zmq::Error::EAGAIN) => continue,
-            Err(_)                  => continue,
+        let bytes = match &egress_edge {
+            Some(edge) => match edge.try_pop() {
+                Some(b) => b,
+                None    => { std::thread::sleep(Duration::from_micros(200)); continue; }
+            },
+            None => match pull.as_ref().unwrap().recv_bytes(0) {
+                Ok(b)                   => b,
+                Err(zmq::Error::EAGAIN) => continue,
+                Err(_)                  => continue,
+            },
         };
 
-        // Forward a copy to any external subscriber. Best effort: if the
-        // PUB socket queue is full or no one's listening, the send drops
-        // silently (sndtimeo=0). The collector's primary job is
-        // telemetry — we don't want a slow dashboard to delay metric
-        // accounting.
-        let _ = pub_socket.send(&bytes, zmq::DONTWAIT);
+        // Forward a copy to any external subscriber (socket mode only).
+        if let Some(ps) = pub_socket.as_ref() {
+            let _ = ps.send(&bytes, zmq::DONTWAIT);
+        }
 
         // ── EOS detection ────────────────────────────────────────────────
         // The loadgen's `tp` profile emits a marker after the last event;
@@ -553,7 +988,7 @@ fn run_collector(
         // per the flamegraph).
         if !eos_received
             && bytes.len() < 4096
-            && bytes.windows(15).any(|w| w == b"__epico_eos\":")
+            && bytes.windows(EOS_NEEDLE.len()).any(|w| w == EOS_NEEDLE)
         {
             if let Ok(ev) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                 if ev.get("__epico_eos").and_then(|v| v.as_bool()) == Some(true) {
@@ -578,6 +1013,12 @@ fn run_collector(
             // Skip telemetry accounting for the EOS marker itself — it
             // isn't a real event and shouldn't bias e2e_ms or recv_count.
             continue;
+        }
+
+        // Native sink logic (option A): user-supplied side-effect per finished
+        // event, before host-side e2e accounting.
+        if let Some(s) = sink.as_mut() {
+            s.consume(&bytes);
         }
 
         let recv_ts = std::time::SystemTime::now()
@@ -692,6 +1133,7 @@ fn build_summary(
     test_start:    f64,
     test_duration: f64,
     stage_names:   &[String],
+    run_config:    serde_json::Value,
 ) -> serde_json::Value {
     let tel = match telemetry.lock() {
         Ok(t)  => t,
@@ -893,6 +1335,9 @@ fn build_summary(
         .collect();
 
     json!({
+        // ── Run configuration (for cross-run comparison/sweeps) ──────────────
+        "run_config":    run_config,
+
         // ── Paper-grade blocks (primary export) ───────────────────────────────
         "environment":   env_block,
         "counters":      counters_block,
@@ -989,76 +1434,86 @@ fn build_worker_timing_block(
         let empty_u: Vec<u64> = vec![];
         let empty_f: Vec<f64> = vec![];
 
-        let mut total = total_us_samples.get(stage).cloned().unwrap_or_default();
-        let mut serde = serde_us_samples.get(stage).cloned().unwrap_or_default();
-        // wasm_ms → wasm_us (multiply by 1000, round to u64)
-        let wasm_ms_raw = wasm_ms_samples.get(stage).cloned().unwrap_or_default();
-        let mut wasm_us: Vec<u64> = wasm_ms_raw.iter()
-            .map(|&ms| (ms * 1000.0).round() as u64)
-            .collect();
+        // total/serde samples now arrive in NANOSECONDS (worker switched
+        // from as_micros to as_nanos so sub-µs serialization no longer
+        // floors to 0). Convert to µs as f64 here: the summary keys stay
+        // named *_us and stay in microseconds for downstream consumers,
+        // but now carry sub-µs precision instead of truncating.
+        let mut total: Vec<f64> = total_us_samples.get(stage).cloned().unwrap_or_default()
+            .iter().map(|&ns| ns as f64 / 1000.0).collect();
+        let mut serde: Vec<f64> = serde_us_samples.get(stage).cloned().unwrap_or_default()
+            .iter().map(|&ns| ns as f64 / 1000.0).collect();
+        // wasm residence comes from bench hops in ms → µs.
+        let mut wasm_us: Vec<f64> = wasm_ms_samples.get(stage).cloned().unwrap_or_default()
+            .iter().map(|&ms| ms * 1000.0).collect();
 
-        total.sort_unstable();
-        serde.sort_unstable();
-        wasm_us.sort_unstable();
+        total.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        serde.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        wasm_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
         // Overhead = total - wasm. Pair-wise on sorted arrays is not
         // meaningful, so we compute it from percentile arithmetic. For the
         // sample list we approximate via the means.
-        let overhead_p50  = (pct_u64(&total, 0.50) - pct_u64(&wasm_us, 0.50)).max(0.0);
-        let overhead_p99  = (pct_u64(&total, 0.99) - pct_u64(&wasm_us, 0.99)).max(0.0);
-        let overhead_mean = (mean_u64(&total)       - mean_u64(&wasm_us)).max(0.0);
+        let overhead_p50  = (pct_f64(&total, 0.50) - pct_f64(&wasm_us, 0.50)).max(0.0);
+        let overhead_p99  = (pct_f64(&total, 0.99) - pct_f64(&wasm_us, 0.99)).max(0.0);
+        let overhead_mean = (mean_f64(&total)       - mean_f64(&wasm_us)).max(0.0);
 
         // Serde fraction at p50 (how much of total is serialization).
-        let serde_frac_p50 = if pct_u64(&total, 0.50) > 0.0 {
-            pct_u64(&serde, 0.50) / pct_u64(&total, 0.50)
+        // Unit-independent ratio — nonzero now that serde isn't floored.
+        let serde_frac_p50 = if pct_f64(&total, 0.50) > 0.0 {
+            pct_f64(&serde, 0.50) / pct_f64(&total, 0.50)
         } else { 0.0 };
 
         let n = total.len().max(wasm_us.len()).max(serde.len());
 
+        // 3-decimal µs == ns precision; keeps JSON compact.
+        let r3 = |x: f64| (x * 1000.0).round() / 1000.0;
+
         per_stage.insert(stage.clone(), serde_json::json!({
             "n": n,
             "total_us": {
-                "p50":  pct_u64(&total, 0.50),
-                "p95":  pct_u64(&total, 0.95),
-                "p99":  pct_u64(&total, 0.99),
-                "p999": pct_u64(&total, 0.999),
-                "max":  total.last().copied().unwrap_or(0) as f64,
-                "mean": mean_u64(&total),
-                "samples": subsample_u64(&total, 50_000),
+                "p50":  r3(pct_f64(&total, 0.50)),
+                "p95":  r3(pct_f64(&total, 0.95)),
+                "p99":  r3(pct_f64(&total, 0.99)),
+                "p999": r3(pct_f64(&total, 0.999)),
+                "max":  r3(total.last().copied().unwrap_or(0.0)),
+                "mean": r3(mean_f64(&total)),
+                "samples": subsample_f64(&total, 50_000),
             },
             "serde_us": {
-                "p50":  pct_u64(&serde, 0.50),
-                "p95":  pct_u64(&serde, 0.95),
-                "p99":  pct_u64(&serde, 0.99),
-                "max":  serde.last().copied().unwrap_or(0) as f64,
-                "mean": mean_u64(&serde),
-                "samples": subsample_u64(&serde, 50_000),
+                "p50":  r3(pct_f64(&serde, 0.50)),
+                "p95":  r3(pct_f64(&serde, 0.95)),
+                "p99":  r3(pct_f64(&serde, 0.99)),
+                "max":  r3(serde.last().copied().unwrap_or(0.0)),
+                "mean": r3(mean_f64(&serde)),
+                "samples": subsample_f64(&serde, 50_000),
             },
             "wasm_us": {
-                "p50":  pct_u64(&wasm_us, 0.50),
-                "p95":  pct_u64(&wasm_us, 0.95),
-                "p99":  pct_u64(&wasm_us, 0.99),
-                "p999": pct_u64(&wasm_us, 0.999),
-                "max":  wasm_us.last().copied().unwrap_or(0) as f64,
-                "mean": mean_u64(&wasm_us),
-                "samples": subsample_u64(&wasm_us, 50_000),
+                "p50":  r3(pct_f64(&wasm_us, 0.50)),
+                "p95":  r3(pct_f64(&wasm_us, 0.95)),
+                "p99":  r3(pct_f64(&wasm_us, 0.99)),
+                "p999": r3(pct_f64(&wasm_us, 0.999)),
+                "max":  r3(wasm_us.last().copied().unwrap_or(0.0)),
+                "mean": r3(mean_f64(&wasm_us)),
+                "samples": subsample_f64(&wasm_us, 50_000),
             },
             // overhead = total − wasm (recv + deser + val construction + ser + push)
             "overhead_us": {
-                "p50":  overhead_p50,
-                "p99":  overhead_p99,
-                "mean": overhead_mean,
+                "p50":  r3(overhead_p50),
+                "p99":  r3(overhead_p99),
+                "mean": r3(overhead_mean),
             },
             "serde_frac_p50": (serde_frac_p50 * 1000.0).round() / 1000.0,
         }));
 
-        let _ = (empty_u, empty_f, pct_f64, mean_f64); // suppress unused warnings
+        let _ = (empty_u, empty_f, pct_u64, mean_u64); // suppress unused warnings
     }
 
     serde_json::Value::Object(per_stage)
 }
 
 /// Subsample a sorted u64 series to at most `cap` elements.
+#[allow(dead_code)] // retained for callers that still emit integer-µs samples
 fn subsample_u64(src: &[u64], cap: usize) -> Vec<u64> {
     if src.len() <= cap { return src.to_vec(); }
     let k = (src.len() + cap - 1) / cap;

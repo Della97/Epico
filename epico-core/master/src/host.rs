@@ -25,6 +25,7 @@
 #[cfg(feature = "cold-start-opt")]
 use wasmtime::{InstanceAllocationStrategy, OptLevel, PoolingAllocationConfig};
 use wasmtime::Engine;
+use wasmtime::{StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
@@ -42,6 +43,35 @@ pub(crate) struct HostState {
     pub table: ResourceTable,
     pub wasi: WasiCtx,
     pub http: WasiHttpCtx,
+    /// Per-instance resource ceiling (linear memory, tables). Bounds how much
+    /// a single guest can allocate so one component can't exhaust the shared
+    /// host process. Hooked up per-Store via `store.limiter(|s| &mut s.limits)`.
+    pub limits: StoreLimits,
+}
+
+// ---------------------------------------------------------------------------
+// Guest resource & compute bounds
+// ---------------------------------------------------------------------------
+
+/// The epoch ticker advances the engine's epoch once per this many ms. Each
+/// Store arms a per-call deadline in these ticks, so it doubles as the
+/// resolution of the compute-interrupt timer.
+pub(crate) const EPOCH_TICK_MS: u64 = 1;
+
+/// Per-call CPU budget, in epoch ticks (≈ ms). A single guest invocation that
+/// runs longer than this is interrupted with a trap, so a runaway guest can't
+/// pin a worker thread forever in the shared-process model. Generous enough
+/// that well-behaved stream stages never approach it.
+pub(crate) const MAX_CALL_EPOCH_TICKS: u64 = 1_000;
+
+/// Default per-instance resource ceiling. Caps linear-memory and table growth
+/// with ample headroom for legitimate stages — the point is to bound the worst
+/// case (a memory-bomb guest OOM-killing the host), not to constrain normal use.
+pub(crate) fn default_store_limits() -> StoreLimits {
+    StoreLimitsBuilder::new()
+        .memory_size(256 * 1024 * 1024) // 256 MiB per instance
+        .table_elements(1_000_000)
+        .build()
 }
 
 impl WasiView for HostState {
@@ -123,6 +153,11 @@ pub(crate) fn build_engine(total_max_replicas: usize) -> Engine {
 
     let mut wasm_config = wasmtime::Config::new();
     wasm_config.wasm_component_model(true);
+    // Enable cooperative compute interruption: combined with the epoch ticker
+    // thread (spawned below) and a per-call deadline on each Store, this lets a
+    // runaway guest be trapped instead of pinning its worker thread. Applies to
+    // both the AOT and JIT paths so they share the same isolation guarantees.
+    wasm_config.epoch_interruption(true);
 
     #[cfg(feature = "cold-start-opt")]
     {
@@ -181,6 +216,21 @@ pub(crate) fn build_engine(total_max_replicas: usize) -> Engine {
                 e
             );
         }
+    }
+
+    // Epoch ticker: advances the engine's epoch once per EPOCH_TICK_MS so the
+    // per-call deadlines armed on each worker Store actually fire. Detached
+    // daemon for the life of the process; ~1k wakeups/s, negligible cost. The
+    // Engine is Arc-backed, so the clone just shares the same engine.
+    {
+        let ticker_engine = engine.clone();
+        std::thread::Builder::new()
+            .name("epoch-ticker".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(EPOCH_TICK_MS));
+                ticker_engine.increment_epoch();
+            })
+            .expect("failed to spawn epoch ticker");
     }
 
     engine

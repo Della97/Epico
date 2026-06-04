@@ -96,6 +96,12 @@ pub(crate) struct DispatcherConfig {
     /// existing pipelines keep working unchanged.
     #[serde(default = "default_credit_window")]
     pub credit_window: u32,
+    /// Events packed into a single ROUTER message to a worker. Default 1 keeps
+    /// the legacy one-event-per-message wire. Larger values amortise the
+    /// per-message zmq overhead; credits are still counted in events so this is
+    /// orthogonal to `credit_window`.
+    #[serde(default = "default_batch_events")]
+    pub batch_events: usize,
     /// Mirrors the stage's placement — the dispatcher always runs on
     /// the same node as its stage. Used by the placement filter.
     #[serde(default = "default_placement")]
@@ -103,6 +109,7 @@ pub(crate) struct DispatcherConfig {
 }
 
 pub(crate) fn default_credit_window() -> u32 { 1 }
+pub(crate) fn default_batch_events() -> usize { 1 }
 
 // ---------------------------------------------------------------------------
 // Nodes (declared but unused at runtime today)

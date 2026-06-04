@@ -14,6 +14,7 @@ use epico_logger::Logger;
 
 use crate::config::{make_pull_endpoint, make_push_endpoint, PipelineStage};
 use crate::host::HostState;
+use crate::inproc::Edge;
 use crate::worker::{spawn_worker, WorkerHandle};
 use crate::{RunTelemetry, ScalingEvent};
 
@@ -145,6 +146,8 @@ pub(crate) fn run_autoscaler_loop(
     stage:         PipelineStage,
     ctrl_port:     u16,
     credit_window: u32,
+    input_edge:    Option<Edge>,
+    output_edge:   Option<Edge>,
     engine:        Engine,
     log:           Logger,
     telemetry:     Arc<Mutex<RunTelemetry>>,
@@ -236,8 +239,10 @@ pub(crate) fn run_autoscaler_loop(
                 table: ResourceTable::new(),
                 wasi:  WasiCtxBuilder::new().build(),
                 http:  WasiHttpCtx::new(),
+                limits: crate::host::default_store_limits(),
             };
             let mut warmup_store = Store::new(&engine, host_state);
+            warmup_store.limiter(|s| &mut s.limits);
             match instance_pre.instantiate(&mut warmup_store) {
                 Ok(_inst) => {
                     let warmup_ms = t_warm.elapsed().as_secs_f64() * 1000.0;
@@ -328,12 +333,20 @@ pub(crate) fn run_autoscaler_loop(
         let current = workers.len();
         ticks_since_spawn = ticks_since_spawn.saturating_add(1);
 
-        let metrics = match fetch_dispatcher_metrics(&ctrl_socket) {
-            Some(m) => m,
-            None    => continue,
+        // Queue-depth signal. An in-process consumer stage has no dispatcher to
+        // poll, so its input Edge's occupancy is the signal — and we must NOT
+        // `continue` on a missing dispatcher, or the min-replica spawn below
+        // never runs, no worker ever drains the ring, and the pipeline
+        // deadlocks behind backpressure.
+        let (qd, dispatcher_metrics) = match input_edge.as_ref() {
+            Some(edge) => (edge.len() as f64, None),
+            None => match fetch_dispatcher_metrics(&ctrl_socket) {
+                Some(m) => (m.queue_depth, Some(m)),
+                None    => continue,
+            },
         };
-        let qd = metrics.queue_depth;
 
+        if let Some(metrics) = dispatcher_metrics.as_ref() {
         if !metrics.worker_samples.is_empty() {
             if let Ok(mut tel) = telemetry.try_lock() {
                 let t_s = test_start.elapsed().as_secs_f64();
@@ -363,6 +376,7 @@ pub(crate) fn run_autoscaler_loop(
                     }
                 }
             }
+        }
         }
 
         if current > max_rep {
@@ -407,6 +421,7 @@ pub(crate) fn run_autoscaler_loop(
             ]);
             workers.push(spawn_worker(
                 &stage, &in_endpoint, &out_endpoint,
+                input_edge.clone(), output_edge.clone(),
                 credit_window,
                 &engine, instance_pre,
                 &last_active_ts, &avg_latency_us,
@@ -448,6 +463,7 @@ pub(crate) fn run_autoscaler_loop(
             ]);
             workers.push(spawn_worker(
                 &stage, &in_endpoint, &out_endpoint,
+                input_edge.clone(), output_edge.clone(),
                 credit_window,
                 &engine, instance_pre,
                 &last_active_ts, &avg_latency_us,
@@ -483,6 +499,7 @@ pub(crate) fn run_autoscaler_loop(
             ]);
             workers.push(spawn_worker(
                 &stage, &in_endpoint, &out_endpoint,
+                input_edge.clone(), output_edge.clone(),
                 credit_window,
                 &engine, instance_pre,
                 &last_active_ts, &avg_latency_us,
@@ -564,8 +581,16 @@ fn fetch_dispatcher_metrics(ctrl: &zmq::Socket) -> Option<DispatcherMetrics> {
     let mut cold_start_ms_seen: Vec<f64> = Vec::new();
     if let Some(consumers) = json.get("consumers").and_then(|v| v.as_array()) {
         for c in consumers {
-            let total = c.get("total_us").and_then(|v| v.as_u64()).unwrap_or(0);
-            let serde = c.get("serde_us").and_then(|v| v.as_u64()).unwrap_or(0);
+            // Worker now reports nanoseconds (`total_ns`/`serde_ns`) so
+            // sub-µs serde survives. Fall back to the legacy µs keys
+            // (scaled to ns) if an older worker is in the mix. Stored
+            // throughout as nanoseconds; converted to µs at summary time.
+            let total = c.get("total_ns").and_then(|v| v.as_u64())
+                .or_else(|| c.get("total_us").and_then(|v| v.as_u64()).map(|us| us * 1000))
+                .unwrap_or(0);
+            let serde = c.get("serde_ns").and_then(|v| v.as_u64())
+                .or_else(|| c.get("serde_us").and_then(|v| v.as_u64()).map(|us| us * 1000))
+                .unwrap_or(0);
             if total > 0 {
                 worker_samples.push((total, serde));
             }

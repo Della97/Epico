@@ -54,6 +54,14 @@ enum Commands {
         /// Mutually exclusive with --aot.
         #[arg(long)]
         jit: bool,
+        /// Skip the stage (re)build and launch against the .wasm already on
+        /// disk. runtime.yaml is still regenerated from the pipeline YAML, so
+        /// launch-time knobs (batch_events, credit_window, ports, collector,
+        /// scaling caps, resource sampling) take effect immediately. Use this
+        /// to sweep those without paying a wasm recompile each run. Only safe
+        /// when the stage .rs sources are unchanged since the last build.
+        #[arg(long)]
+        no_build: bool,
     },
     /// Generate stage crates + validate components.
     Validate {
@@ -85,8 +93,8 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Build { config, project_root, aot, jit } =>
             cmd_build(&config, project_root.as_deref(), aot, jit),
-        Commands::Run { config, project_root, log_dir, aot, jit } =>
-            cmd_run(&config, project_root.as_deref(), &log_dir, aot, jit),
+        Commands::Run { config, project_root, log_dir, aot, jit, no_build } =>
+            cmd_run(&config, project_root.as_deref(), &log_dir, aot, jit, no_build),
         Commands::Validate { config, project_root } =>
             cmd_validate(&config, project_root.as_deref()),
         Commands::Clean { config, project_root } =>
@@ -110,6 +118,10 @@ fn cmd_build(config_path: &Path, project_root: Option<&Path>, aot: bool, jit: bo
         build::build_stages(&out.workspace_manifest)?;
     } else {
         println!("==> No Rust stages to build (all stages use prebuilt wasm).");
+    }
+
+    if let Some(manifest) = &out.agent_manifest {
+        build::build_agent(manifest)?;
     }
 
     // AOT: precompile .wasm→.cwasm now so the agent deserializes at startup.
@@ -160,7 +172,7 @@ fn cmd_validate(config_path: &Path, project_root: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_run(config_path: &Path, project_root: Option<&Path>, log_dir: &Path, aot: bool, jit: bool) -> Result<()> {
+fn cmd_run(config_path: &Path, project_root: Option<&Path>, log_dir: &Path, aot: bool, jit: bool, no_build: bool) -> Result<()> {
     if aot && jit {
         anyhow::bail!("--aot and --jit are mutually exclusive");
     }
@@ -170,8 +182,25 @@ fn cmd_run(config_path: &Path, project_root: Option<&Path>, log_dir: &Path, aot:
 
     let out = codegen::generate(&spec, &root, &output_dir, compile_mode)?;
 
-    if out.needs_build {
+    if out.needs_build && !no_build {
         build::build_stages(&out.workspace_manifest)?;
+    } else if no_build {
+        // Launch-time-only change (e.g. batch_events / credit_window): skip the
+        // wasm rebuild and use the .wasm already on disk. Sanity-check it exists
+        // so we fail clearly rather than inside the agent.
+        let missing: Vec<_> = out.wasm_by_stage.iter()
+            .filter(|(_, p)| !p.exists())
+            .map(|(s, _)| s.clone())
+            .collect();
+        if !missing.is_empty() {
+            bail!(
+                "--no-build but wasm is missing for stage(s): {}. Run once without \
+                 --no-build to build them first.",
+                missing.join(", ")
+            );
+        }
+        println!("==> --no-build: reusing existing .wasm; runtime.yaml regenerated \
+                  (launch-time config applied)");
     }
 
     // Reconcile AOT/JIT artifacts. AOT: precompile .cwasm now.
@@ -208,6 +237,16 @@ fn cmd_run(config_path: &Path, project_root: Option<&Path>, log_dir: &Path, aot:
     let log_dir_abs = std::env::current_dir()
         .unwrap_or_else(|_| root.clone())
         .join(log_dir);
+
+    // Native source/sink (option A): build the per-pipeline agent with the
+    // user's source/sink compiled in, and launch it instead of stock `master`.
+    // The bootstrap above still ensured the dispatcher binary exists (the agent
+    // resolves it even when it spawns none) and that epico_master compiles.
+    let agent = match &out.agent_manifest {
+        Some(manifest) => build::build_agent(manifest)?,
+        None => agent,
+    };
+
     println!("==> Log directory: {}", log_dir_abs.display());
     println!("==> Component mode: {}",
         if aot { "AOT (.cwasm precompiled)" }

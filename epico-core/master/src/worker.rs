@@ -4,6 +4,7 @@
 //! entire life. Loops: recv event → call process-event → push output →
 //! signal readiness back to dispatcher.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -22,6 +23,7 @@ use crate::conversion::{
     record_val_to_json,
 };
 use crate::host::HostState;
+use crate::inproc::Edge;
 
 // ---------------------------------------------------------------------------
 // Worker handle
@@ -41,6 +43,8 @@ pub(crate) fn spawn_worker(
     stage:          &PipelineStage,
     in_endpoint:    &str,
     out_endpoint:   &str,
+    input_edge:     Option<Edge>,
+    output_edge:    Option<Edge>,
     credit_window:  u32,
     engine:         &Engine,
     instance_pre:   &Arc<InstancePre<HostState>>,
@@ -64,7 +68,7 @@ pub(crate) fn spawn_worker(
 
     let handle = std::thread::spawn(move || {
         run_wasm_worker(
-            stage_clone, in_ep, out_ep, credit_window,
+            stage_clone, in_ep, out_ep, input_edge, output_edge, credit_window,
             engine_clone, instance_pre_clone,
             heartbeat_clone, avg_lat_clone,
             drain_clone, decision_ts, worker_ctx, log,
@@ -76,6 +80,107 @@ pub(crate) fn spawn_worker(
 }
 
 // ---------------------------------------------------------------------------
+// Worker transport
+// ---------------------------------------------------------------------------
+
+/// Where a worker reads its input events from.
+///
+/// `Zmq` is the existing path: a DEALER fed by this stage's dispatcher, with
+/// the credit-window control protocol (hello / refill / per-drop credit return)
+/// layered on top. `Queue` is an in-process edge shared with the upstream
+/// stage's workers — no control protocol, because the bounded ring is itself
+/// the flow control. Phase 2 only ever constructs `Zmq`; `Queue` is wired in
+/// Phase 3.
+enum WorkerInput {
+    Zmq {
+        dealer: zmq::Socket,
+        /// Extra events from a batched ROUTER message, drained one per loop
+        /// iteration before the socket is touched again.
+        pending: VecDeque<Vec<u8>>,
+    },
+    #[allow(dead_code)]
+    Queue(Edge),
+}
+
+impl WorkerInput {
+    /// Next event, or `None` when the worker should exit (drain raised, or the
+    /// input is gone). Encapsulates batch-unpacking on the zmq path and the
+    /// blocking pop on the queue path. Identical receive semantics to the old
+    /// inline loop: drain is checked first, then buffered batch events, then
+    /// the socket; an `EAGAIN` recv timeout retries, a hard error exits.
+    fn next_event(&mut self, drain: &AtomicBool) -> Option<Vec<u8>> {
+        match self {
+            WorkerInput::Zmq { dealer, pending } => loop {
+                if drain.load(Ordering::Relaxed) {
+                    return None;
+                }
+                if let Some(ev) = pending.pop_front() {
+                    return Some(ev);
+                }
+                match dealer.recv_multipart(0) {
+                    Ok(frames) => {
+                        let start = if !frames.is_empty() && frames[0].is_empty() { 1 } else { 0 };
+                        let mut iter = frames.into_iter().skip(start);
+                        match iter.next() {
+                            Some(first) => {
+                                for extra in iter {
+                                    if !extra.is_empty() {
+                                        pending.push_back(extra);
+                                    }
+                                }
+                                return Some(first);
+                            }
+                            None => continue,
+                        }
+                    }
+                    Err(zmq::Error::EAGAIN) => continue,
+                    Err(_)                  => return None,
+                }
+            },
+            WorkerInput::Queue(edge) => edge.pop(drain),
+        }
+    }
+
+    /// True if this input runs the credit-window control protocol. The queue
+    /// path returns false: the bounded ring is its flow control, so hello /
+    /// refill / credit-return are skipped (and their payloads not even built).
+    fn wants_credits(&self) -> bool {
+        matches!(self, WorkerInput::Zmq { .. })
+    }
+
+    /// Send a control frame on the input channel (hello, credit refill, or an
+    /// empty credit-return). No-op on the queue path.
+    fn send_control(&self, bytes: &[u8]) {
+        if let WorkerInput::Zmq { dealer, .. } = self {
+            let _ = dealer.send(bytes, 0);
+        }
+    }
+}
+
+/// Where a worker sends its output events.
+enum WorkerOutput {
+    Zmq { pusher: zmq::Socket },
+    #[allow(dead_code)]
+    Queue(Edge),
+}
+
+impl WorkerOutput {
+    /// Forward one event downstream. On the zmq path this is a PUSH; on the
+    /// queue path it's a bounded enqueue that applies backpressure (and returns
+    /// early if `drain` is raised mid-wait).
+    fn send(&self, bytes: &[u8], drain: &AtomicBool) {
+        match self {
+            WorkerOutput::Zmq { pusher } => {
+                let _ = pusher.send(bytes, 0);
+            }
+            WorkerOutput::Queue(edge) => {
+                edge.push(bytes.to_vec(), drain);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Event loop
 // ---------------------------------------------------------------------------
 
@@ -83,6 +188,8 @@ fn run_wasm_worker(
     stage:          PipelineStage,
     in_endpoint:    String,
     out_endpoint:   String,
+    input_edge:     Option<Edge>,
+    output_edge:    Option<Edge>,
     credit_window:  u32,
     engine:         Engine,
     instance_pre:   Arc<InstancePre<HostState>>,
@@ -133,15 +240,19 @@ fn run_wasm_worker(
     dealer.set_rcvtimeo(50).ok();
     let t_sockets_created_ms = start_time.elapsed().as_secs_f64() * 1000.0;
 
-    if let Err(e) = pusher.connect(&out_endpoint) {
-        log.error("PUSH connect failed", &[("addr", &out_endpoint), ("err", &e.to_string())]);
-        return;
+    if output_edge.is_none() {
+        if let Err(e) = pusher.connect(&out_endpoint) {
+            log.error("PUSH connect failed", &[("addr", &out_endpoint), ("err", &e.to_string())]);
+            return;
+        }
     }
     let t_pusher_connect_ms = start_time.elapsed().as_secs_f64() * 1000.0;
 
-    if let Err(e) = dealer.connect(&in_endpoint) {
-        log.error("DEALER connect failed", &[("addr", &in_endpoint), ("err", &e.to_string())]);
-        return;
+    if input_edge.is_none() {
+        if let Err(e) = dealer.connect(&in_endpoint) {
+            log.error("DEALER connect failed", &[("addr", &in_endpoint), ("err", &e.to_string())]);
+            return;
+        }
     }
     let t_dealer_connect_ms = start_time.elapsed().as_secs_f64() * 1000.0;
 
@@ -150,8 +261,15 @@ fn run_wasm_worker(
         table: ResourceTable::new(),
         wasi:  WasiCtxBuilder::new().build(),
         http:  WasiHttpCtx::new(),
+        limits: crate::host::default_store_limits(),
     };
     let mut store = Store::new(&engine, host_state);
+    // Bound this instance's resource growth and make it interruptible: a guest
+    // that exceeds its memory ceiling gets a graceful error, and one that runs
+    // past its per-call epoch deadline (armed before each call below) traps
+    // instead of pinning this worker thread.
+    store.limiter(|s| &mut s.limits);
+    store.epoch_deadline_trap();
 
     let t_before_instantiate_ms = start_time.elapsed().as_secs_f64() * 1000.0;
     let instance = match instance_pre.instantiate(&mut store) {
@@ -272,7 +390,21 @@ fn run_wasm_worker(
         "{{\"_ctrl\":\"hello\",\"rid\":\"{}\",\"fn\":\"{}\",\"n_credits\":{}}}",
         rid_str, stage.name, credit_window,
     );
-    let _ = dealer.send(hello.as_bytes(), 0);
+    // Build the transport handles. An in-process edge replaces the zmq socket
+    // on that side; the socket created above was never connected, so it's just
+    // dropped here. The credit-window hello is sent only on a zmq input — the
+    // queue path has no credit protocol.
+    let worker_output = match output_edge {
+        Some(edge) => WorkerOutput::Queue(edge),
+        None       => WorkerOutput::Zmq { pusher },
+    };
+    let mut worker_input = match input_edge {
+        Some(edge) => WorkerInput::Queue(edge),
+        None       => {
+            let _ = dealer.send(hello.as_bytes(), 0);
+            WorkerInput::Zmq { dealer, pending: VecDeque::new() }
+        }
+    };
 
     let mut invocation_count: u64 = 0;
     // Events processed since the last credit refill was sent. We refill
@@ -286,18 +418,19 @@ fn run_wasm_worker(
     let mut processed_since_refill: u32 = 0;
 
     // ── Event loop ────────────────────────────────────────────────────────────
+    // Events may arrive batched: one ROUTER message carries
+    // [<delimiter>, ev1, ev2, ...]. We process one event per iteration and
+    // stash the rest of the batch in `pending`, touching the socket only once
+    // the batch drains. This is the receive side of the dispatcher's event
+    // batching — it amortises one recv/poll across the whole batch while the
+    // per-event body below is unchanged. With batch_events=1 each message holds
+    // a single event and `pending` stays empty (legacy behaviour).
     loop {
-        if drain_flag.load(Ordering::Relaxed) { break; }
-
-        let frames = match dealer.recv_multipart(0) {
-            Ok(f)                   => f,
-            Err(zmq::Error::EAGAIN) => continue,
-            Err(_)                  => break,
+        let event_owned = match worker_input.next_event(&drain_flag) {
+            Some(ev) => ev,
+            None     => break,
         };
-
-        let event_bytes = if frames.len() >= 2 { &frames[1] }
-                          else if frames.len() == 1 { &frames[0] }
-                          else { continue };
+        let event_bytes: &[u8] = &event_owned;
 
         if event_bytes.is_empty() { continue; }
 
@@ -308,18 +441,22 @@ fn run_wasm_worker(
             Ordering::Relaxed,
         );
 
-        let mut serde_us: u64 = 0;
+        // Nanosecond resolution: at small payloads parse+serialize is
+        // sub-microsecond, so `as_micros()` floored serde to 0 and made
+        // serde_frac collapse. Measure in ns; the summary still reports
+        // µs (as floats), so sub-µs costs survive instead of truncating.
+        let mut serde_ns: u64 = 0;
 
         let parse_t0 = Instant::now();
         let in_json: serde_json::Value = match serde_json::from_slice(event_bytes) {
             Ok(v)  => v,
             Err(e) => {
                 log.warn("bad json from dispatcher", &[("err", &e.to_string())]);
-                let _ = dealer.send("", 0);
+                worker_input.send_control(b"");
                 continue;
             }
         };
-        serde_us += parse_t0.elapsed().as_micros() as u64;
+        serde_ns += parse_t0.elapsed().as_nanos() as u64;
 
         if in_json.get("__epico_eos").and_then(|v| v.as_bool()) == Some(true) {
             log.info("EOS received; forwarding and exiting", &[
@@ -327,8 +464,8 @@ fn run_wasm_worker(
                 ("loadgen_sent",
                 &in_json.get("loadgen_sent").and_then(|v| v.as_u64()).unwrap_or(0).to_string()),
             ]);
-            let _ = pusher.send(event_bytes, 0);
-            let _ = dealer.send("", 0);
+            worker_output.send(event_bytes, &drain_flag);
+            worker_input.send_control(b"");
             break;
         }
 
@@ -344,11 +481,14 @@ fn run_wasm_worker(
         let t0       = Instant::now();
 
         let mut results = vec![Val::Bool(false); result_types.len()];
+        // Give this invocation a fresh CPU budget. If the guest runs past it the
+        // call returns a trap (handled below) rather than hanging the worker.
+        store.set_epoch_deadline(crate::host::MAX_CALL_EPOCH_TICKS);
         let call_result = process_fn.call(&mut store, &[ev_val, bench_val], &mut results);
 
         if let Err(e) = call_result {
             log.error("process-event call error", &[("err", &e.to_string())]);
-            let _ = dealer.send("", 0);
+            worker_input.send_control(b"");
             let _ = process_fn.post_return(&mut store);
             continue;
         }
@@ -414,15 +554,15 @@ fn run_wasm_worker(
         let serialize_t0 = Instant::now();
         let final_bytes = serde_json::to_vec(&serde_json::Value::Object(final_obj))
             .unwrap_or_default();
-        serde_us += serialize_t0.elapsed().as_micros() as u64;
+        serde_ns += serialize_t0.elapsed().as_nanos() as u64;
 
         let _ = process_fn.post_return(&mut store);
 
         if !final_bytes.is_empty() {
-            let _ = pusher.send(&final_bytes as &[u8], 0);
+            worker_output.send(&final_bytes, &drain_flag);
         }
 
-        let total_us = total_t0.elapsed().as_micros() as u64;
+        let total_ns = total_t0.elapsed().as_nanos() as u64;
         invocation_count += 1;
         processed_since_refill += 1;
 
@@ -430,7 +570,7 @@ fn run_wasm_worker(
         // events since the last one. With larger windows the refill batches credits and
         // metrics together — the metrics_payload for the autoscaler
         // arrives less often but the latest sample is always carried.
-        if processed_since_refill >= refill_threshold {
+        if worker_input.wants_credits() && processed_since_refill >= refill_threshold {
             let latency_ms = latency_us / 1000;
             let refill_payload = format!(
                 "{{\"_ctrl\":\"refill\",\"rid\":\"{}\",\"fn\":\"{}\",\
@@ -444,7 +584,7 @@ fn run_wasm_worker(
                  \"ph_instantiate_ms\":{:.5},\"ph_export_ms\":{:.5},\
                  \"ph_tail_ms\":{:.5},\
                  \"is_leader\":false,\"p99_latency_ms\":{},\
-                 \"total_us\":{},\"serde_us\":{},\"n_credits\":{}}}",
+                 \"total_ns\":{},\"serde_ns\":{},\"n_credits\":{}}}",
                 rid_str, stage.name, cold_start_ms, spawn_ts,
                 spawn_to_thread_ms,
                 phase_ctx_ms,
@@ -454,9 +594,9 @@ fn run_wasm_worker(
                 phase_pre_inst_ms,
                 phase_instantiate_ms, phase_export_ms,
                 phase_tail_ms,
-                latency_ms, total_us, serde_us, processed_since_refill,
+                latency_ms, total_ns, serde_ns, processed_since_refill,
             );
-            let _ = dealer.send(refill_payload.as_bytes(), 0);
+            worker_input.send_control(refill_payload.as_bytes());
             processed_since_refill = 0;
         }
     }
