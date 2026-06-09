@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::collections::{HashMap, HashSet};
 
+use bytes::Bytes;
 use clap::Parser;
 use epico_logger::Logger;
 use serde_json::json;
@@ -17,6 +18,7 @@ use serde_json::json;
 mod autoscaler;
 mod config;
 mod conversion;
+mod envelope;
 mod host;
 mod inproc;
 mod pipeline_validator;
@@ -29,7 +31,7 @@ use crate::inproc::Edge;
 
 /// In-flight bound for an in-process edge (prototype). Plays the role
 /// `credit_window` plays on the zmq path; promote to per-edge config later.
-const INPROC_EDGE_CAPACITY: usize = 1;
+const INPROC_EDGE_CAPACITY: usize = 1024;
 /// Substring every EOS marker contains; the collector scans for it (cheap)
 /// before the confirming JSON parse. Must be matched with a window of its own
 /// length — a wrong window size silently never matches and the run never ends.
@@ -481,13 +483,14 @@ pub fn run_agent(
         let stage_log   = log.with_component(&format!("autoscaler/{}", stage.name));
         let tel_c       = telemetry.clone();
         let compile_mode_c = config.compile_mode.clone();
+        let event_format_c = config.event_format.clone();
         let in_edge_c   = input_edges.get(&stage.name).cloned();
         let out_edge_c  = output_edges.get(&stage.name).cloned();
 
         handles.push(std::thread::spawn(move || {
             autoscaler::run_autoscaler_loop(
                 stage_c, ctrl_port, cw, in_edge_c, out_edge_c, engine_c, stage_log, tel_c,
-                test_start_instant, compile_mode_c,
+                test_start_instant, compile_mode_c, event_format_c,
             );
         }));
     }
@@ -704,7 +707,7 @@ fn run_source_native(out_edge: Edge, mut factory: SourceFactory, threads: usize,
                 if let Some(dl) = deadline { if std::time::Instant::now() >= dl { break; } }
                 match source.next_event() {
                     Some(bytes) => {
-                        if !edge.push(bytes, &supervisor::SHUTDOWN) { break; }
+                        if !edge.push(Bytes::from(bytes), &supervisor::SHUTDOWN) { break; }
                         n += 1;
                     }
                     None => break,
@@ -722,7 +725,7 @@ fn run_source_native(out_edge: Edge, mut factory: SourceFactory, threads: usize,
         "expected_count":  n,
         "loadgen_done_ts": wall_now(),
     })).unwrap_or_default();
-    let _ = out_edge.push(eos, &supervisor::SHUTDOWN);
+    let _ = out_edge.push(Bytes::from(eos), &supervisor::SHUTDOWN);
     log.info("source driver done", &[("count", &n.to_string()), ("threads", &k.to_string())]);
 }
 
@@ -769,7 +772,7 @@ fn run_source_gen(out_edge: Edge, count: u64, sensors: usize, threads: usize, lo
         "expected_count":  sent,
         "loadgen_done_ts": wall_now(),
     })).unwrap_or_default();
-    let _ = out_edge.push(eos, &supervisor::SHUTDOWN);
+    let _ = out_edge.push(Bytes::from(eos), &supervisor::SHUTDOWN);
     log.info("source done (generated)", &[("count", &sent.to_string()), ("threads", &k.to_string())]);
 }
 
@@ -833,7 +836,7 @@ fn gen_partition(out_edge: &Edge, count: u64, sensors: usize, index: usize, stri
             "is_anomaly":    is_anomaly,
         })).unwrap_or_default();
 
-        if !out_edge.push(bytes, &supervisor::SHUTDOWN) { break; }
+        if !out_edge.push(Bytes::from(bytes), &supervisor::SHUTDOWN) { break; }
         pushed += 1;
         seq    += stride;
     }
@@ -875,7 +878,7 @@ fn run_source(ingress_uri: String, out_edge: Edge, log: Logger) {
             Ok(b) => {
                 // push() blocks under backpressure and returns false only if
                 // shutdown was raised while waiting.
-                if !out_edge.push(b, &supervisor::SHUTDOWN) { break; }
+	                if !out_edge.push(Bytes::from(b), &supervisor::SHUTDOWN) { break; }
             }
             Err(zmq::Error::EAGAIN) => continue,
             Err(_)                  => break,
@@ -962,7 +965,7 @@ fn run_collector(
                 None    => { std::thread::sleep(Duration::from_micros(200)); continue; }
             },
             None => match pull.as_ref().unwrap().recv_bytes(0) {
-                Ok(b)                   => b,
+                Ok(b)                   => Bytes::from(b),
                 Err(zmq::Error::EAGAIN) => continue,
                 Err(_)                  => continue,
             },
@@ -970,7 +973,7 @@ fn run_collector(
 
         // Forward a copy to any external subscriber (socket mode only).
         if let Some(ps) = pub_socket.as_ref() {
-            let _ = ps.send(&bytes, zmq::DONTWAIT);
+            let _ = ps.send(bytes.as_ref(), zmq::DONTWAIT);
         }
 
         // ── EOS detection ────────────────────────────────────────────────

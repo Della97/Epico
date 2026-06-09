@@ -16,8 +16,8 @@
 //!     signaler round-trip that came with it) with a single shared bound.
 //!   * Load-balancing is the MPMC pop — the next idle consumer takes the next
 //!     event (work-stealing), replacing the dispatcher's ROUTER fan-out.
-//!   * No serialization is forced by the transport: the event is moved as the
-//!     bytes it already is (Vec<u8>); nothing is re-encoded to cross the edge.
+//!   * No serialization is forced by the transport: the event is moved as a
+//!     shared byte buffer (`Bytes`); nothing is re-encoded to cross the edge.
 //!
 //! The wait path uses spin → yield → short-sleep backoff so an idle edge does
 //! not burn a core — i.e. it does not reintroduce the busy-poll cost that the
@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_queue::ArrayQueue;
+use bytes::Bytes;
 
 /// A single in-process edge between two stages.
 ///
@@ -36,7 +37,7 @@ use crossbeam_queue::ArrayQueue;
 /// the edge holds its own `Edge` handle pointing at one ring.
 #[derive(Clone)]
 pub(crate) struct Edge {
-    ring: Arc<ArrayQueue<Vec<u8>>>,
+    ring: Arc<ArrayQueue<Bytes>>,
 }
 
 impl Edge {
@@ -71,7 +72,7 @@ impl Edge {
     /// Returns `false` if `drain` is raised while waiting — i.e. the pipeline is
     /// shutting down and the event should be dropped rather than block forever.
     #[inline]
-    pub fn push(&self, item: Vec<u8>, drain: &AtomicBool) -> bool {
+    pub fn push(&self, item: Bytes, drain: &AtomicBool) -> bool {
         // Fast path: room immediately.
         let mut pending = match self.ring.push(item) {
             Ok(()) => return true,
@@ -94,7 +95,7 @@ impl Edge {
     /// until one is available. Returns `None` if `drain` is raised while the
     /// ring is empty (clean shutdown).
     #[inline]
-    pub fn pop(&self, drain: &AtomicBool) -> Option<Vec<u8>> {
+    pub fn pop(&self, drain: &AtomicBool) -> Option<Bytes> {
         // Fast path: item immediately.
         if let Some(item) = self.ring.pop() {
             return Some(item);
@@ -116,7 +117,7 @@ impl Edge {
     /// Non-blocking dequeue — used when a consumer wants to interleave queue
     /// draining with other work without committing to a blocking wait.
     #[inline]
-    pub fn try_pop(&self) -> Option<Vec<u8>> {
+    pub fn try_pop(&self) -> Option<Bytes> {
         self.ring.pop()
     }
 }

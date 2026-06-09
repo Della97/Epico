@@ -153,6 +153,7 @@ pub(crate) fn run_autoscaler_loop(
     telemetry:     Arc<Mutex<RunTelemetry>>,
     test_start:    Instant,
     compile_mode:  String,
+    event_format:  String,
 ) {
     let min_rep  = stage.slo.min_replicas;
     let max_rep  = stage.slo.max_replicas;
@@ -427,6 +428,7 @@ pub(crate) fn run_autoscaler_loop(
                 &last_active_ts, &avg_latency_us,
                 decision_ts,
                 worker_ctx.clone(),
+                event_format.clone(),
                 log.with_component(&format!("worker/{}", stage.name)),
             ));
             if let Ok(mut tel) = telemetry.lock() {
@@ -469,6 +471,7 @@ pub(crate) fn run_autoscaler_loop(
                 &last_active_ts, &avg_latency_us,
                 decision_ts,
                 worker_ctx.clone(),
+                event_format.clone(),
                 log.with_component(&format!("worker/{}", stage.name)),
             ));
             record_event(&telemetry, test_start, &stage.name, "spawn",
@@ -505,6 +508,7 @@ pub(crate) fn run_autoscaler_loop(
                 &last_active_ts, &avg_latency_us,
                 decision_ts,
                 worker_ctx.clone(),
+                event_format.clone(),
                 log.with_component(&format!("worker/{}", stage.name)),
             ));
             record_event(&telemetry, test_start, &stage.name, "spawn",

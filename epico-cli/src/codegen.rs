@@ -125,6 +125,7 @@ pub fn generate(
     // Emit runtime.yaml the agent can consume.
     let runtime_yaml_path = output_dir.join("runtime.yaml");
     write_runtime_yaml(&runtime_yaml_path, spec, &wasm_by_stage, compile_mode)?;
+    write_binary_schema_artifact(output_dir, spec)?;
 
     // If the pipeline declares native source/sink nodes, scaffold a per-pipeline
     // agent crate that links them into `epico_master` (option A).
@@ -873,6 +874,7 @@ fn write_runtime_yaml(
          ingress:   {ingress}\n\
          collector: {collector}\n\
          resource_sample_interval_ms: {rsi}\n\
+         event_format: {event_format}\n\
          {cm}\n\
          {nodes}\n\
          {d}\n\
@@ -882,12 +884,64 @@ fn write_runtime_yaml(
         ingress = spec.ingress,
         collector = spec.collector,
         rsi = spec.resource_sample_interval_ms,
+        event_format = spec.event_format,
         cm = compile_mode_line,
         nodes = nodes_block,
         d = dispatchers,
         p = pipeline,
     );
     std::fs::write(path, combined)?;
+    Ok(())
+}
+
+/// Emit the first binary-envelope schema artifact.
+///
+/// This is intentionally descriptive rather than executable: it freezes the
+/// field order, WIT names, JSON names, and primitive tags the eventual binary
+/// row codec should use. Keeping it generated from `types:` means the next
+/// implementation step can consume this artifact or replace it with generated
+/// Rust without changing the user-facing YAML.
+fn write_binary_schema_artifact(output_dir: &Path, spec: &PipelineSpec) -> Result<()> {
+    let schema_path = output_dir.join("binary-schema.json");
+    let mut type_entries = serde_json::Map::new();
+
+    for (type_name, typedef) in &spec.types {
+        let fields: Vec<serde_json::Value> = typedef
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(idx, (field_name, field_type))| {
+                let optional = field_type.ends_with('?');
+                let base = field_type.strip_suffix('?').unwrap_or(field_type);
+                serde_json::json!({
+                    "id": idx,
+                    "json_name": field_name,
+                    "wit_name": to_wit_ident(field_name),
+                    "type": base,
+                    "optional": optional,
+                })
+            })
+            .collect();
+        type_entries.insert(type_name.clone(), serde_json::json!({ "fields": fields }));
+    }
+
+    let schema = serde_json::json!({
+        "format": "epico-binary-envelope",
+        "version": 1,
+        "status": "schema-artifact-only",
+        "notes": [
+            "JSON is still the only fully implemented event codec.",
+            "This artifact records generated field ids/order for the binary row codec."
+        ],
+        "types": type_entries,
+        "stages": spec.stages.iter().map(|s| serde_json::json!({
+            "name": s.name,
+            "in": s.input_type,
+            "out": s.output_type,
+        })).collect::<Vec<_>>(),
+    });
+
+    std::fs::write(schema_path, serde_json::to_vec_pretty(&schema)?)?;
     Ok(())
 }
 

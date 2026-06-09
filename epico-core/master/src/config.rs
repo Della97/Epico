@@ -166,6 +166,10 @@ pub(crate) struct Config {
     ///               the loop; compilation is NOT counted in cold-start latency.
     #[serde(default = "default_compile_mode")]
     pub compile_mode: String,
+    /// Event envelope format. `json` is the compatible default. `binary` is
+    /// scaffolded as the next transport mode, but not yet accepted for real runs.
+    #[serde(default = "default_event_format")]
+    pub event_format: String,
 }
 
 pub(crate) fn default_resource_sample_interval_ms() -> u64 {
@@ -174,6 +178,10 @@ pub(crate) fn default_resource_sample_interval_ms() -> u64 {
 
 pub(crate) fn default_compile_mode() -> String {
     "startup".to_string()
+}
+
+pub(crate) fn default_event_format() -> String {
+    "json".to_string()
 }
 
 // ---------------------------------------------------------------------------

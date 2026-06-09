@@ -96,6 +96,24 @@ pub(crate) fn extract_record_fields(ty: &Type) -> Vec<RecordField> {
     fields
 }
 
+/// Extract the event record fields from a `process-event` result type.
+///
+/// The current WIT shape returns `tuple<event, bench-ctx>`, which Wasmtime
+/// exposes as one `Type::Tuple` result. The domain event is the first tuple
+/// member. Older/future shapes that return the event record directly are also
+/// accepted.
+pub(crate) fn extract_result_event_fields(ty: &Type) -> Vec<RecordField> {
+    match ty {
+        Type::Tuple(tuple) => tuple
+            .types()
+            .next()
+            .map(|event_ty| extract_record_fields(&event_ty))
+            .unwrap_or_default(),
+        Type::Record(_) => extract_record_fields(ty),
+        _ => Vec::new(),
+    }
+}
+
 fn type_to_kind(ty: &Type) -> FieldKind {
     match ty {
         Type::String => FieldKind::String,

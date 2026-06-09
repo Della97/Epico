@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use wasmtime::component::types::ComponentItem;
 use wasmtime::component::{Func, InstancePre, Type, Val};
 use wasmtime::{Engine, Store};
@@ -18,10 +19,8 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use epico_logger::Logger;
 
 use crate::config::PipelineStage;
-use crate::conversion::{
-    bench_val_to_json, extract_record_fields, json_to_bench_val, json_to_record_val,
-    record_val_to_json,
-};
+use crate::conversion::{extract_record_fields, extract_result_event_fields};
+use crate::envelope::{EnvelopeFormat, EventEnvelope};
 use crate::host::HostState;
 use crate::inproc::Edge;
 
@@ -52,6 +51,7 @@ pub(crate) fn spawn_worker(
     avg_latency_us: &Arc<AtomicU64>,
     decision_ts:    f64,
     worker_ctx:     zmq::Context,
+    event_format:   String,
     log:            Logger,
 ) -> WorkerHandle {
     let stage_clone       = stage.clone();
@@ -71,7 +71,7 @@ pub(crate) fn spawn_worker(
             stage_clone, in_ep, out_ep, input_edge, output_edge, credit_window,
             engine_clone, instance_pre_clone,
             heartbeat_clone, avg_lat_clone,
-            drain_clone, decision_ts, worker_ctx, log,
+            drain_clone, decision_ts, worker_ctx, event_format, log,
         );
         done_clone.store(true, Ordering::Relaxed);
     });
@@ -96,7 +96,7 @@ enum WorkerInput {
         dealer: zmq::Socket,
         /// Extra events from a batched ROUTER message, drained one per loop
         /// iteration before the socket is touched again.
-        pending: VecDeque<Vec<u8>>,
+        pending: VecDeque<Bytes>,
     },
     #[allow(dead_code)]
     Queue(Edge),
@@ -108,7 +108,7 @@ impl WorkerInput {
     /// blocking pop on the queue path. Identical receive semantics to the old
     /// inline loop: drain is checked first, then buffered batch events, then
     /// the socket; an `EAGAIN` recv timeout retries, a hard error exits.
-    fn next_event(&mut self, drain: &AtomicBool) -> Option<Vec<u8>> {
+    fn next_event(&mut self, drain: &AtomicBool) -> Option<Bytes> {
         match self {
             WorkerInput::Zmq { dealer, pending } => loop {
                 if drain.load(Ordering::Relaxed) {
@@ -125,10 +125,10 @@ impl WorkerInput {
                             Some(first) => {
                                 for extra in iter {
                                     if !extra.is_empty() {
-                                        pending.push_back(extra);
+                                        pending.push_back(Bytes::from(extra));
                                     }
                                 }
-                                return Some(first);
+                                return Some(Bytes::from(first));
                             }
                             None => continue,
                         }
@@ -168,13 +168,13 @@ impl WorkerOutput {
     /// Forward one event downstream. On the zmq path this is a PUSH; on the
     /// queue path it's a bounded enqueue that applies backpressure (and returns
     /// early if `drain` is raised mid-wait).
-    fn send(&self, bytes: &[u8], drain: &AtomicBool) {
+    fn send(&self, bytes: Bytes, drain: &AtomicBool) {
         match self {
             WorkerOutput::Zmq { pusher } => {
-                let _ = pusher.send(bytes, 0);
+                let _ = pusher.send(bytes.as_ref(), 0);
             }
             WorkerOutput::Queue(edge) => {
-                edge.push(bytes.to_vec(), drain);
+                edge.push(bytes, drain);
             }
         }
     }
@@ -198,6 +198,7 @@ fn run_wasm_worker(
     drain_flag:     Arc<AtomicBool>,
     decision_ts:    f64,
     worker_ctx:     zmq::Context,
+    event_format:   String,
     log:            Logger,
 ) {
     let spawn_ts   = decision_ts;
@@ -329,7 +330,17 @@ fn run_wasm_worker(
     }
 
     let in_fields  = extract_record_fields(&param_types[0]);
-    let _out_fields = extract_record_fields(&result_types[0]);
+    let out_fields = result_types
+        .first()
+        .map(extract_result_event_fields)
+        .unwrap_or_default();
+    let envelope_format = match EnvelopeFormat::parse(&event_format) {
+        Ok(f) => f,
+        Err(e) => {
+            log.error("bad event_format", &[("err", &e.to_string())]);
+            return;
+        }
+    };
 
     let t_export_lookup_ms = start_time.elapsed().as_secs_f64() * 1000.0;
 
@@ -430,7 +441,7 @@ fn run_wasm_worker(
             Some(ev) => ev,
             None     => break,
         };
-        let event_bytes: &[u8] = &event_owned;
+        let event_bytes: &[u8] = event_owned.as_ref();
 
         if event_bytes.is_empty() { continue; }
 
@@ -448,34 +459,41 @@ fn run_wasm_worker(
         let mut serde_ns: u64 = 0;
 
         let parse_t0 = Instant::now();
-        let in_json: serde_json::Value = match serde_json::from_slice(event_bytes) {
+        let envelope = match EventEnvelope::decode(envelope_format, event_owned.clone()) {
             Ok(v)  => v,
             Err(e) => {
-                log.warn("bad json from dispatcher", &[("err", &e.to_string())]);
+                log.warn("bad event envelope from dispatcher", &[("err", &e.to_string())]);
                 worker_input.send_control(b"");
                 continue;
             }
         };
         serde_ns += parse_t0.elapsed().as_nanos() as u64;
 
-        if in_json.get("__epico_eos").and_then(|v| v.as_bool()) == Some(true) {
+        if envelope.is_eos() {
             log.info("EOS received; forwarding and exiting", &[
                 ("stage", &stage.name),
-                ("loadgen_sent",
-                &in_json.get("loadgen_sent").and_then(|v| v.as_u64()).unwrap_or(0).to_string()),
             ]);
-            worker_output.send(event_bytes, &drain_flag);
+            worker_output.send(event_owned.clone(), &drain_flag);
             worker_input.send_control(b"");
             break;
         }
 
-        // DEBUG: log input/output status sizes to localize where event
-        // fields are being lost.
-        let _in_status_len = in_json.get("status")
-            .and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
-
-        let ev_val    = json_to_record_val(&in_json, &in_fields, &param_types[0]);
-        let bench_val = json_to_bench_val(&in_json, &param_types[1]);
+        let ev_val = match envelope.input_val(&in_fields, &param_types[0]) {
+            Ok(v) => v,
+            Err(e) => {
+                log.error("event decode failed", &[("err", &e.to_string())]);
+                worker_input.send_control(b"");
+                continue;
+            }
+        };
+        let bench_val = match envelope.bench_val(&param_types[1]) {
+            Ok(v) => v,
+            Err(e) => {
+                log.error("bench decode failed", &[("err", &e.to_string())]);
+                worker_input.send_control(b"");
+                continue;
+            }
+        };
 
         let enter_ts = now_secs_f64();
         let t0       = Instant::now();
@@ -498,7 +516,7 @@ fn run_wasm_worker(
         let prev_us    = avg_latency_us.load(Ordering::Relaxed);
         avg_latency_us.store((prev_us * 3 + latency_us) / 4, Ordering::Relaxed);
 
-        let out_json = if !results.is_empty() {
+        let final_bytes = if !results.is_empty() {
             // The WIT signature is `process-event(...) -> tuple<event, bench-ctx>`.
             // wasmtime exposes that as a single result of Type::Tuple,
             // not as two separate results. Drill into the tuple:
@@ -515,12 +533,6 @@ fn run_wasm_worker(
                 }
                 _ => (results[0].clone(), None),
             };
-            // Use in_fields (the event's field schema), not out_fields,
-            // because out_fields was extracted from the tuple — which
-            // has no named fields and thus is empty. The event record
-            // schema is identical to in_fields by construction (input
-            // and output are both `event`).
-            let json = record_val_to_json(&event_val, &in_fields);
             // Stash bench_val into results[1] slot for the bench_json
             // call below, which expects results.get(1).
             if let Some(bv) = bench_val_from_tuple {
@@ -530,36 +542,35 @@ fn run_wasm_worker(
                     results[1] = bv;
                 }
             }
-            json
+            let bench_result = results.get(1).unwrap_or(&Val::Bool(false));
+            let fields = if out_fields.is_empty() { &in_fields } else { &out_fields };
+            match envelope.encode_output(
+                &event_val,
+                fields,
+                bench_result,
+                &stage.name,
+                enter_ts,
+                exit_ts,
+            ) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    log.error("event encode failed", &[("err", &e.to_string())]);
+                    worker_input.send_control(b"");
+                    let _ = process_fn.post_return(&mut store);
+                    continue;
+                }
+            }
         } else {
-            serde_json::Value::Object(Default::default())
+            Bytes::new()
         };
-
-        let _out_status_len = out_json.get("status")
-            .and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
-
-        let bench_json = bench_val_to_json(
-            results.get(1).unwrap_or(&Val::Bool(false)),
-            &in_json, &stage.name, enter_ts, exit_ts,
-        );
-
-        let mut final_obj = match out_json {
-            serde_json::Value::Object(m) => m,
-            _                            => serde_json::Map::new(),
-        };
-        if let serde_json::Value::Object(bm) = bench_json {
-            for (k, v) in bm { final_obj.insert(k, v); }
-        }
 
         let serialize_t0 = Instant::now();
-        let final_bytes = serde_json::to_vec(&serde_json::Value::Object(final_obj))
-            .unwrap_or_default();
         serde_ns += serialize_t0.elapsed().as_nanos() as u64;
 
         let _ = process_fn.post_return(&mut store);
 
         if !final_bytes.is_empty() {
-            worker_output.send(&final_bytes, &drain_flag);
+            worker_output.send(final_bytes, &drain_flag);
         }
 
         let total_ns = total_t0.elapsed().as_nanos() as u64;

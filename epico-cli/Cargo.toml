@@ -15,6 +15,7 @@ clap = { version = "4", features = ["derive"] }
 # YAML parsing for pipeline.yaml (both old and new format)
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+serde_json = "1"
 
 # Error handling
 anyhow = "1"

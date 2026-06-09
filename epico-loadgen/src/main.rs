@@ -106,6 +106,14 @@ struct Args {
     /// loadgen connects to a non-epico ingress for cross-stack tests).
     #[arg(long)]
     external_entry: Option<String>,
+
+    /// (tp profile) Reuse ONE pre-serialized event buffer instead of
+    /// generating a fresh event per send. Removes the loadgen's per-event
+    /// rng + serde cost (~10-15 us) so a single producer thread can saturate
+    /// any in-process transport. THROUGHPUT ONLY: `bench_ts` is stamped once,
+    /// so e2e latency is meaningless under --blast. Ignored unless profile=tp.
+    #[arg(long)]
+    blast: bool,
 }
 
 // ============================================================================
@@ -402,6 +410,7 @@ fn main() -> Result<()> {
     let args_burst_dur    = args.burst_duration;
     let args_wave_min     = args.wave_min;
     let args_wave_period  = args.wave_period;
+    let args_blast        = args.blast;
 
     let producer = std::thread::spawn(move || {
         if args_profile == "tp" {
@@ -422,18 +431,39 @@ fn main() -> Result<()> {
             let mut sent_n = 0u64;
             let mut anom_n = 0u64;
 
-            while running_c.load(Ordering::Relaxed) && sent_n < tp_count {
-                let sensor = &mut sensors[si % n_sensors];
-                si += 1;
-                let (bytes, is_anom) = sensor.reading(seq);
-                seq += 1;
-                match push.send(&bytes as &[u8], 0) {
-                    Ok(_)  => {
-                        sent_n += 1;
-                        if is_anom { anom_n += 1; }
+            if args_blast {
+                // Pre-serialize a single event once, then resend the same
+                // bytes so the hot loop is nothing but push.send(). This
+                // removes the per-event rng + serde cost that otherwise caps a
+                // single producer thread at ~60-100k ev/s, letting the loadgen
+                // outpace (and therefore actually measure) the transport under
+                // test. bench_ts is frozen at build time, so DO NOT read e2e
+                // latency from a --blast run.
+                let (cached, _) = sensors[0].reading(0);
+                log_prod.info("tp blast mode (cached event, latency invalid)", &[
+                    ("bytes", &cached.len().to_string()),
+                    ("count", &tp_count.to_string()),
+                ]);
+                while running_c.load(Ordering::Relaxed) && sent_n < tp_count {
+                    match push.send(&cached as &[u8], 0) {
+                        Ok(_)  => sent_n += 1,
+                        Err(_) => { dropped_c.fetch_add(1, Ordering::Relaxed); }
                     }
-                    Err(_) => {
-                        dropped_c.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                while running_c.load(Ordering::Relaxed) && sent_n < tp_count {
+                    let sensor = &mut sensors[si % n_sensors];
+                    si += 1;
+                    let (bytes, is_anom) = sensor.reading(seq);
+                    seq += 1;
+                    match push.send(&bytes as &[u8], 0) {
+                        Ok(_)  => {
+                            sent_n += 1;
+                            if is_anom { anom_n += 1; }
+                        }
+                        Err(_) => {
+                            dropped_c.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }

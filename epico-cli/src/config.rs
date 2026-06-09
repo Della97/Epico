@@ -120,6 +120,9 @@ pub struct PipelineSpec {
     /// Events per ROUTER message to a worker. Default 1. Amortises the
     /// per-message zmq poll/command overhead; orthogonal to credit_window.
     pub batch_events: usize,
+    /// Transport envelope format for events. `json` is the compatible default;
+    /// `binary` is reserved for the generated binary envelope path.
+    pub event_format: String,
 }
 
 /// A native boundary node (source or sink) compiled into the per-pipeline
@@ -346,6 +349,10 @@ struct DeploySpec {
     /// event per message). Larger values amortise per-message zmq overhead;
     /// orthogonal to credit_window (credits are still counted in events).
     batch_events: Option<usize>,
+    /// Event envelope format. Defaults to `json`. `binary` is currently emitted
+    /// as an experimental runtime knob and schema artifact, but JSON remains the
+    /// only fully implemented codec.
+    event_format: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -682,6 +689,12 @@ fn from_new_format(raw: NewFormat, yaml_dir: &Path) -> Result<PipelineSpec> {
         None => None,
     };
 
+    let event_format = raw.deploy.event_format.unwrap_or_else(|| "json".to_string());
+    match event_format.as_str() {
+        "json" | "binary" | "epico-binary" => {}
+        other => bail!("deploy.event_format {:?} is invalid; expected `json` or `binary`", other),
+    }
+
     Ok(PipelineSpec {
         package: raw.package,
         nodes,
@@ -702,6 +715,7 @@ fn from_new_format(raw: NewFormat, yaml_dir: &Path) -> Result<PipelineSpec> {
         resource_sample_interval_ms: raw.deploy.resource_sample_interval_ms.unwrap_or(1000),
         credit_window: raw.deploy.credit_window.unwrap_or(1),
         batch_events: raw.deploy.batch_events.unwrap_or(1),
+        event_format,
     })
 }
 
@@ -806,5 +820,6 @@ fn from_old_format(raw: OldFormat, yaml_dir: &Path) -> Result<PipelineSpec> {
         credit_window: 1,
         // Old-format YAMLs predate batching; one event per message.
         batch_events: 1,
+        event_format: "json".to_string(),
     })
 }
