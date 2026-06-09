@@ -115,13 +115,16 @@ def main():
             cand = [(reps, means[(a, reps)]) for (a, reps) in means if a == arm
                     and means[(a, reps)] == means[(a, reps)]]  # drop NaN
             return max(cand, key=lambda x: x[1]) if cand else None
-        be, bd = best("edge"), best("dispatcher")
-        if be:
-            print(f"\n  edge       plateau: {be[1]:.0f} ev/s at {be[0]} replicas")
-        if bd:
-            print(f"  dispatcher plateau: {bd[1]:.0f} ev/s at {bd[0]} replicas")
-        if be and bd and bd[1]:
-            print(f"  edge / dispatcher (max): {be[1] / bd[1]:.2f}x")
+        arms_present = sorted({a for (a, _) in means})
+        plateaus = {a: best(a) for a in arms_present}
+        for a in arms_present:
+            if plateaus[a]:
+                print(f"\n  {a:<11} plateau: {plateaus[a][1]:.0f} ev/s at {plateaus[a][0]} replicas")
+        base = plateaus.get("dispatcher")
+        if base and base[1]:
+            for a in arms_present:
+                if a != "dispatcher" and plateaus[a]:
+                    print(f"  {a} / dispatcher (max): {plateaus[a][1] / base[1]:.2f}x")
 
         print("\n  per-hop transport latency p50 (ms):")
         for (arm, reps), hops in sorted(tp_hops.items()):

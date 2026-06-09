@@ -22,7 +22,7 @@ use crate::config::PipelineStage;
 use crate::conversion::{extract_record_fields, extract_result_event_fields};
 use crate::envelope::{EnvelopeFormat, EventEnvelope};
 use crate::host::HostState;
-use crate::inproc::Edge;
+use crate::spsc::{EdgeIn, EdgeOut};
 
 // ---------------------------------------------------------------------------
 // Worker handle
@@ -42,8 +42,8 @@ pub(crate) fn spawn_worker(
     stage:          &PipelineStage,
     in_endpoint:    &str,
     out_endpoint:   &str,
-    input_edge:     Option<Edge>,
-    output_edge:    Option<Edge>,
+    input_edge:     Option<EdgeIn>,
+    output_edge:    Option<EdgeOut>,
     credit_window:  u32,
     engine:         &Engine,
     instance_pre:   &Arc<InstancePre<HostState>>,
@@ -99,7 +99,7 @@ enum WorkerInput {
         pending: VecDeque<Bytes>,
     },
     #[allow(dead_code)]
-    Queue(Edge),
+    Queue(EdgeIn),
 }
 
 impl WorkerInput {
@@ -161,7 +161,7 @@ impl WorkerInput {
 enum WorkerOutput {
     Zmq { pusher: zmq::Socket },
     #[allow(dead_code)]
-    Queue(Edge),
+    Queue(EdgeOut),
 }
 
 impl WorkerOutput {
@@ -188,8 +188,8 @@ fn run_wasm_worker(
     stage:          PipelineStage,
     in_endpoint:    String,
     out_endpoint:   String,
-    input_edge:     Option<Edge>,
-    output_edge:    Option<Edge>,
+    input_edge:     Option<EdgeIn>,
+    output_edge:    Option<EdgeOut>,
     credit_window:  u32,
     engine:         Engine,
     instance_pre:   Arc<InstancePre<HostState>>,

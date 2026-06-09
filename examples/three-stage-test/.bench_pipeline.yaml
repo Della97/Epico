@@ -1,0 +1,52 @@
+package: epico:temps@1.0.0
+nodes:
+  - name: local
+    host: 127.0.0.1
+    force_tcp: false
+types:
+  reading:
+    sensor_id: string
+    value:     f64
+    unit:      string?
+  enriched:
+    sensor_id: string
+    value:     f64
+    anomaly:   bool?
+    severity:  string?
+source:
+  kind: loadgen
+  profile: steady
+  rate: 20000
+  count: 0
+  duration: 30
+  sensors: 100
+
+stages:
+  - name: normalize
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/normalize.rs
+    scaling: { min: 1, max: 1, queue_up: 50, cooldown_up_s: 20, cooldown_down_s: 20 }
+  - name: detect
+    placement: local
+    in:  reading
+    out: enriched
+    src: ./stages/detect.rs
+    scaling: { min: 1, max: 1, queue_up: 50, cooldown_up_s: 20, cooldown_down_s: 20 }
+  - name: finalize
+    placement: local
+    in:  enriched
+    out: enriched
+    src: ./stages/finalize.rs
+    scaling: { min: 1, max: 1, queue_up: 50, cooldown_up_s: 20, cooldown_down_s: 20 }
+edges:
+  - normalize -> detect
+  - detect -> finalize
+deploy:
+  host: localhost
+  this_host: local
+  ingress: ipc:///tmp/epico-bench-push
+  credit_window: 16
+  batch_events: 1
+  resource_sample_interval_ms: 0

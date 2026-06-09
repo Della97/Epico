@@ -44,7 +44,7 @@ TP_COUNT="${TP_COUNT:-3000000}"         # events per throughput run
 STEADY_DUR="${STEADY_DUR:-30}"          # seconds per latency run
 SENSORS="${SENSORS:-100}"
 COOLDOWN="${COOLDOWN:-8}"
-ARMS="${ARMS:-dispatcher edge}"
+ARMS="${ARMS:-dispatcher edge spsc}"
 
 # throughput: saturate via parallelism. Pinned min==max==R, swept.
 REPLICAS="${REPLICAS:-1 2 3}"           # workers per stage to sweep
@@ -52,6 +52,7 @@ BLAST="${BLAST:-1}"                     # 1 = cached-blast source (removes loadg
 
 # fairness knobs (held equal so this measures transport, not buffer depth)
 EDGE_CAPS="${EDGE_CAPS:-256}"
+SPSC_RING_CAP="${SPSC_RING_CAP:-64}"   # per-ring cap for spsc mesh (total in-flight = cap * N * M)
 CREDIT_WINDOWS="${CREDIT_WINDOWS:-16}"
 BATCH="${BATCH:-1}"
 
@@ -127,9 +128,11 @@ run_one() {  # arm profile rate count dur cap cw reps blast rep outdir
   emit_yaml "$profile" "$rate" "$count" "$dur" "$cw" "$reps" "$blast" > "$BENCH_YAML"
 
   local env_kv=()
-  if [ "$arm" = "edge" ]; then
-    env_kv=(EPICO_INPROC_EDGES=1 "EPICO_EDGE_CAP=$cap")
-  fi
+  case "$arm" in
+    edge) env_kv=(EPICO_INPROC_EDGES=1 "EPICO_EDGE_CAP=$cap") ;;
+    spsc) env_kv=(EPICO_INPROC_EDGES=1 EPICO_EDGE_IMPL=spsc "EPICO_SPSC_RING_CAP=$SPSC_RING_CAP") ;;
+    dispatcher) : ;;
+  esac
 
   echo ">> $arm | $profile rate=$rate count=$count reps=$reps blast=$blast cap=$cap cw=$cw rep=$rep"
   if env ${env_kv[@]+"${env_kv[@]}"} \

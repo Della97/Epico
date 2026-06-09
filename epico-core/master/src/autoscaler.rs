@@ -14,7 +14,7 @@ use epico_logger::Logger;
 
 use crate::config::{make_pull_endpoint, make_push_endpoint, PipelineStage};
 use crate::host::HostState;
-use crate::inproc::Edge;
+use crate::spsc::{EdgeInSrc, EdgeOutSrc};
 use crate::worker::{spawn_worker, WorkerHandle};
 use crate::{RunTelemetry, ScalingEvent};
 
@@ -146,8 +146,8 @@ pub(crate) fn run_autoscaler_loop(
     stage:         PipelineStage,
     ctrl_port:     u16,
     credit_window: u32,
-    input_edge:    Option<Edge>,
-    output_edge:   Option<Edge>,
+    input_edge:    EdgeInSrc,
+    output_edge:   EdgeOutSrc,
     engine:        Engine,
     log:           Logger,
     telemetry:     Arc<Mutex<RunTelemetry>>,
@@ -339,12 +339,13 @@ pub(crate) fn run_autoscaler_loop(
         // `continue` on a missing dispatcher, or the min-replica spawn below
         // never runs, no worker ever drains the ring, and the pipeline
         // deadlocks behind backpressure.
-        let (qd, dispatcher_metrics) = match input_edge.as_ref() {
-            Some(edge) => (edge.len() as f64, None),
-            None => match fetch_dispatcher_metrics(&ctrl_socket) {
+        let (qd, dispatcher_metrics) = if input_edge.is_some() {
+            (input_edge.len() as f64, None)
+        } else {
+            match fetch_dispatcher_metrics(&ctrl_socket) {
                 Some(m) => (m.queue_depth, Some(m)),
                 None    => continue,
-            },
+            }
         };
 
         if let Some(metrics) = dispatcher_metrics.as_ref() {
@@ -420,9 +421,10 @@ pub(crate) fn run_autoscaler_loop(
                 ("qd",      &format!("{:.0}", qd)),
                 ("max_rep", &max_rep.to_string()),
             ]);
+            let replica_idx = workers.len();
             workers.push(spawn_worker(
                 &stage, &in_endpoint, &out_endpoint,
-                input_edge.clone(), output_edge.clone(),
+                input_edge.for_replica(replica_idx), output_edge.for_replica(replica_idx),
                 credit_window,
                 &engine, instance_pre,
                 &last_active_ts, &avg_latency_us,
@@ -463,9 +465,10 @@ pub(crate) fn run_autoscaler_loop(
                 ("current", &current.to_string()),
                 ("min_rep", &min_rep.to_string()),
             ]);
+            let replica_idx = workers.len();
             workers.push(spawn_worker(
                 &stage, &in_endpoint, &out_endpoint,
-                input_edge.clone(), output_edge.clone(),
+                input_edge.for_replica(replica_idx), output_edge.for_replica(replica_idx),
                 credit_window,
                 &engine, instance_pre,
                 &last_active_ts, &avg_latency_us,
@@ -500,9 +503,10 @@ pub(crate) fn run_autoscaler_loop(
                 ("new",     &(current + 1).to_string()),
                 ("max_rep", &max_rep.to_string()),
             ]);
+            let replica_idx = workers.len();
             workers.push(spawn_worker(
                 &stage, &in_endpoint, &out_endpoint,
-                input_edge.clone(), output_edge.clone(),
+                input_edge.for_replica(replica_idx), output_edge.for_replica(replica_idx),
                 credit_window,
                 &engine, instance_pre,
                 &last_active_ts, &avg_latency_us,

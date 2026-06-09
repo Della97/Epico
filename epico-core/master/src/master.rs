@@ -23,11 +23,13 @@ mod host;
 mod inproc;
 mod pipeline_validator;
 mod resources;
+mod spsc;
 mod supervisor;
 mod worker;
 
 use crate::config::{default_wasm_path, stage_owned_by, Config};
 use crate::inproc::Edge;
+use crate::spsc::{SpscMesh, EdgeInSrc, EdgeOutSrc};
 
 /// In-flight bound for an in-process edge (prototype). Plays the role
 /// `credit_window` plays on the zmq path; promote to per-edge config later.
@@ -237,8 +239,8 @@ pub fn run_agent(
         || std::env::var("EPICO_INPROC_EDGES")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-    let mut input_edges:  HashMap<String, Edge> = HashMap::new();
-    let mut output_edges: HashMap<String, Edge> = HashMap::new();
+    let mut input_edges:  HashMap<String, EdgeInSrc>  = HashMap::new();
+    let mut output_edges: HashMap<String, EdgeOutSrc> = HashMap::new();
     let mut skip_dispatchers: HashSet<String> = HashSet::new();
     let mut ingress_source_edge: Option<Edge> = None;
     let mut egress_sink_edge:    Option<Edge> = None;
@@ -247,12 +249,26 @@ pub fn run_agent(
     let edge_cap = std::env::var("EPICO_EDGE_CAP")
         .ok().and_then(|v| v.parse::<usize>().ok()).filter(|&c| c > 0)
         .unwrap_or(INPROC_EDGE_CAPACITY);
+    // Transport for the in-process edges: "" / "ring" = crossbeam MPMC ring,
+    // "spsc" = FastFlow-style N×M mesh of SPSC rings. The spsc path requires
+    // min==max replicas (it round-robins over a fixed-size mesh).
+    let edge_impl = std::env::var("EPICO_EDGE_IMPL").unwrap_or_default();
+    let spsc_ring_cap = std::env::var("EPICO_SPSC_RING_CAP")
+        .ok().and_then(|v| v.parse::<usize>().ok()).filter(|&c| c > 0)
+        .unwrap_or(64);
     if inproc_edges {
         for pair in config.pipeline.windows(2) {
             let (prod, cons) = (&pair[0], &pair[1]);
-            let edge = Edge::new(edge_cap);
-            output_edges.insert(prod.name.clone(), edge.clone());
-            input_edges.insert(cons.name.clone(), edge);
+            if edge_impl == "spsc" {
+                let mesh = Arc::new(SpscMesh::new(
+                    prod.slo.max_replicas, cons.slo.max_replicas, spsc_ring_cap));
+                output_edges.insert(prod.name.clone(), EdgeOutSrc::Mesh(mesh.clone()));
+                input_edges.insert(cons.name.clone(),  EdgeInSrc::Mesh(mesh));
+            } else {
+                let edge = Edge::new(edge_cap);
+                output_edges.insert(prod.name.clone(), EdgeOutSrc::Ring(edge.clone()));
+                input_edges.insert(cons.name.clone(),  EdgeInSrc::Ring(edge));
+            }
             let bare = cons.name.strip_prefix("fn-").unwrap_or(&cons.name);
             skip_dispatchers.insert(format!("dispatch-{}", bare));
             log.info("in-process edge", &[
@@ -267,7 +283,7 @@ pub fn run_agent(
         // PULL pump feeding the first stage's Edge. Skip that dispatcher.
         if let Some(first) = config.pipeline.first() {
             let edge = Edge::new(edge_cap);
-            input_edges.insert(first.name.clone(), edge.clone());
+            input_edges.insert(first.name.clone(), EdgeInSrc::Ring(edge.clone()));
             ingress_source_edge = Some(edge);
             let bare = first.name.strip_prefix("fn-").unwrap_or(&first.name);
             skip_dispatchers.insert(format!("dispatch-{}", bare));
@@ -280,7 +296,7 @@ pub fn run_agent(
         // process instead of binding a PULL socket. No egress socket on a host.
         if let Some(last) = config.pipeline.last() {
             let edge = Edge::new(edge_cap);
-            output_edges.insert(last.name.clone(), edge.clone());
+            output_edges.insert(last.name.clone(), EdgeOutSrc::Ring(edge.clone()));
             egress_sink_edge = Some(edge);
             log.info("in-process egress (sink drain)", &[
                 ("from", &last.name),
@@ -484,8 +500,8 @@ pub fn run_agent(
         let tel_c       = telemetry.clone();
         let compile_mode_c = config.compile_mode.clone();
         let event_format_c = config.event_format.clone();
-        let in_edge_c   = input_edges.get(&stage.name).cloned();
-        let out_edge_c  = output_edges.get(&stage.name).cloned();
+        let in_edge_c   = input_edges.get(&stage.name).cloned().unwrap_or(EdgeInSrc::None);
+        let out_edge_c  = output_edges.get(&stage.name).cloned().unwrap_or(EdgeOutSrc::None);
 
         handles.push(std::thread::spawn(move || {
             autoscaler::run_autoscaler_loop(

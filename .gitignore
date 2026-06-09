@@ -9,6 +9,7 @@ target/
 plots/ablation_test/*
 !plots/ablation_test/plot.py
 !plots/ablation_test/ablation.sh
+bench/results/
 
 # Deprecated code
 /deprecated/
