@@ -1,0 +1,59 @@
+# two-stage-min — minimal-compute pipeline for transport throughput tests.
+#
+# Two identity stages over the smallest practical record. The WASM body does
+# nothing, so per-event cost is just the fixed stage boundary (JSON -> WIT ->
+# JSON, ~1 us) and the *transport under test* on the single interior hop
+# relay -> forward. Ingress (loadgen -> dispatcher PULL) and egress (collector
+# PULL) are identical across arms, so any throughput difference between
+# dispatcher / edge / spsc is attributable to that one hop.
+#
+# Run standalone:        epico run
+# Run the A/B harness:   bench/tp_bench_2stage.sh   (overrides this file)
+
+package: epico:minbench@1.0.0
+
+nodes:
+  - name: local
+    host: 127.0.0.1
+    force_tcp: false
+
+# One record type, reused for in: and out: of both stages. Two fields keeps
+# conversion close to the floor; if you want the absolute minimum serde cost,
+# drop sensor_id and keep only `value: f64` (one alloc-free field per event).
+types:
+  event:
+    sensor_id: string
+    value:     f64
+
+source:
+  kind: loadgen
+  profile: tp
+  count: 3000000
+  sensors: 100
+  blast: true
+
+stages:
+  - name: relay
+    placement: local
+    in:  event
+    out: event
+    src: ./stages/relay.rs
+    scaling: { min: 1, max: 1, queue_up: 50, cooldown_up_s: 20, cooldown_down_s: 20 }
+
+  - name: forward
+    placement: local
+    in:  event
+    out: event
+    src: ./stages/forward.rs
+    scaling: { min: 1, max: 1, queue_up: 50, cooldown_up_s: 20, cooldown_down_s: 20 }
+
+edges:
+  - relay -> forward
+
+deploy:
+  host: localhost
+  this_host: local
+  ingress: ipc:///tmp/epico-minbench-push
+  credit_window: 16
+  batch_events: 1
+  resource_sample_interval_ms: 0
