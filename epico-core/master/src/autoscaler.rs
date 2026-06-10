@@ -423,7 +423,7 @@ pub(crate) fn run_autoscaler_loop(
             ]);
             let replica_idx = workers.len();
             workers.push(spawn_worker(
-                &stage, &in_endpoint, &out_endpoint,
+                &stage, replica_idx, &in_endpoint, &out_endpoint,
                 input_edge.for_replica(replica_idx), output_edge.for_replica(replica_idx),
                 credit_window,
                 &engine, instance_pre,
@@ -467,7 +467,7 @@ pub(crate) fn run_autoscaler_loop(
             ]);
             let replica_idx = workers.len();
             workers.push(spawn_worker(
-                &stage, &in_endpoint, &out_endpoint,
+                &stage, replica_idx, &in_endpoint, &out_endpoint,
                 input_edge.for_replica(replica_idx), output_edge.for_replica(replica_idx),
                 credit_window,
                 &engine, instance_pre,
@@ -505,7 +505,7 @@ pub(crate) fn run_autoscaler_loop(
             ]);
             let replica_idx = workers.len();
             workers.push(spawn_worker(
-                &stage, &in_endpoint, &out_endpoint,
+                &stage, replica_idx, &in_endpoint, &out_endpoint,
                 input_edge.for_replica(replica_idx), output_edge.for_replica(replica_idx),
                 credit_window,
                 &engine, instance_pre,

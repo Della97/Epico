@@ -40,6 +40,7 @@ pub(crate) struct WorkerHandle {
 
 pub(crate) fn spawn_worker(
     stage:          &PipelineStage,
+    replica_idx:    usize,
     in_endpoint:    &str,
     out_endpoint:   &str,
     input_edge:     Option<EdgeIn>,
@@ -68,7 +69,7 @@ pub(crate) fn spawn_worker(
 
     let handle = std::thread::spawn(move || {
         run_wasm_worker(
-            stage_clone, in_ep, out_ep, input_edge, output_edge, credit_window,
+            stage_clone, replica_idx, in_ep, out_ep, input_edge, output_edge, credit_window,
             engine_clone, instance_pre_clone,
             heartbeat_clone, avg_lat_clone,
             drain_clone, decision_ts, worker_ctx, event_format, log,
@@ -186,6 +187,7 @@ impl WorkerOutput {
 
 fn run_wasm_worker(
     stage:          PipelineStage,
+    replica_idx:    usize,
     in_endpoint:    String,
     out_endpoint:   String,
     input_edge:     Option<EdgeIn>,
@@ -202,6 +204,11 @@ fn run_wasm_worker(
     log:            Logger,
 ) {
     let spawn_ts   = decision_ts;
+    // Telemetry hop label: `stage#replica`. The collector strips the `#r`
+    // suffix for per-stage aggregation (so existing per_stage_* metrics and
+    // analyze scripts are unchanged) and additionally aggregates by the full
+    // label for the new per_replica summary block.
+    let hop_label = format!("{}#{}", stage.name, replica_idx);
     // First wall-clock read in this worker thread. Used to bound the gap
     // between `decision_ts` (captured in the autoscaler before
     // `std::thread::spawn`) and the moment this thread actually started
@@ -548,7 +555,7 @@ fn run_wasm_worker(
                 &event_val,
                 fields,
                 bench_result,
-                &stage.name,
+                &hop_label,
                 enter_ts,
                 exit_ts,
             ) {

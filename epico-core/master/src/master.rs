@@ -130,6 +130,15 @@ pub(crate) struct RunTelemetry {
     /// scale-up it may briefly lag.
     pub per_stage_count:      std::collections::HashMap<String, u64>,
 
+    // ── Per-replica timing (new) ───────────────────────────────────────────
+    /// Residence times keyed by the full hop label `stage#replica`. Same
+    /// samples as per_stage_latency_ms, but split by which replica actually
+    /// processed the event — powers per-replica box/violin plots and
+    /// load-balance checks. Empty on runs predating replica-tagged hops.
+    pub per_replica_latency_ms: std::collections::HashMap<String, Vec<f64>>,
+    /// Event count per `stage#replica` label (load-balance fairness check).
+    pub per_replica_count:      std::collections::HashMap<String, u64>,
+
     // ── Autoscaler events (new) ────────────────────────────────────────────
     pub scaling_events: Vec<ScalingEvent>,
 
@@ -1088,15 +1097,30 @@ fn run_collector(
                         }
                         *tel.recv_per_second.entry(bucket).or_default() += 1;
 
-                        // Per-stage latencies and counts (unchanged).
+                        // Per-stage latencies and counts. Hop names carry a
+                        // `#replica` suffix since replica-tagged hops landed;
+                        // strip it here so per_stage_* keys stay bare stage
+                        // names (analyze scripts unchanged), and aggregate the
+                        // full label separately for the per_replica block.
                         for (name, enter, exit) in &hops_vec {
+                            let res_ms = (exit - enter) * 1000.0;
+                            let base = name.split('#').next().unwrap_or(name);
                             tel.per_stage_latency_ms
-                                .entry(name.clone())
+                                .entry(base.to_string())
                                 .or_default()
-                                .push((exit - enter) * 1000.0);
+                                .push(res_ms);
                             *tel.per_stage_count
-                                .entry(name.clone())
+                                .entry(base.to_string())
                                 .or_default() += 1;
+                            if name.contains('#') {
+                                tel.per_replica_latency_ms
+                                    .entry(name.clone())
+                                    .or_default()
+                                    .push(res_ms);
+                                *tel.per_replica_count
+                                    .entry(name.clone())
+                                    .or_default() += 1;
+                            }
                         }
 
                         // Per-event raw row. recv_t_s is normalized to the
@@ -1346,6 +1370,13 @@ fn build_summary(
         &tel.per_stage_latency_ms,
     );
 
+    // Per-replica residence times: stage -> replica -> stats. Built from the
+    // `stage#replica` hop labels; empty object on runs without tagged hops.
+    let per_replica_block = build_per_replica_block(
+        &tel.per_replica_latency_ms,
+        &tel.per_replica_count,
+    );
+
     // Dispatcher queue depth time-series per stage.
     let queue_depth_block: serde_json::Map<String, serde_json::Value> = tel
         .queue_depth_samples
@@ -1368,6 +1399,7 @@ fn build_summary(
         "resources":     resources_block,
         "events":        events_block,
         "worker_timing": worker_timing_block,
+        "per_replica":   per_replica_block,
         "queue_depth":   serde_json::Value::Object(queue_depth_block),
 
         // ── Legacy fields (kept for existing plot scripts) ────────────────────
@@ -1549,6 +1581,64 @@ fn subsample_u64(src: &[u64], cap: usize) -> Vec<u64> {
 /// Events with fewer than 2 hops contribute nothing and are skipped.
 /// Edge labels are deduplicated by (from_stage, to_stage) so pipelines
 /// with repeating stage names still produce well-defined keys.
+/// Build the per_replica block: `{ stage: { "0": {stats}, "1": {stats} } }`.
+///
+/// Stats per replica: event count, residence-time percentiles (ms), and a
+/// capped sample list for distribution plots (box/violin per replica). The
+/// `share` field is this replica's fraction of the stage's events — a direct
+/// load-balance fairness readout (1/R when the transport balances perfectly).
+fn build_per_replica_block(
+    latency_ms: &std::collections::HashMap<String, Vec<f64>>,
+    counts:     &std::collections::HashMap<String, u64>,
+) -> serde_json::Value {
+    use std::collections::BTreeMap;
+    if latency_ms.is_empty() {
+        return serde_json::Value::Object(Default::default());
+    }
+    let pct = |arr: &[f64], p: f64| -> f64 {
+        if arr.is_empty() { return 0.0; }
+        let idx = ((arr.len() as f64 * p) as usize).min(arr.len() - 1);
+        arr[idx]
+    };
+    let r4 = |x: f64| (x * 10_000.0).round() / 10_000.0;
+
+    // stage -> replica -> sorted samples
+    let mut grouped: BTreeMap<String, BTreeMap<u32, Vec<f64>>> = BTreeMap::new();
+    for (label, samples) in latency_ms {
+        let mut it = label.splitn(2, '#');
+        let stage = it.next().unwrap_or(label).to_string();
+        let rep: u32 = it.next().and_then(|r| r.parse().ok()).unwrap_or(0);
+        let mut s = samples.clone();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        grouped.entry(stage).or_default().insert(rep, s);
+    }
+
+    let mut out: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    for (stage, reps) in &grouped {
+        let stage_total: u64 = reps.keys()
+            .map(|r| counts.get(&format!("{stage}#{r}")).copied().unwrap_or(0))
+            .sum();
+        let mut rep_map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        for (rep, samples) in reps {
+            let n_evt = counts.get(&format!("{stage}#{rep}")).copied().unwrap_or(samples.len() as u64);
+            let mean = if samples.is_empty() { 0.0 }
+                       else { samples.iter().sum::<f64>() / samples.len() as f64 };
+            rep_map.insert(rep.to_string(), json!({
+                "count":   n_evt,
+                "share":   if stage_total > 0 { r4(n_evt as f64 / stage_total as f64) } else { 0.0 },
+                "p50":     r4(pct(samples, 0.50)),
+                "p95":     r4(pct(samples, 0.95)),
+                "p99":     r4(pct(samples, 0.99)),
+                "max":     r4(samples.last().copied().unwrap_or(0.0)),
+                "mean":    r4(mean),
+                "samples": subsample_f64(samples, 20_000),
+            }));
+        }
+        out.insert(stage.clone(), serde_json::Value::Object(rep_map));
+    }
+    serde_json::Value::Object(out)
+}
+
 fn build_inter_stage_block(
     events: &[(f64, f64, Vec<(String, f64, f64)>)],
 ) -> serde_json::Value {
@@ -1563,8 +1653,13 @@ fn build_inter_stage_block(
             let (to_name, to_enter, _)    = &pair[1];
             if *to_enter >= *from_exit {
                 let gap_ms = (to_enter - from_exit) * 1000.0;
+                // Hop labels are `stage#replica`; the edge key aggregates
+                // over replicas so it stays `relay -> forward`, matching the
+                // pipeline topology and existing analyze scripts.
+                let from_base = from_name.split('#').next().unwrap_or(from_name).to_string();
+                let to_base   = to_name.split('#').next().unwrap_or(to_name).to_string();
                 per_edge
-                    .entry((from_name.clone(), to_name.clone()))
+                    .entry((from_base, to_base))
                     .or_default()
                     .push(gap_ms);
             }
