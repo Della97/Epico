@@ -235,6 +235,7 @@ fn run_wasm_worker(
     if let Some(m) = native_mode {
         log.info("NATIVE BYPASS ACTIVE — wasm is not being called", &[("mode", m)]);
     }
+
     // First wall-clock read in this worker thread. Used to bound the gap
     // between `decision_ts` (captured in the autoscaler before
     // `std::thread::spawn`) and the moment this thread actually started
@@ -374,6 +375,40 @@ fn run_wasm_worker(
             return;
         }
     };
+    // Outgoing wire format. `EPICO_BINARY_EDGES=1` switches stage OUTPUT to
+    // the compact binary envelope; decode is always magic-sniffed, so the
+    // first stage keeps accepting JSON from the loadgen and external
+    // producers with zero coordination. EOS markers are forwarded verbatim
+    // (they stay JSON), so EOS detection is unaffected end to end.
+    let out_format = if std::env::var("EPICO_BINARY_EDGES").map(|v| v == "1").unwrap_or(false) {
+        crate::envelope::EnvelopeFormat::Binary
+    } else {
+        envelope_format
+    };
+    if out_format == crate::envelope::EnvelopeFormat::Binary {
+        log.info("binary edges active: stage output uses binary envelope", &[]);
+    }
+
+    // Typed fast path: if the generated agent registered concrete types for
+    // this stage (and EPICO_DYNAMIC_DISPATCH != 1), type the resolved Func
+    // once and skip the per-event Val layer entirely. Falls back to the
+    // dynamic path on any prepare failure.
+    let mut typed_dispatch: Option<Box<dyn crate::typed::PreparedDispatch>> =
+        match crate::typed::lookup(&stage.name) {
+            Some(d) => match d.prepare(&mut store, process_fn) {
+                Ok(p) => {
+                    log.info("TYPED DISPATCH ACTIVE — Val layer bypassed",
+                             &[("stage", &stage.name)]);
+                    Some(p)
+                }
+                Err(e) => {
+                    log.warn("typed dispatch prepare failed; using dynamic path",
+                             &[("stage", &stage.name), ("err", &e.to_string())]);
+                    None
+                }
+            },
+            None => None,
+        };
 
     let t_export_lookup_ms = start_time.elapsed().as_secs_f64() * 1000.0;
 
@@ -460,6 +495,13 @@ fn run_wasm_worker(
     // with no extra round-trips.
     let refill_threshold: u32 = (credit_window / 2).max(1);
     let mut processed_since_refill: u32 = 0;
+    // Reused across iterations — previously allocated per event.
+    let mut results = vec![Val::Bool(false); result_types.len()];
+    // The boot-phase refill fields (cold_start_ms, ph_*) never change after
+    // worker boot; send them once and use a compact payload afterwards. The
+    // autoscaler parses refills with `.get` + defaults, so absent keys are
+    // fine, and the dispatcher only substring-scans for n_credits.
+    let mut sent_boot_refill = false;
 
     // ── Event loop ────────────────────────────────────────────────────────────
     // Events may arrive batched: one ROUTER message carries
@@ -480,10 +522,17 @@ fn run_wasm_worker(
 
         let total_t0 = Instant::now();
 
-        heartbeat.store(
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            Ordering::Relaxed,
-        );
+        // Heartbeat every 16th event instead of every event: one
+        // clock_gettime + atomic store saved on 15/16 iterations. Staleness
+        // is bounded by 16 events, which at any rate above ~16 ev/s keeps it
+        // under the autoscaler's seconds-scale idle thresholds; below that
+        // rate the worker spends its life blocked in recv anyway.
+        if invocation_count & 0xF == 0 {
+            heartbeat.store(
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                Ordering::Relaxed,
+            );
+        }
 
         // ── Native bypass: passthrough ────────────────────────────────────
         // Forward bytes untouched. EOS is detected with a byte scan so this
@@ -579,6 +628,41 @@ fn run_wasm_worker(
             continue;
         }
 
+        // ── Typed fast path ───────────────────────────────────────────────
+        if let Some(tp) = typed_dispatch.as_mut() {
+            let mut enter_exit = (0.0_f64, 0.0_f64);
+            match tp.call(&mut store, &envelope, &hop_label, out_format, &mut enter_exit) {
+                Ok(out_bytes) => {
+                    let (enter_ts, exit_ts) = enter_exit;
+                    let latency_us = ((exit_ts - enter_ts) * 1e6).max(0.0) as u64;
+                    let prev_us = avg_latency_us.load(Ordering::Relaxed);
+                    avg_latency_us.store((prev_us * 3 + latency_us) / 4, Ordering::Relaxed);
+                    worker_output.send(out_bytes, &drain_flag);
+                    invocation_count += 1;
+                    processed_since_refill += 1;
+                    if worker_input.wants_credits()
+                        && processed_since_refill >= refill_threshold
+                    {
+                        let total_ns = total_t0.elapsed().as_nanos() as u64;
+                        let refill_payload = format!(
+                            "{{\"_ctrl\":\"refill\",\"rid\":\"{}\",\"fn\":\"{}\",\
+                             \"is_leader\":false,\"p99_latency_ms\":{},\
+                             \"total_ns\":{},\"serde_ns\":{},\"n_credits\":{}}}",
+                            rid_str, stage.name, latency_us / 1000,
+                            total_ns, serde_ns, processed_since_refill,
+                        );
+                        worker_input.send_control(refill_payload.as_bytes());
+                        processed_since_refill = 0;
+                    }
+                }
+                Err(e) => {
+                    log.error("typed call failed", &[("err", &e.to_string())]);
+                    worker_input.send_control(b"");
+                }
+            }
+            continue;
+        }
+
         let ev_val = match envelope.input_val(&in_fields, &param_types[0]) {
             Ok(v) => v,
             Err(e) => {
@@ -599,7 +683,8 @@ fn run_wasm_worker(
         let enter_ts = now_secs_f64();
         let t0       = Instant::now();
 
-        let mut results = vec![Val::Bool(false); result_types.len()];
+        // `results` is hoisted out of the loop (see above) and reused;
+        // Func::call overwrites every slot on success.
         // Give this invocation a fresh CPU budget. If the guest runs past it the
         // call returns a trap (handled below) rather than hanging the worker.
         store.set_epoch_deadline(crate::host::MAX_CALL_EPOCH_TICKS);
@@ -657,6 +742,7 @@ fn run_wasm_worker(
                 &hop_label,
                 enter_ts,
                 exit_ts,
+                out_format,
             ) {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -688,30 +774,45 @@ fn run_wasm_worker(
         // arrives less often but the latest sample is always carried.
         if worker_input.wants_credits() && processed_since_refill >= refill_threshold {
             let latency_ms = latency_us / 1000;
-            let refill_payload = format!(
-                "{{\"_ctrl\":\"refill\",\"rid\":\"{}\",\"fn\":\"{}\",\
-                 \"cold_start_ms\":{:.5},\"spawn_ts\":{:.6},\
-                 \"spawn_to_thread_ms\":{:.5},\
-                 \"ph_ctx_ms\":{:.5},\
-                 \"ph_push_socket_ms\":{:.5},\"ph_push_setopt_ms\":{:.5},\
-                 \"ph_dealer_socket_ms\":{:.5},\"ph_dealer_setopt_ms\":{:.5},\
-                 \"ph_pusher_connect_ms\":{:.5},\"ph_dealer_connect_ms\":{:.5},\
-                 \"ph_pre_inst_ms\":{:.5},\
-                 \"ph_instantiate_ms\":{:.5},\"ph_export_ms\":{:.5},\
-                 \"ph_tail_ms\":{:.5},\
-                 \"is_leader\":false,\"p99_latency_ms\":{},\
-                 \"total_ns\":{},\"serde_ns\":{},\"n_credits\":{}}}",
-                rid_str, stage.name, cold_start_ms, spawn_ts,
-                spawn_to_thread_ms,
-                phase_ctx_ms,
-                phase_push_socket_ms, phase_push_setopt_ms,
-                phase_dealer_socket_ms, phase_dealer_setopt_ms,
-                phase_pusher_connect_ms, phase_dealer_connect_ms,
-                phase_pre_inst_ms,
-                phase_instantiate_ms, phase_export_ms,
-                phase_tail_ms,
-                latency_ms, total_ns, serde_ns, processed_since_refill,
-            );
+            let refill_payload = if !sent_boot_refill {
+                sent_boot_refill = true;
+                format!(
+                    "{{\"_ctrl\":\"refill\",\"rid\":\"{}\",\"fn\":\"{}\",\
+                     \"cold_start_ms\":{:.5},\"spawn_ts\":{:.6},\
+                     \"spawn_to_thread_ms\":{:.5},\
+                     \"ph_ctx_ms\":{:.5},\
+                     \"ph_push_socket_ms\":{:.5},\"ph_push_setopt_ms\":{:.5},\
+                     \"ph_dealer_socket_ms\":{:.5},\"ph_dealer_setopt_ms\":{:.5},\
+                     \"ph_pusher_connect_ms\":{:.5},\"ph_dealer_connect_ms\":{:.5},\
+                     \"ph_pre_inst_ms\":{:.5},\
+                     \"ph_instantiate_ms\":{:.5},\"ph_export_ms\":{:.5},\
+                     \"ph_tail_ms\":{:.5},\
+                     \"is_leader\":false,\"p99_latency_ms\":{},\
+                     \"total_ns\":{},\"serde_ns\":{},\"n_credits\":{}}}",
+                    rid_str, stage.name, cold_start_ms, spawn_ts,
+                    spawn_to_thread_ms,
+                    phase_ctx_ms,
+                    phase_push_socket_ms, phase_push_setopt_ms,
+                    phase_dealer_socket_ms, phase_dealer_setopt_ms,
+                    phase_pusher_connect_ms, phase_dealer_connect_ms,
+                    phase_pre_inst_ms,
+                    phase_instantiate_ms, phase_export_ms,
+                    phase_tail_ms,
+                    latency_ms, total_ns, serde_ns, processed_since_refill,
+                )
+            } else {
+                // Boot-phase fields are static per worker and were already
+                // delivered; the steady-state refill carries only what the
+                // dispatcher (n_credits) and autoscaler (timing samples)
+                // actually consume per tick.
+                format!(
+                    "{{\"_ctrl\":\"refill\",\"rid\":\"{}\",\"fn\":\"{}\",\
+                     \"is_leader\":false,\"p99_latency_ms\":{},\
+                     \"total_ns\":{},\"serde_ns\":{},\"n_credits\":{}}}",
+                    rid_str, stage.name,
+                    latency_ms, total_ns, serde_ns, processed_since_refill,
+                )
+            };
             worker_input.send_control(refill_payload.as_bytes());
             processed_since_refill = 0;
         }

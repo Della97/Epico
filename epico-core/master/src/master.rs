@@ -18,14 +18,18 @@ use serde_json::json;
 mod autoscaler;
 mod config;
 mod conversion;
-mod envelope;
+pub mod envelope;
 mod host;
 mod inproc;
 mod pipeline_validator;
 mod resources;
 mod spsc;
 mod supervisor;
+pub mod typed;
 mod worker;
+
+// Re-exported so `typed`'s public trait signatures don't leak private paths.
+pub use host::HostState;
 
 use crate::config::{default_wasm_path, stage_owned_by, Config};
 use crate::inproc::Edge;
@@ -1054,7 +1058,18 @@ fn run_collector(
             .unwrap_or_default()
             .as_secs_f64();
 
-        if let Ok(ev) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+        // Binary envelopes are sniffed by magic and decoded header-only into
+        // the same JSON shape the accounting below already consumes —
+        // strictly cheaper than the JSON parse it replaces (domain fields
+        // are skipped; the collector never reads them). EOS markers stay
+        // JSON end to end and were already handled above.
+        let ev_parsed: Option<serde_json::Value> =
+            if crate::envelope::is_binary(bytes.as_ref()) {
+                crate::envelope::binary_to_telemetry_json(bytes.as_ref())
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+            };
+        if let Some(ev) = ev_parsed {
             if let Some(bench_ts) = ev["bench_ts_wall"].as_f64() {
                 if recv_ts > bench_ts {
                     let lat_ms = (recv_ts - bench_ts) * 1000.0;

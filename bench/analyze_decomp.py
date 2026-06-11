@@ -25,7 +25,7 @@ import statistics as st
 from collections import defaultdict
 from pathlib import Path
 
-MODES = ["passthrough", "serde", "wasm"]
+MODES = ["passthrough", "serde", "serde-bin", "wasm-bin", "wasm", "wasm-dyn"]
 
 
 def load(root):
@@ -106,9 +106,15 @@ def main():
     print("\n=== DECOMPOSITION WATERFALL (per stage, us) ===")
     bars = {}
     for arm in arms:
+        # binary-envelope comparison, if those modes were run
+        for m, ref in (("wasm", "wasm-dyn"), ("wasm-bin", "wasm"), ("serde-bin", "serde")):
+            tb, tr = T.get((arm, m)), T.get((arm, ref))
+            if tb and tr and tb == tb and tr == tr:
+                print(f"  {arm:<11} {ref} {tr:6.2f} -> {m} {tb:6.2f} us  "
+                      f"(envelope saves {tr-tb:+.2f} us, {100*(tr-tb)/tr:.0f}%)")
         p  = T.get((arm, "passthrough"))
         sd = T.get((arm, "serde"))
-        w  = T.get((arm, "wasm"))
+        w  = T.get((arm, "wasm-dyn")) or T.get((arm, "wasm"))
         if None in (p, sd, w) or any(x != x for x in (p, sd, w)):
             print(f"  {arm}: incomplete mode set, skipping")
             continue

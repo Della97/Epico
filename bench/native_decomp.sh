@@ -39,7 +39,7 @@ TP_COUNT="${TP_COUNT:-3000000}"
 SENSORS="${SENSORS:-100}"
 COOLDOWN="${COOLDOWN:-8}"
 ARMS="${ARMS:-dispatcher edge}"
-MODES="${MODES:-wasm serde passthrough}"
+MODES="${MODES:-wasm-dyn wasm wasm-bin serde passthrough}"
 CREDIT_WINDOW="${CREDIT_WINDOW:-16}"
 EDGE_CAP="${EDGE_CAP:-256}"
 
@@ -50,8 +50,11 @@ nodes:
   - name: local
     host: 127.0.0.1
     force_tcp: false
+# NOTE: the type is named `msg`, NOT `event` — codegen falls back to the
+# legacy 18-optional-field shared record whenever in/out are literally
+# named `event`, which silently inflates Val and serde costs.
 types:
-  event:
+  msg:
     sensor_id: string
     value:     f64
 source:
@@ -65,14 +68,14 @@ source:
 stages:
   - name: relay
     placement: local
-    in:  event
-    out: event
+    in:  msg
+    out: msg
     src: ./stages/relay.rs
     scaling: { min: 1, max: 1, queue_up: 50, cooldown_up_s: 20, cooldown_down_s: 20 }
   - name: forward
     placement: local
-    in:  event
-    out: event
+    in:  msg
+    out: msg
     src: ./stages/forward.rs
     scaling: { min: 1, max: 1, queue_up: 50, cooldown_up_s: 20, cooldown_down_s: 20 }
 edges:
@@ -100,7 +103,10 @@ run_one() {  # arm mode rep outdir
   esac
   case "$mode" in
     serde|passthrough) env_kv+=("EPICO_NATIVE_STAGE=$mode") ;;
-    wasm) : ;;
+    serde-bin)         env_kv+=(EPICO_NATIVE_STAGE=serde EPICO_BINARY_EDGES=1) ;;
+    wasm-dyn)          env_kv+=(EPICO_DYNAMIC_DISPATCH=1) ;;          # Val layer (old default)
+    wasm)              : ;;                                            # typed dispatch, JSON
+    wasm-bin)          env_kv+=(EPICO_BINARY_EDGES=1) ;;               # typed dispatch, binary
   esac
 
   echo ">> arm=$arm mode=$mode rep=$rep"

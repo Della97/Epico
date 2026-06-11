@@ -39,7 +39,7 @@ use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 /// The `ResourceTable` is what wasmtime-wasi uses to hand resource
 /// handles to guests; WASI and HTTP each need their own context
 /// (they're independent subsystems).
-pub(crate) struct HostState {
+pub struct HostState {
     pub table: ResourceTable,
     pub wasi: WasiCtx,
     pub http: WasiHttpCtx,
