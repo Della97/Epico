@@ -209,6 +209,32 @@ fn run_wasm_worker(
     // analyze scripts are unchanged) and additionally aggregates by the full
     // label for the new per_replica summary block.
     let hop_label = format!("{}#{}", stage.name, replica_idx);
+
+    // Native-bypass experiment mode (`EPICO_NATIVE_STAGE`):
+    //   "passthrough" — forward the input bytes untouched: no JSON parse, no
+    //                   hop append. Measures transport + recv/push plumbing
+    //                   only. Per-stage telemetry is empty (no hops); e2e and
+    //                   throughput remain valid since bench_ts_wall rides
+    //                   through unchanged.
+    //   "serde"       — full envelope path (parse + hop append + serialize)
+    //                   but no Val construction and no wasm call.
+    // Together with the normal wasm path these decompose the stage service
+    // time into transport/plumbing, serde, and wasm+dynamic-dispatch shares.
+    // Identity pipelines only — user code is NOT executed in either mode.
+    let native_mode: Option<&'static str> =
+        match std::env::var("EPICO_NATIVE_STAGE").ok().as_deref() {
+            Some("passthrough") => Some("passthrough"),
+            Some("serde")       => Some("serde"),
+            Some(other) => {
+                log.warn("unknown EPICO_NATIVE_STAGE value; running normal wasm path",
+                         &[("value", other)]);
+                None
+            }
+            None => None,
+        };
+    if let Some(m) = native_mode {
+        log.info("NATIVE BYPASS ACTIVE — wasm is not being called", &[("mode", m)]);
+    }
     // First wall-clock read in this worker thread. Used to bound the gap
     // between `decision_ts` (captured in the autoscaler before
     // `std::thread::spawn`) and the moment this thread actually started
@@ -459,6 +485,39 @@ fn run_wasm_worker(
             Ordering::Relaxed,
         );
 
+        // ── Native bypass: passthrough ────────────────────────────────────
+        // Forward bytes untouched. EOS is detected with a byte scan so this
+        // path pays no JSON parse at all. The reduced refill keeps the
+        // credit protocol and worker_timing (total_ns) alive; serde_ns is 0
+        // by construction.
+        if native_mode == Some("passthrough") {
+            const EOS_PAT: &[u8] = b"\"__epico_eos\"";
+            let is_eos = event_bytes.len() >= EOS_PAT.len()
+                && event_bytes.windows(EOS_PAT.len()).any(|w| w == EOS_PAT);
+            if is_eos {
+                log.info("EOS received (passthrough); forwarding and exiting",
+                         &[("stage", &stage.name)]);
+                worker_output.send(event_owned.clone(), &drain_flag);
+                worker_input.send_control(b"");
+                break;
+            }
+            worker_output.send(event_owned.clone(), &drain_flag);
+            invocation_count += 1;
+            processed_since_refill += 1;
+            if worker_input.wants_credits() && processed_since_refill >= refill_threshold {
+                let total_ns = total_t0.elapsed().as_nanos() as u64;
+                let refill_payload = format!(
+                    "{{\"_ctrl\":\"refill\",\"rid\":\"{}\",\"fn\":\"{}\",\
+                     \"is_leader\":false,\"p99_latency_ms\":0,\
+                     \"total_ns\":{},\"serde_ns\":0,\"n_credits\":{}}}",
+                    rid_str, stage.name, total_ns, processed_since_refill,
+                );
+                worker_input.send_control(refill_payload.as_bytes());
+                processed_since_refill = 0;
+            }
+            continue;
+        }
+
         // Nanosecond resolution: at small payloads parse+serialize is
         // sub-microsecond, so `as_micros()` floored serde to 0 and made
         // serde_frac collapse. Measure in ns; the summary still reports
@@ -483,6 +542,41 @@ fn run_wasm_worker(
             worker_output.send(event_owned.clone(), &drain_flag);
             worker_input.send_control(b"");
             break;
+        }
+
+        // ── Native bypass: serde ──────────────────────────────────────────
+        // Full envelope path (parse above + hop append + serialize below),
+        // zero Val construction, zero wasm. enter==exit so the hop records a
+        // zero-width residence — per-stage/per-replica telemetry stays alive
+        // but contributes ~nothing, as a host-native identity stage should.
+        if native_mode == Some("serde") {
+            let enter_ts = now_secs_f64();
+            let exit_ts  = enter_ts;
+            let ser_t0 = Instant::now();
+            let out = match envelope.encode_identity(&hop_label, enter_ts, exit_ts) {
+                Ok(b) => b,
+                Err(e) => {
+                    log.error("identity encode failed", &[("err", &e.to_string())]);
+                    worker_input.send_control(b"");
+                    continue;
+                }
+            };
+            serde_ns += ser_t0.elapsed().as_nanos() as u64;
+            worker_output.send(out, &drain_flag);
+            invocation_count += 1;
+            processed_since_refill += 1;
+            if worker_input.wants_credits() && processed_since_refill >= refill_threshold {
+                let total_ns = total_t0.elapsed().as_nanos() as u64;
+                let refill_payload = format!(
+                    "{{\"_ctrl\":\"refill\",\"rid\":\"{}\",\"fn\":\"{}\",\
+                     \"is_leader\":false,\"p99_latency_ms\":0,\
+                     \"total_ns\":{},\"serde_ns\":{},\"n_credits\":{}}}",
+                    rid_str, stage.name, total_ns, serde_ns, processed_since_refill,
+                );
+                worker_input.send_control(refill_payload.as_bytes());
+                processed_since_refill = 0;
+            }
+            continue;
         }
 
         let ev_val = match envelope.input_val(&in_fields, &param_types[0]) {
@@ -523,6 +617,11 @@ fn run_wasm_worker(
         let prev_us    = avg_latency_us.load(Ordering::Relaxed);
         avg_latency_us.store((prev_us * 3 + latency_us) / 4, Ordering::Relaxed);
 
+        // Serialization timing starts BEFORE encode_output. (Previously the
+        // stopwatch started after final_bytes was already computed, so the
+        // reported serde_us was parse-only and the serialize cost was
+        // silently attributed to "other host" overhead.)
+        let serialize_t0 = Instant::now();
         let final_bytes = if !results.is_empty() {
             // The WIT signature is `process-event(...) -> tuple<event, bench-ctx>`.
             // wasmtime exposes that as a single result of Type::Tuple,
@@ -571,7 +670,6 @@ fn run_wasm_worker(
             Bytes::new()
         };
 
-        let serialize_t0 = Instant::now();
         serde_ns += serialize_t0.elapsed().as_nanos() as u64;
 
         let _ = process_fn.post_return(&mut store);

@@ -94,6 +94,39 @@ impl EventEnvelope {
             ),
         }
     }
+
+    /// Identity re-encode for the native-bypass experiment
+    /// (`EPICO_NATIVE_STAGE=serde`): re-serialize the original event JSON
+    /// unchanged except for the appended bench hop. This replays the full
+    /// envelope cost (parse happened at decode + serialize + hop bookkeeping)
+    /// with zero Val construction and zero wasm involvement, isolating the
+    /// serde share of the stage service time.
+    pub(crate) fn encode_identity(
+        &self,
+        stage_name: &str,
+        enter_ts: f64,
+        exit_ts: f64,
+    ) -> Result<Bytes> {
+        match self {
+            Self::Json(j) => {
+                let mut obj = j.value.clone();
+                if let serde_json::Value::Object(ref mut map) = obj {
+                    let mut hops = map
+                        .get("bench_hops")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    hops.push(serde_json::json!([stage_name, enter_ts, exit_ts]));
+                    map.insert("bench_hops".to_string(), serde_json::Value::Array(hops));
+                }
+                Ok(Bytes::from(serde_json::to_vec(&obj)?))
+            }
+            Self::Binary(_) => bail!(
+                "EPICO_NATIVE_STAGE=serde requires event_format: json \
+                 (binary envelopes are not implemented yet)"
+            ),
+        }
+    }
 }
 
 pub(crate) struct JsonEnvelope {
