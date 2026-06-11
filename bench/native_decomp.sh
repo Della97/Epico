@@ -50,9 +50,9 @@ nodes:
   - name: local
     host: 127.0.0.1
     force_tcp: false
-# NOTE: the type is named `msg`, NOT `event` — codegen falls back to the
+# NOTE: the type is named msg, NOT event -- codegen falls back to the
 # legacy 18-optional-field shared record whenever in/out are literally
-# named `event`, which silently inflates Val and serde costs.
+# named event, which silently inflates Val and serde costs.
 types:
   msg:
     sensor_id: string
