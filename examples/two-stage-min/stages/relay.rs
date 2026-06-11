@@ -7,7 +7,7 @@
 use epico_sdk::stage;
 
 stage! {
-    fn relay(ev: Event) -> Event {
+    fn relay(ev: Msg) -> Msg {
         ev
     }
 }

@@ -3,7 +3,7 @@
 use epico_sdk::stage;
 
 stage! {
-    fn forward(ev: Event) -> Event {
+    fn forward(ev: Msg) -> Msg {
         ev
     }
 }

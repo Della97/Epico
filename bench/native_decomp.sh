@@ -83,6 +83,7 @@ edges:
 deploy:
   host: localhost
   this_host: local
+  port_base: 9100
   ingress: ipc:///tmp/epico-minbench-push
   credit_window: $CREDIT_WINDOW
   batch_events: 1
