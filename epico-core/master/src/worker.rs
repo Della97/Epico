@@ -683,8 +683,11 @@ fn run_wasm_worker(
         let enter_ts = now_secs_f64();
         let t0       = Instant::now();
 
-        // `results` is hoisted out of the loop (see above) and reused;
-        // Func::call overwrites every slot on success.
+        // `results` is hoisted out of the loop and reused. The tuple-drilling
+        // below stashes the bench Val into results[1], growing the vec to 2;
+        // Func::call requires the slice length to equal the function's result
+        // count (1), so restore it before every call.
+        results.truncate(result_types.len());
         // Give this invocation a fresh CPU budget. If the guest runs past it the
         // call returns a trap (handled below) rather than hanging the worker.
         store.set_epoch_deadline(crate::host::MAX_CALL_EPOCH_TICKS);
@@ -693,7 +696,10 @@ fn run_wasm_worker(
         if let Err(e) = call_result {
             log.error("process-event call error", &[("err", &e.to_string())]);
             worker_input.send_control(b"");
-            let _ = process_fn.post_return(&mut store);
+            // NOTE: no post_return here — it is only legal after a SUCCESSFUL
+            // call; invoking it after a failed one panics inside wasmtime
+            // ("post_return can only be called after a function has
+            // previously been called").
             continue;
         }
 
