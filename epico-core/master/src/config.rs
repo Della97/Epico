@@ -170,6 +170,28 @@ pub(crate) struct Config {
     /// scaffolded as the next transport mode, but not yet accepted for real runs.
     #[serde(default = "default_event_format")]
     pub event_format: String,
+    /// Wire format the in-process/native SOURCE emits at the ingress
+    /// (`json` | `binary`). Independent of `event_format` (interior edges).
+    /// Roadmap item 2. The loadgen reads the same key directly from runtime.yaml.
+    #[serde(default = "default_source_format")]
+    pub source_format: String,
+    /// Ingress spine mode for co-located sources: `socket` (default) keeps the
+    /// ZMQ ingress dispatcher; `inprocess` lets the host collapse the spine to
+    /// in-process rings when the source resolves to this host (roadmap item 1).
+    #[serde(default = "default_ingress_mode")]
+    pub ingress_mode: String,
+    /// In-process source fan-in width (pump threads). `None` = host default /
+    /// `EPICO_SOURCE_THREADS` env override (roadmap item 1).
+    #[serde(default)]
+    pub source_threads: Option<usize>,
+}
+
+pub(crate) fn default_source_format() -> String {
+    "json".to_string()
+}
+
+pub(crate) fn default_ingress_mode() -> String {
+    "socket".to_string()
 }
 
 pub(crate) fn default_resource_sample_interval_ms() -> u64 {

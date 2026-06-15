@@ -43,6 +43,11 @@ wasmparser = "0.218"
 anyhow = "1"
 epico-logger = { path = "../logger" }
 
+# Shared binary event-envelope wire format (single source of truth, also used
+# by epico-loadgen). Zero-dependency; defines magic/version, scalar tags,
+# header + field codec, and the reader.
+epico-wire = { path = "../../epico-wire" }
+
 # Process CPU + RSS sampling for the run summary. Cross-platform
 # (Linux/macOS/Windows); refresh cost is negligible at 1 Hz.
 sysinfo = "0.30"

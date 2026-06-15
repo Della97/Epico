@@ -32,13 +32,17 @@ use anyhow::{bail, Result};
 use bytes::Bytes;
 use wasmtime::component::{Type, Val};
 
+// The binary wire format lives in the shared `epico-wire` crate so the loadgen
+// can emit the identical layout without depending on `master`. We re-use its
+// constants, the `Scalar` type (aliased to the historical `BinScalar` name),
+// the header/field writers, and the reader/decoder here.
+use epico_wire::{self as wire, Scalar as BinScalar, BIN_MAGIC, BIN_VERSION};
+pub(crate) use epico_wire::is_binary;
+
 use crate::conversion::{
     bench_val_to_json, json_to_bench_val, json_to_record_val, record_val_to_json, FieldKind,
     RecordField,
 };
-
-const BIN_MAGIC: u8 = 0xEB;
-const BIN_VERSION: u8 = 0x01;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvelopeFormat {
@@ -57,9 +61,7 @@ impl EnvelopeFormat {
 }
 
 /// True when the buffer carries the binary envelope magic.
-pub(crate) fn is_binary(bytes: &[u8]) -> bool {
-    bytes.len() >= 4 && bytes[0] == BIN_MAGIC && bytes[1] == BIN_VERSION
-}
+/// (Implementation re-exported from `epico-wire` — see the `use` above.)
 
 /// Collector-side adapter: decode ONLY the telemetry-relevant header of a
 /// binary event (bench fields + hops) into the same JSON shape the collector
@@ -273,17 +275,9 @@ impl JsonEnvelope {
 
 // ── Binary envelope ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
-pub(crate) enum BinScalar {
-    Str(String),
-    F64(f64),
-    F32(f32),
-    U64(u64),
-    U32(u32),
-    S64(i64),
-    S32(i32),
-    Bool(bool),
-}
+// `BinScalar` is `epico_wire::Scalar` (aliased in the imports above). Variants
+// and pattern matches below are unchanged; the type now lives in the shared
+// wire crate so encoder and decoder can never drift.
 
 #[derive(Debug, Clone)]
 pub(crate) struct BinField {
@@ -310,7 +304,7 @@ impl BinaryEnvelope {
     }
 
     fn decode_inner(b: &[u8], with_fields: bool) -> Result<Self> {
-        let mut c = Cursor { b, pos: 0 };
+        let mut c = wire::Reader::new(b);
         let magic = c.u8()?;
         let version = c.u8()?;
         if magic != BIN_MAGIC || version != BIN_VERSION {
@@ -341,24 +335,9 @@ impl BinaryEnvelope {
                 let present = c.u8()? != 0;
                 let nlen = c.u8()? as usize;
                 let name = c.str_n(nlen)?;
-                let scalar = if present {
-                    Some(match kind {
-                        0 => {
-                            let slen = c.u16()? as usize;
-                            BinScalar::Str(c.str_n(slen)?)
-                        }
-                        1 => BinScalar::F64(c.f64()?),
-                        2 => BinScalar::F32(f32::from_le_bytes(c.arr4()?)),
-                        3 => BinScalar::U64(c.u64()?),
-                        4 => BinScalar::U32(u32::from_le_bytes(c.arr4()?)),
-                        5 => BinScalar::S64(i64::from_le_bytes(c.arr8()?)),
-                        6 => BinScalar::S32(i32::from_le_bytes(c.arr4()?)),
-                        7 => BinScalar::Bool(c.u8()? != 0),
-                        other => bail!("binary envelope: unknown field kind {other}"),
-                    })
-                } else {
-                    None
-                };
+                // `Reader::scalar` reads the payload for this kind tag and
+                // rejects unknown kinds — the single shared decode path.
+                let scalar = if present { Some(c.scalar(kind)?) } else { None };
                 fields.push(BinField { name, scalar });
             }
         }
@@ -484,72 +463,19 @@ fn default_val(kind: FieldKind) -> Val {
 
 fn kind_tag(kind: FieldKind) -> u8 {
     match kind {
-        FieldKind::String => 0,
-        FieldKind::F64 => 1,
-        FieldKind::F32 => 2,
-        FieldKind::U64 => 3,
-        FieldKind::U32 => 4,
-        FieldKind::S64 => 5,
-        FieldKind::S32 => 6,
-        FieldKind::Bool => 7,
+        FieldKind::String => wire::tag::STR,
+        FieldKind::F64 => wire::tag::F64,
+        FieldKind::F32 => wire::tag::F32,
+        FieldKind::U64 => wire::tag::U64,
+        FieldKind::U32 => wire::tag::U32,
+        FieldKind::S64 => wire::tag::S64,
+        FieldKind::S32 => wire::tag::S32,
+        FieldKind::Bool => wire::tag::BOOL,
     }
 }
 
-fn write_header(
-    out: &mut Vec<u8>,
-    ts_wall: Option<f64>,
-    ts: Option<f64>,
-    seq: Option<u64>,
-    hops: &[(String, f64, f64)],
-    new_hop: Option<(&str, f64, f64)>,
-) {
-    out.push(BIN_MAGIC);
-    out.push(BIN_VERSION);
-    out.push(0); // flags
-    let mut bitmap = 0u8;
-    if ts_wall.is_some() { bitmap |= 1; }
-    if ts.is_some()      { bitmap |= 2; }
-    if seq.is_some()     { bitmap |= 4; }
-    out.push(bitmap);
-    if let Some(v) = ts_wall { out.extend_from_slice(&v.to_le_bytes()); }
-    if let Some(v) = ts      { out.extend_from_slice(&v.to_le_bytes()); }
-    if let Some(v) = seq     { out.extend_from_slice(&v.to_le_bytes()); }
-
-    let n_hops = hops.len() + usize::from(new_hop.is_some());
-    out.extend_from_slice(&(n_hops as u16).to_le_bytes());
-    let write_hop = |out: &mut Vec<u8>, name: &str, enter: f64, exit: f64| {
-        let nb = name.as_bytes();
-        let nlen = nb.len().min(u8::MAX as usize);
-        out.push(nlen as u8);
-        out.extend_from_slice(&nb[..nlen]);
-        out.extend_from_slice(&enter.to_le_bytes());
-        out.extend_from_slice(&exit.to_le_bytes());
-    };
-    for (n, e, x) in hops {
-        write_hop(out, n, *e, *x);
-    }
-    if let Some((n, e, x)) = new_hop {
-        write_hop(out, n, e, x);
-    }
-}
-
-fn write_field_payload(out: &mut Vec<u8>, s: &BinScalar) {
-    match s {
-        BinScalar::Str(v) => {
-            let b = v.as_bytes();
-            let len = b.len().min(u16::MAX as usize);
-            out.extend_from_slice(&(len as u16).to_le_bytes());
-            out.extend_from_slice(&b[..len]);
-        }
-        BinScalar::F64(v) => out.extend_from_slice(&v.to_le_bytes()),
-        BinScalar::F32(v) => out.extend_from_slice(&v.to_le_bytes()),
-        BinScalar::U64(v) => out.extend_from_slice(&v.to_le_bytes()),
-        BinScalar::U32(v) => out.extend_from_slice(&v.to_le_bytes()),
-        BinScalar::S64(v) => out.extend_from_slice(&v.to_le_bytes()),
-        BinScalar::S32(v) => out.extend_from_slice(&v.to_le_bytes()),
-        BinScalar::Bool(v) => out.push(u8::from(*v)),
-    }
-}
+// `write_header` and `write_field_payload` now live in `epico-wire` (imported as
+// `wire::write_header` / `wire::write_field` / `wire::write_field_payload`).
 
 /// Encode from a post-call `Val::Record` (the normal output path).
 fn write_binary(
@@ -561,7 +487,7 @@ fn write_binary(
     event: Option<(&Val, &[RecordField])>,
 ) -> Bytes {
     let mut out = Vec::with_capacity(96 + hops.len() * 40);
-    write_header(&mut out, ts_wall, ts, seq, hops, new_hop);
+    wire::write_header(&mut out, ts_wall, ts, seq, hops, new_hop);
 
     let count_pos = out.len();
     out.extend_from_slice(&0u16.to_le_bytes());
@@ -572,15 +498,7 @@ fn write_binary(
             for (name, fval) in rec.iter() {
                 let Some(f) = fields.iter().find(|f| f.name == *name) else { continue };
                 let scalar = val_to_scalar(fval, f);
-                out.push(kind_tag(f.inner_kind));
-                out.push(u8::from(scalar.is_some()));
-                let nb = f.json_name.as_bytes();
-                let nlen = nb.len().min(u8::MAX as usize);
-                out.push(nlen as u8);
-                out.extend_from_slice(&nb[..nlen]);
-                if let Some(s) = &scalar {
-                    write_field_payload(&mut out, s);
-                }
+                wire::write_field(&mut out, &f.json_name, kind_tag(f.inner_kind), scalar.as_ref());
                 n_fields += 1;
             }
         }
@@ -599,34 +517,13 @@ fn write_binary_raw_fields(
     fields: &[BinField],
 ) -> Bytes {
     let mut out = Vec::with_capacity(96 + hops.len() * 40);
-    write_header(&mut out, ts_wall, ts, seq, hops, new_hop);
+    wire::write_header(&mut out, ts_wall, ts, seq, hops, new_hop);
     out.extend_from_slice(&(fields.len().min(u16::MAX as usize) as u16).to_le_bytes());
     for f in fields.iter().take(u16::MAX as usize) {
-        let (tag, present): (u8, bool) = match &f.scalar {
-            Some(s) => (
-                match s {
-                    BinScalar::Str(_) => 0,
-                    BinScalar::F64(_) => 1,
-                    BinScalar::F32(_) => 2,
-                    BinScalar::U64(_) => 3,
-                    BinScalar::U32(_) => 4,
-                    BinScalar::S64(_) => 5,
-                    BinScalar::S32(_) => 6,
-                    BinScalar::Bool(_) => 7,
-                },
-                true,
-            ),
-            None => (0, false),
-        };
-        out.push(tag);
-        out.push(u8::from(present));
-        let nb = f.name.as_bytes();
-        let nlen = nb.len().min(u8::MAX as usize);
-        out.push(nlen as u8);
-        out.extend_from_slice(&nb[..nlen]);
-        if let Some(s) = &f.scalar {
-            write_field_payload(&mut out, s);
-        }
+        // An absent field still carries its original kind tag so the schema
+        // kind survives the hop; derive it from the scalar when present.
+        let tag = f.scalar.as_ref().map(BinScalar::tag).unwrap_or(wire::tag::STR);
+        wire::write_field(&mut out, &f.name, tag, f.scalar.as_ref());
     }
     Bytes::from(out)
 }
@@ -656,43 +553,8 @@ fn val_to_scalar(val: &Val, field: &RecordField) -> Option<BinScalar> {
 }
 
 // ── Cursor ────────────────────────────────────────────────────────────────────
-
-struct Cursor<'a> {
-    b: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        if self.pos + n > self.b.len() {
-            bail!("binary envelope truncated at byte {}", self.pos);
-        }
-        let s = &self.b[self.pos..self.pos + n];
-        self.pos += n;
-        Ok(s)
-    }
-    fn u8(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
-    }
-    fn u16(&mut self) -> Result<u16> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
-    }
-    fn u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.arr8()?))
-    }
-    fn f64(&mut self) -> Result<f64> {
-        Ok(f64::from_le_bytes(self.arr8()?))
-    }
-    fn arr4(&mut self) -> Result<[u8; 4]> {
-        Ok(self.take(4)?.try_into().unwrap())
-    }
-    fn arr8(&mut self) -> Result<[u8; 8]> {
-        Ok(self.take(8)?.try_into().unwrap())
-    }
-    fn str_n(&mut self, n: usize) -> Result<String> {
-        Ok(String::from_utf8_lossy(self.take(n)?).into_owned())
-    }
-}
+// The byte cursor now lives in `epico-wire` as `wire::Reader`; `decode_inner`
+// uses it directly.
 
 #[cfg(test)]
 mod tests {
@@ -927,29 +789,21 @@ fn write_binary_typed(
     fields: &[(&'static str, WireValue)],
 ) -> Bytes {
     let mut out = Vec::with_capacity(96 + hops.len() * 40);
-    write_header(&mut out, ts_wall, ts, seq, hops, new_hop);
+    wire::write_header(&mut out, ts_wall, ts, seq, hops, new_hop);
     out.extend_from_slice(&(fields.len().min(u16::MAX as usize) as u16).to_le_bytes());
     for (name, v) in fields.iter().take(u16::MAX as usize) {
         let (tag, scalar): (u8, Option<BinScalar>) = match v {
-            WireValue::Str(s) => (0, Some(BinScalar::Str(s.clone()))),
-            WireValue::F64(x) => (1, Some(BinScalar::F64(*x))),
-            WireValue::F32(x) => (2, Some(BinScalar::F32(*x))),
-            WireValue::U64(x) => (3, Some(BinScalar::U64(*x))),
-            WireValue::U32(x) => (4, Some(BinScalar::U32(*x))),
-            WireValue::S64(x) => (5, Some(BinScalar::S64(*x))),
-            WireValue::S32(x) => (6, Some(BinScalar::S32(*x))),
-            WireValue::Bool(x) => (7, Some(BinScalar::Bool(*x))),
-            WireValue::Absent => (0, None),
+            WireValue::Str(s) => (wire::tag::STR, Some(BinScalar::Str(s.clone()))),
+            WireValue::F64(x) => (wire::tag::F64, Some(BinScalar::F64(*x))),
+            WireValue::F32(x) => (wire::tag::F32, Some(BinScalar::F32(*x))),
+            WireValue::U64(x) => (wire::tag::U64, Some(BinScalar::U64(*x))),
+            WireValue::U32(x) => (wire::tag::U32, Some(BinScalar::U32(*x))),
+            WireValue::S64(x) => (wire::tag::S64, Some(BinScalar::S64(*x))),
+            WireValue::S32(x) => (wire::tag::S32, Some(BinScalar::S32(*x))),
+            WireValue::Bool(x) => (wire::tag::BOOL, Some(BinScalar::Bool(*x))),
+            WireValue::Absent => (wire::tag::STR, None),
         };
-        out.push(tag);
-        out.push(u8::from(scalar.is_some()));
-        let nb = name.as_bytes();
-        let nlen = nb.len().min(u8::MAX as usize);
-        out.push(nlen as u8);
-        out.extend_from_slice(&nb[..nlen]);
-        if let Some(s) = &scalar {
-            write_field_payload(&mut out, s);
-        }
+        wire::write_field(&mut out, name, tag, scalar.as_ref());
     }
     Bytes::from(out)
 }

@@ -29,6 +29,7 @@ pub struct Source {
     count:   u64, // global cap across all replicas
     stride:  u64, // 1 single-threaded; = num_threads when fanned out
     sensors: u64,
+    binary:  bool, // emit the binary envelope instead of JSON
 }
 
 impl Source {
@@ -37,7 +38,16 @@ impl Source {
             .ok().and_then(|v| v.parse().ok()).unwrap_or(4_000_000);
         let sensors = std::env::var("EPICO_SOURCE_SENSORS")
             .ok().and_then(|v| v.parse().ok()).unwrap_or(100);
-        Source { seq: 0, count, stride: 1, sensors }
+        // Binary ingest (roadmap item 2). The agent sets EPICO_SOURCE_FORMAT
+        // from `deploy.source_format` in the pipeline YAML, so either the env
+        // var or `source_format: binary` turns this on.
+        let binary = std::env::var("EPICO_SOURCE_FORMAT")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                v == "binary" || v == "epico-binary"
+            })
+            .unwrap_or(false);
+        Source { seq: 0, count, stride: 1, sensors, binary }
     }
 }
 
@@ -59,20 +69,41 @@ impl EventSource for Source {
         let (type_name, unit, base) = TYPES[idx % TYPES.len()];
         let location   = LOCATIONS[idx % LOCATIONS.len()];
         let value      = base + ((seq % 211) as f64) * 0.01;
+        let value      = (value * 10_000.0).round() / 10_000.0;
         let is_anomaly = seq % 500 == 0;
         let now_wall   = wall_now();
 
-        serde_json::to_vec(&serde_json::json!({
-            "bench_ts":      now_wall,
-            "bench_ts_wall": now_wall,
-            "bench_seq":     seq,
-            "sensor_id":     format!("sensor-{:04}", idx),
-            "sensor_type":   type_name,
-            "location":      location,
-            "unit":          unit,
-            "value":         (value * 10_000.0).round() / 10_000.0,
-            "is_anomaly":    is_anomaly,
-        }))
-        .ok()
+        // Same fields/values either way — only the encoding differs, so a
+        // binary-vs-JSON ingest run is a clean A/B (roadmap item 2). The host
+        // sniffs the format per event by magic byte; the stages read fields by
+        // name, so they are unchanged.
+        if self.binary {
+            Some(
+                epico_master::wire::EventBuilder::new()
+                    .ts_wall(now_wall)
+                    .ts(now_wall)
+                    .seq(seq)
+                    .str_field("sensor_id", format!("sensor-{:04}", idx))
+                    .str_field("sensor_type", type_name)
+                    .str_field("location", location)
+                    .str_field("unit", unit)
+                    .f64_field("value", value)
+                    .bool_field("is_anomaly", is_anomaly)
+                    .finish(),
+            )
+        } else {
+            serde_json::to_vec(&serde_json::json!({
+                "bench_ts":      now_wall,
+                "bench_ts_wall": now_wall,
+                "bench_seq":     seq,
+                "sensor_id":     format!("sensor-{:04}", idx),
+                "sensor_type":   type_name,
+                "location":      location,
+                "unit":          unit,
+                "value":         value,
+                "is_anomaly":    is_anomaly,
+            }))
+            .ok()
+        }
     }
 }

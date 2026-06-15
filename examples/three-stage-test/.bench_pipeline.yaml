@@ -46,6 +46,8 @@ edges:
 deploy:
   host: localhost
   this_host: local
+  # Loadgen binary ingest (roadmap item 2). Remove for the JSON baseline.
+  source_format: binary
   ingress: ipc:///tmp/epico-bench-push
   credit_window: 16
   batch_events: 1

@@ -1,0 +1,15 @@
+[package]
+name = "epico-wire"
+version = "0.1.0"
+edition = "2021"
+description = "Epico binary event-envelope wire format — single source of truth, shared by master and loadgen"
+
+[lib]
+name = "epico_wire"
+path = "src/lib.rs"
+
+[dependencies]
+# Intentionally none. This crate is the format spec; it must be cheap to
+# depend on from both the heavy `master` (wasmtime) crate and the lightweight
+# `epico-loadgen`. It deals only in `Vec<u8>` and primitive scalars — no
+# wasmtime `Val`, no `bytes::Bytes` (callers wrap as they please).

@@ -107,3 +107,7 @@ edges:
 deploy:
   host: localhost
   this_host: local
+  # Binary ingest from the native in-process source (roadmap item 2). The agent
+  # bridges this onto EPICO_SOURCE_FORMAT so stages/source.rs emits the binary
+  # envelope. Remove the line (or set `json`) for the JSON baseline arm.
+  source_format: binary

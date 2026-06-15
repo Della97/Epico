@@ -123,6 +123,18 @@ pub struct PipelineSpec {
     /// Transport envelope format for events. `json` is the compatible default;
     /// `binary` is reserved for the generated binary envelope path.
     pub event_format: String,
+    /// Wire format the source emits at the ingress (`json` | `binary`). Read by
+    /// the loadgen and the native in-process source. Independent of
+    /// `event_format` (interior edges). Roadmap item 2.
+    pub source_format: String,
+    /// Ingress spine mode for co-located sources: `socket` (default) collapses
+    /// nothing; `inprocess` lets the host replace the ZMQ ingress dispatcher
+    /// with in-process rings when the source resolves to this host. Roadmap
+    /// item 1.
+    pub ingress_mode: String,
+    /// In-process source fan-in width (pump threads). `None` = host default /
+    /// `EPICO_SOURCE_THREADS`. Roadmap item 1.
+    pub source_threads: Option<usize>,
 }
 
 /// A native boundary node (source or sink) compiled into the per-pipeline
@@ -353,6 +365,19 @@ struct DeploySpec {
     /// as an experimental runtime knob and schema artifact, but JSON remains the
     /// only fully implemented codec.
     event_format: Option<String>,
+    /// Wire format the SOURCE (loadgen / native in-process source) emits at the
+    /// ingress: `json` (default) or `binary`. Distinct from `event_format`,
+    /// which governs interior edges — a pipeline may take binary in while
+    /// keeping JSON edges, or vice versa (roadmap item 2).
+    source_format: Option<String>,
+    /// Ingress/egress spine mode for co-located sources (roadmap item 1):
+    /// `socket` (default — ZMQ ingress dispatcher) or `inprocess` (collapse the
+    /// spine to in-process rings when the source resolves to this host). The
+    /// host still falls back to sockets when an external producer is declared.
+    ingress_mode: Option<String>,
+    /// Source fan-in width — number of in-process source pump threads. Mirrors
+    /// the `EPICO_SOURCE_THREADS` env override so it is reproducible from YAML.
+    source_threads: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -695,6 +720,18 @@ fn from_new_format(raw: NewFormat, yaml_dir: &Path) -> Result<PipelineSpec> {
         other => bail!("deploy.event_format {:?} is invalid; expected `json` or `binary`", other),
     }
 
+    let source_format = raw.deploy.source_format.unwrap_or_else(|| "json".to_string());
+    match source_format.as_str() {
+        "json" | "binary" | "epico-binary" => {}
+        other => bail!("deploy.source_format {:?} is invalid; expected `json` or `binary`", other),
+    }
+
+    let ingress_mode = raw.deploy.ingress_mode.unwrap_or_else(|| "socket".to_string());
+    match ingress_mode.as_str() {
+        "socket" | "inprocess" | "inproc" => {}
+        other => bail!("deploy.ingress_mode {:?} is invalid; expected `socket` or `inprocess`", other),
+    }
+
     Ok(PipelineSpec {
         package: raw.package,
         nodes,
@@ -716,6 +753,9 @@ fn from_new_format(raw: NewFormat, yaml_dir: &Path) -> Result<PipelineSpec> {
         credit_window: raw.deploy.credit_window.unwrap_or(1),
         batch_events: raw.deploy.batch_events.unwrap_or(1),
         event_format,
+        source_format,
+        ingress_mode,
+        source_threads: raw.deploy.source_threads,
     })
 }
 
@@ -821,5 +861,10 @@ fn from_old_format(raw: OldFormat, yaml_dir: &Path) -> Result<PipelineSpec> {
         // Old-format YAMLs predate batching; one event per message.
         batch_events: 1,
         event_format: "json".to_string(),
+        // Old-format YAMLs predate binary ingest / spine collapse; preserve the
+        // original socket-based JSON ingress.
+        source_format: "json".to_string(),
+        ingress_mode: "socket".to_string(),
+        source_threads: None,
     })
 }

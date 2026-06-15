@@ -31,6 +31,11 @@ mod worker;
 // Re-exported so `typed`'s public trait signatures don't leak private paths.
 pub use host::HostState;
 
+// Re-exported so native source/sink crates (compiled into the per-pipeline
+// agent) can build the binary envelope without declaring their own dependency:
+// `epico_master::wire::EventBuilder`.
+pub use epico_wire as wire;
+
 use crate::config::{default_wasm_path, stage_owned_by, Config};
 use crate::inproc::Edge;
 use crate::spsc::{SpscMesh, EdgeInSrc, EdgeOutSrc};
@@ -416,11 +421,32 @@ pub fn run_agent(
     if let Some(edge) = ingress_source_edge {
         let src_log = log.with_component("master/source");
         // Fan the source out across K threads on the (MPMC) ingress edge. One
-        // thread by default; raise EPICO_SOURCE_THREADS to feed faster than a
-        // single generate-plus-serialize thread can, to find the pipeline's
-        // drain ceiling rather than the source's rate.
+        // thread by default. Precedence: EPICO_SOURCE_THREADS env override >
+        // `source_threads:` from runtime.yaml (deploy field, roadmap item 1) > 1.
         let threads = std::env::var("EPICO_SOURCE_THREADS")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(1usize).max(1);
+            .ok().and_then(|v| v.parse().ok())
+            .or(config.source_threads)
+            .unwrap_or(1usize).max(1);
+        // Native/in-process source emits binary when the pipeline asks for it
+        // (`source_format: binary`, roadmap item 2). EOS stays JSON regardless.
+        // EPICO_SOURCE_FORMAT env overrides for a same-binary A/B.
+        let source_binary = std::env::var("EPICO_SOURCE_FORMAT")
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                v == "binary" || v == "epico-binary"
+            })
+            .unwrap_or_else(|| {
+                matches!(config.source_format.as_str(), "binary" | "epico-binary")
+            });
+        // Native sources (`run_source_native`, compiled from a user `source.rs`)
+        // read the format from the EPICO_SOURCE_FORMAT env, since the host can't
+        // change bytes the EventSource produces. Bridge the YAML knob onto the
+        // env (before spawning the source thread) so `source_format: binary`
+        // works for native sources without an explicit env var.
+        if source_binary {
+            std::env::set_var("EPICO_SOURCE_FORMAT", "binary");
+        }
         if let Some(factory) = custom_source {
             // Native source logic linked into the agent (option A).
             std::thread::spawn(move || {
@@ -432,7 +458,7 @@ pub fn run_agent(
             let sensors = std::env::var("EPICO_SOURCE_SENSORS")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(100usize);
             std::thread::spawn(move || {
-                run_source_gen(edge, count, sensors, threads, src_log);
+                run_source_gen(edge, count, sensors, threads, source_binary, src_log);
             });
         } else {
             let ingress_uri = config.dispatchers.iter()
@@ -770,13 +796,14 @@ fn run_source_native(out_edge: Edge, mut factory: SourceFactory, threads: usize,
 /// throughput flat, util still low), the next step is a pre-serialized event
 /// pool or sharding the source — but per-event serde is typically well above the
 /// stage ceiling, so the workers should bind first.
-fn run_source_gen(out_edge: Edge, count: u64, sensors: usize, threads: usize, log: Logger) {
+fn run_source_gen(out_edge: Edge, count: u64, sensors: usize, threads: usize, binary: bool, log: Logger) {
     let k = threads.max(1);
     let deadline = source_deadline();
     log.info("source generating (in-process, no socket)", &[
         ("count",   &count.to_string()),
         ("sensors", &sensors.max(1).to_string()),
         ("threads", &k.to_string()),
+        ("format",  if binary { "binary" } else { "json" }),
         ("seconds", &deadline.map(|_| std::env::var("EPICO_SOURCE_SECONDS")
             .unwrap_or_default()).unwrap_or_else(|| "∞".into())),
     ]);
@@ -787,7 +814,7 @@ fn run_source_gen(out_edge: Edge, count: u64, sensors: usize, threads: usize, lo
         let edge  = out_edge.clone();
         let total = total.clone();
         handles.push(std::thread::spawn(move || {
-            let n = gen_partition(&edge, count, sensors, i, k, deadline);
+            let n = gen_partition(&edge, count, sensors, i, k, binary, deadline);
             total.fetch_add(n, Ordering::Relaxed);
         }));
     }
@@ -822,7 +849,7 @@ fn source_deadline() -> Option<std::time::Instant> {
 /// `count`) and pushes them into the shared ingress Edge. No EOS — the
 /// coordinator emits one after all replicas join. Returns the count pushed.
 fn gen_partition(out_edge: &Edge, count: u64, sensors: usize, index: usize, stride: usize,
-                 deadline: Option<std::time::Instant>) -> u64 {
+                 binary: bool, deadline: Option<std::time::Instant>) -> u64 {
     // (type_name, unit, base_value) — mirrors the loadgen's sensor table.
     const TYPES: &[(&str, &str, f64)] = &[
         ("temperature", "\u{00b0}C", 22.0),
@@ -850,20 +877,37 @@ fn gen_partition(out_edge: &Edge, count: u64, sensors: usize, index: usize, stri
         if let Some(dl) = deadline { if std::time::Instant::now() >= dl { break; } }
         let (id, type_name, unit, location, base) = &descriptors[(seq as usize) % n];
         let value      = base + ((seq % 211) as f64) * 0.01;
+        let value      = (value * 10_000.0).round() / 10_000.0;
         let is_anomaly = seq % 500 == 0;
         let now_wall   = wall_now();
 
-        let bytes = serde_json::to_vec(&serde_json::json!({
-            "bench_ts":      now_wall,
-            "bench_ts_wall": now_wall,
-            "bench_seq":     seq,
-            "sensor_id":     id.as_str(),
-            "sensor_type":   *type_name,
-            "location":      *location,
-            "unit":          *unit,
-            "value":         (value * 10_000.0).round() / 10_000.0,
-            "is_anomaly":    is_anomaly,
-        })).unwrap_or_default();
+        // Same fields and values either way — only the encoding differs, so a
+        // binary-vs-JSON ingest run is a clean A/B (roadmap item 2).
+        let bytes = if binary {
+            epico_wire::EventBuilder::new()
+                .ts_wall(now_wall)
+                .ts(now_wall)
+                .seq(seq)
+                .str_field("sensor_id", id.as_str())
+                .str_field("sensor_type", *type_name)
+                .str_field("location", *location)
+                .str_field("unit", *unit)
+                .f64_field("value", value)
+                .bool_field("is_anomaly", is_anomaly)
+                .finish()
+        } else {
+            serde_json::to_vec(&serde_json::json!({
+                "bench_ts":      now_wall,
+                "bench_ts_wall": now_wall,
+                "bench_seq":     seq,
+                "sensor_id":     id.as_str(),
+                "sensor_type":   *type_name,
+                "location":      *location,
+                "unit":          *unit,
+                "value":         value,
+                "is_anomaly":    is_anomaly,
+            })).unwrap_or_default()
+        };
 
         if !out_edge.push(Bytes::from(bytes), &supervisor::SHUTDOWN) { break; }
         pushed += 1;

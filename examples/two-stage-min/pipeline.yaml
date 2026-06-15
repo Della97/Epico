@@ -1,11 +1,11 @@
 # two-stage-min — minimal-compute pipeline for transport throughput tests.
 #
 # Two identity stages over the smallest practical record. The WASM body does
-# nothing, so per-event cost is just the fixed stage boundary (JSON -> WIT ->
-# JSON, ~1 us) and the *transport under test* on the single interior hop
-# relay -> forward. Ingress (loadgen -> dispatcher PULL) and egress (collector
-# PULL) are identical across arms, so any throughput difference between
-# dispatcher / edge / spsc is attributable to that one hop.
+# nothing, so per-event cost is just the fixed stage boundary (decode -> WIT ->
+# encode, ~1 us) and the *transport under test* on the single interior hop
+# relay -> forward. Ingress (loadgen -> first stage) and egress (collector) are
+# identical across arms, so any throughput difference between dispatcher / edge
+# / spsc is attributable to that one hop.
 #
 # Run standalone:        epico run
 # Run the A/B harness:   bench/tp_bench_2stage.sh   (overrides this file)
@@ -20,11 +20,19 @@ nodes:
 # One record type, reused for in: and out: of both stages. Two fields keeps
 # conversion close to the floor; if you want the absolute minimum serde cost,
 # drop sensor_id and keep only `value: f64` (one alloc-free field per event).
+#
+# IMPORTANT: do NOT name this type `event`. A type literally named `event`
+# triggers the legacy all-optional 18-field shared record AND skips typed
+# dispatch, inflating every measurement. `msg` (-> Rust `Msg`, which the
+# stages use) takes the typed fast path.
 types:
-  event:
+  msg:
     sensor_id: string
     value:     f64
 
+# Loadgen source. `source_format: binary` (in deploy:) makes it emit the binary
+# envelope, so the first stage skips the JSON parse on the saturating spine
+# (roadmap item 2). EOS stays JSON automatically.
 source:
   kind: loadgen
   profile: tp
@@ -35,15 +43,15 @@ source:
 stages:
   - name: relay
     placement: local
-    in:  event
-    out: event
+    in:  msg
+    out: msg
     src: ./stages/relay.rs
     scaling: { min: 1, max: 1, queue_up: 50, cooldown_up_s: 20, cooldown_down_s: 20 }
 
   - name: forward
     placement: local
-    in:  event
-    out: event
+    in:  msg
+    out: msg
     src: ./stages/forward.rs
     scaling: { min: 1, max: 1, queue_up: 50, cooldown_up_s: 20, cooldown_down_s: 20 }
 
@@ -53,6 +61,11 @@ edges:
 deploy:
   host: localhost
   this_host: local
+  # Binary INGEST (loadgen -> first stage).
+  source_format: binary
+  # Binary INTERIOR EDGES (relay -> forward). Independent knob; uncomment to
+  # also remove serde on the hop under test for a fully-binary run.
+  event_format: binary
   ingress: ipc:///tmp/epico-minbench-push
   credit_window: 16
   batch_events: 1

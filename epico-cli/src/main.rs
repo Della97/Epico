@@ -364,20 +364,64 @@ fn run_orchestrated(
         std::thread::sleep(Duration::from_millis(100));
     };
 
-    println!("==> Source exited (code {:?}); shutting down agent", source_status.code());
-    let _ = send_sigint(agent_pid);
+    // The source emits an EOS marker as its final message; the agent's collector
+    // recognizes it and self-exits cleanly once the pipeline has fully drained.
+    // Wait for that self-exit rather than SIGINT-ing immediately — an immediate
+    // signal races the in-flight drain, truncating the tail (run-to-run variance)
+    // and can orphan the agent's dispatcher children (the wedged-benchmark
+    // deadlock). SIGINT is only a fallback: if the user already Ctrl+C'd (no
+    // clean EOS is coming) we signal at once; otherwise we give the agent a
+    // bounded grace window to self-exit on EOS before nudging it.
+    let user_aborted = sig_count.load(Ordering::Relaxed) >= 1;
+    if user_aborted {
+        println!("==> Source exited via Ctrl+C; shutting down agent");
+        let _ = send_sigint(agent_pid);
+    } else {
+        println!(
+            "==> Source exited cleanly (code {:?}); waiting for agent to drain on EOS",
+            source_status.code()
+        );
+    }
 
-    let shutdown_deadline = Instant::now() + Duration::from_secs(10);
+    let drain_grace = std::env::var("EPICO_EOS_DRAIN_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30);
+    let drain_deadline = Instant::now() + Duration::from_secs(drain_grace);
+    let mut signalled = user_aborted;
+    let mut kill_deadline: Option<Instant> = if user_aborted {
+        Some(Instant::now() + Duration::from_secs(10))
+    } else {
+        None
+    };
+
     let agent_status = loop {
         if let Ok(Some(status)) = agent_child.try_wait() {
-            break status;
+            break status; // clean EOS-driven self-exit (or SIGINT took effect)
         }
-        if Instant::now() > shutdown_deadline {
-            eprintln!("==> Agent did not shut down in 10 s — killing");
-            let _ = agent_child.kill();
-            break agent_child.wait().unwrap_or_else(|_| std::process::exit(1));
+        // A user Ctrl+C during the drain still forces a prompt shutdown.
+        if !signalled && sig_count.load(Ordering::Relaxed) >= 1 {
+            println!("==> Ctrl+C during drain — forwarding SIGINT to agent");
+            let _ = send_sigint(agent_pid);
+            signalled = true;
+            kill_deadline = Some(Instant::now() + Duration::from_secs(10));
         }
-        std::thread::sleep(Duration::from_millis(100));
+        // Fallback: agent didn't self-exit on EOS within the grace window.
+        if !signalled && Instant::now() > drain_deadline {
+            eprintln!("==> Agent did not self-exit within {drain_grace} s of EOS — sending SIGINT");
+            let _ = send_sigint(agent_pid);
+            signalled = true;
+            kill_deadline = Some(Instant::now() + Duration::from_secs(10));
+        }
+        // Hard kill if it ignores SIGINT too.
+        if let Some(kd) = kill_deadline {
+            if Instant::now() > kd {
+                eprintln!("==> Agent did not shut down after SIGINT — killing");
+                let _ = agent_child.kill();
+                break agent_child.wait().unwrap_or_else(|_| std::process::exit(1));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
     };
 
     if !source_status.success() {

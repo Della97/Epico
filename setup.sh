@@ -4,17 +4,20 @@
 # Run this from the epico repo root. It does:
 #   1. Verifies the Rust toolchain is present (does NOT install rust).
 #   2. Adds the wasm32-wasip2 target via rustup (needed for stage compilation).
-#   3. Installs the `epico` CLI to ~/.cargo/bin via cargo install.
-#   4. Pre-builds runtime binaries (master + dispatcher) by calling
-#      `epico bootstrap`, so the first `epico run` is fast.
-#   5. Verifies ~/.cargo/bin is on PATH and prints a hint if it isn't.
+#   3. Builds the full runtime workspace in release mode:
+#        master + dispatcher + epico-loadgen  (and the epico-wire crate they
+#        share). This also refreshes Cargo.lock so the --locked CLI install
+#        below stays reproducible.
+#   4. Installs the `epico` CLI to ~/.cargo/bin via cargo install.
+#   5. Verifies the produced binaries and that ~/.cargo/bin is on PATH.
 #
 # After setup:
 #   - rebuild the CLI itself:   re-run this script (or `cargo install --path epico-cli --force`)
-#   - rebuild the runtime:      `epico bootstrap`          (from anywhere in the repo)
+#   - rebuild the runtime:      `epico bootstrap`   (master + dispatcher)
+#                               re-run this script   (also rebuilds the loadgen)
 #   - build a pipeline:         `cd examples/X && epico build`
 #   - run a pipeline:           `cd examples/X && epico run`
-#   - wipe all build artifacts: `epico clean`              (from anywhere in the repo)
+#   - wipe all build artifacts: `epico clean`        (from anywhere in the repo)
 #
 # Re-running setup.sh is safe.
 
@@ -44,8 +47,10 @@ cd "$SCRIPT_DIR"
 # Sanity-check the workspace layout — these paths are specific to epico
 # and confirm we're in the right place.
 [[ -f Cargo.toml ]]             || fail "no Cargo.toml in $SCRIPT_DIR — put setup.sh at the epico repo root"
-[[ -f epico-cli/Cargo.toml ]] || fail "epico-cli/Cargo.toml missing — is this a epico checkout?"
-[[ -f epico-sdk/Cargo.toml ]] || fail "epico-sdk/Cargo.toml missing — is this a epico checkout?"
+[[ -f epico-cli/Cargo.toml ]]   || fail "epico-cli/Cargo.toml missing — is this a epico checkout?"
+[[ -f epico-sdk/Cargo.toml ]]   || fail "epico-sdk/Cargo.toml missing — is this a epico checkout?"
+[[ -f epico-wire/Cargo.toml ]]  || fail "epico-wire/Cargo.toml missing — the shared binary wire-format crate is required (master + loadgen depend on it for binary ingest)."
+[[ -f epico-loadgen/Cargo.toml ]] || fail "epico-loadgen/Cargo.toml missing — is this a epico checkout?"
 
 info "repo root: $SCRIPT_DIR"
 
@@ -60,12 +65,13 @@ command -v rustup >/dev/null 2>&1 || fail "rustup not found — the wasm32-wasip
 RUSTC_VERSION="$(rustc --version 2>/dev/null || echo 'unknown')"
 info "rustc=$RUSTC_VERSION"
 
-# wasm32-wasip2 stabilized in rustc 1.82. Warn (don't block) below that.
+# The host crates (master/cli) pull wasmtime 26, which needs rustc >= 1.79;
+# wasm32-wasip2 stabilized in 1.82. Warn (don't block) below 1.82.
 RUSTC_SEMVER="$(rustc --version | awk '{print $2}')"
 RUSTC_MAJOR="$(echo "$RUSTC_SEMVER" | cut -d. -f1)"
 RUSTC_MINOR="$(echo "$RUSTC_SEMVER" | cut -d. -f2)"
 if [[ "$RUSTC_MAJOR" -lt 1 ]] || { [[ "$RUSTC_MAJOR" -eq 1 ]] && [[ "$RUSTC_MINOR" -lt 82 ]]; }; then
-    warn "rustc $RUSTC_SEMVER is older than 1.82 — wasm32-wasip2 support may be missing; consider 'rustup update'"
+    warn "rustc $RUSTC_SEMVER is older than 1.82 — wasm32-wasip2 + wasmtime 26 may not build; consider 'rustup update'"
 fi
 
 # ── 2. wasm target ───────────────────────────────────────────────────────────
@@ -81,16 +87,35 @@ else
         || fail "rustup failed to add wasm32-wasip2 — check network and rustup toolchain"
 fi
 
-# ── 3. install the CLI ───────────────────────────────────────────────────────
+# ── 3. build the runtime workspace ───────────────────────────────────────────
+# One cargo invocation builds every native runtime binary:
+#   master         — the wasm worker host / agent
+#   dispatcher     — the credit-flow router (socket transport)
+#   epico-loadgen  — the load generator (REQUIRED: `epico run` with a
+#                    `source: { kind: loadgen }` spawns target/release/epico-loadgen;
+#                    bootstrap alone does NOT build it, which is the usual
+#                    "epico-loadgen binary not found" failure on a fresh clone).
+# The shared `epico-wire` crate is compiled transitively. Building here also
+# writes/refreshes Cargo.lock so the --locked CLI install below is reproducible.
+
+info "building runtime: master + dispatcher + epico-loadgen (release)"
+info "this may take several minutes on first run (wasmtime is large)"
+
+BUILD_PKGS=(-p master -p dispatcher -p epico-loadgen)
+if ! cargo build --release "${BUILD_PKGS[@]}" ; then
+    fail "runtime build failed — see the cargo error above"
+fi
+info "runtime built: target/release/{master,dispatcher,epico-loadgen}"
+
+# ── 4. install the CLI ───────────────────────────────────────────────────────
 # `cargo install --path epico-cli` builds the CLI crate in release mode and
 # copies the resulting `epico` binary to $CARGO_HOME/bin.
-#   --locked   honors Cargo.lock so setup is reproducible
+#   --locked   honors Cargo.lock (refreshed in step 3) so setup is reproducible
 #   --force    overwrites any previously-installed epico
 
 CARGO_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
 
 info "building and installing the epico CLI (release)"
-info "this may take a few minutes on first run"
 
 if ! cargo install --path epico-cli --locked --force ; then
     warn "install with --locked failed; retrying without it"
@@ -104,27 +129,24 @@ EPICO_BIN="$CARGO_BIN/epico"
 
 info "installed $EPICO_BIN"
 
-# ── 4. PATH check (before calling epico) ───────────────────────────────────
+# ── 5. verify the runtime binaries ───────────────────────────────────────────
+
+REL="$SCRIPT_DIR/target/release"
+for bin in master dispatcher epico-loadgen ; do
+    if [[ -x "$REL/$bin" ]]; then
+        info "ok: target/release/$bin"
+    else
+        warn "expected target/release/$bin but it's missing — 'epico run' may re-bootstrap or fail to find it"
+    fi
+done
+
+# ── 6. PATH check ────────────────────────────────────────────────────────────
 
 PATH_OK=1
 case ":$PATH:" in
     *":$CARGO_BIN:"*) : ;;
     *) PATH_OK=0 ;;
 esac
-
-# ── 5. bootstrap runtime binaries ────────────────────────────────────────────
-# Pre-compiles master + dispatcher so the first `epico run` doesn't spend
-# its first few minutes building the runtime. Safe to skip if it fails —
-# `epico run` will re-bootstrap on demand.
-
-info "pre-building runtime binaries (epico bootstrap)"
-if "$EPICO_BIN" bootstrap --project-root "$SCRIPT_DIR" ; then
-    info "runtime pre-built: target/release/master, target/release/dispatcher"
-else
-    warn "bootstrap failed — you can still use the CLI; the first 'epico run' will retry the bootstrap"
-fi
-
-# ── 6. final PATH message ────────────────────────────────────────────────────
 
 if [[ "$PATH_OK" -eq 0 ]]; then
     warn "$CARGO_BIN is not on your PATH"
@@ -138,4 +160,5 @@ fi
 # ── done ─────────────────────────────────────────────────────────────────────
 
 info "setup complete"
-info "try:  cd examples/temps && epico run"
+info "try:  cd examples/two-stage-min && epico run     # binary ingest via loadgen"
+info " or:  cd examples/three-stage-test && epico run  # binary ingest via native source"

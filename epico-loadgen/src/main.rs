@@ -114,6 +114,20 @@ struct Args {
     /// so e2e latency is meaningless under --blast. Ignored unless profile=tp.
     #[arg(long)]
     blast: bool,
+
+    /// Emit events in Epico's binary envelope format instead of JSON. The host
+    /// sniffs the format per event (magic byte), so this removes the
+    /// first-stage JSON parse on the saturating spine. EOS stays JSON either
+    /// way. Can also be set via `source: { format: binary }` in the config.
+    #[arg(long)]
+    binary: bool,
+}
+
+/// On-wire encoding for domain events. EOS markers are always JSON.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WireFormat {
+    Json,
+    Binary,
 }
 
 // ============================================================================
@@ -182,6 +196,34 @@ fn load_entry_addr(path: &str) -> Result<(String, u16, Vec<String>)> {
     bail!("could not derive entry ingress URI from {path}");
 }
 
+/// Returns true when the config requests binary domain events. Accepts either
+/// the runtime.yaml top-level key `source_format: binary` (emitted by the CLI)
+/// or a nested `source: { format: binary }`. Missing/unknown → false (JSON).
+/// The `--binary` CLI flag ORs with this; either turns binary emission on.
+fn yaml_source_binary(path: &str) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else { return false };
+    let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(&raw) else { return false };
+    let is_binary = |s: &str| {
+        let t = s.trim();
+        t.eq_ignore_ascii_case("binary") || t.eq_ignore_ascii_case("epico-binary")
+    };
+    // Top-level (runtime.yaml) form.
+    if yaml
+        .get("source_format")
+        .and_then(|f| f.as_str())
+        .map(is_binary)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    // Nested (raw pipeline) form.
+    yaml.get("source")
+        .and_then(|s| s.get("format"))
+        .and_then(|f| f.as_str())
+        .map(is_binary)
+        .unwrap_or(false)
+}
+
 // ============================================================================
 // Sensors
 // ============================================================================
@@ -229,8 +271,10 @@ impl Sensor {
         }
     }
 
-    /// Returns a JSON-serialised event bytes + whether it is an anomaly.
-    fn reading(&mut self, seq: u64) -> (Vec<u8>, bool) {
+    /// Returns serialised event bytes (in the requested wire format) + whether
+    /// it is an anomaly. JSON and binary carry identical field values — only
+    /// the encoding differs — so a JSON-vs-binary run is a clean A/B.
+    fn reading(&mut self, seq: u64, fmt: WireFormat) -> (Vec<u8>, bool) {
         let (type_name, st) = &SENSOR_TYPES[self.type_idx];
         self.drift_acc += st.drift_per_s * self.drift_dir;
         if self.drift_acc.abs() > 3.0 * st.std {
@@ -245,22 +289,39 @@ impl Sensor {
             value    += sign * st.anomaly_mag * (0.8 + rng.gen::<f64>() * 0.4);
         }
         self.value = value;
+        let value = (value * 10_000.0).round() / 10_000.0;
 
         let now_wall = wall_now();
         let now_perf = perf_now();
 
-        let bytes = serde_json::to_vec(&serde_json::json!({
-            "bench_ts":      now_perf,
-            "bench_ts_wall": now_wall,
-            "bench_seq":     seq,
-            "sensor_id":     self.id,
-            "sensor_type":   type_name,
-            "location":      self.location,
-            "unit":          st.unit,
-            "value":         (value * 10_000.0).round() / 10_000.0,
-            "is_anomaly":    is_anomaly,
-        }))
-        .unwrap_or_default();
+        let bytes = match fmt {
+            WireFormat::Json => serde_json::to_vec(&serde_json::json!({
+                "bench_ts":      now_perf,
+                "bench_ts_wall": now_wall,
+                "bench_seq":     seq,
+                "sensor_id":     self.id,
+                "sensor_type":   type_name,
+                "location":      self.location,
+                "unit":          st.unit,
+                "value":         value,
+                "is_anomaly":    is_anomaly,
+            }))
+            .unwrap_or_default(),
+
+            // Same fields, same names, binary envelope. The host decodes by
+            // sniffing the magic byte; bench scalars ride in the header.
+            WireFormat::Binary => epico_wire::EventBuilder::new()
+                .ts_wall(now_wall)
+                .ts(now_perf)
+                .seq(seq)
+                .str_field("sensor_id", self.id.as_str())
+                .str_field("sensor_type", *type_name)
+                .str_field("location", self.location)
+                .str_field("unit", st.unit)
+                .f64_field("value", value)
+                .bool_field("is_anomaly", is_anomaly)
+                .finish(),
+        };
 
         (bytes, is_anomaly)
     }
@@ -347,6 +408,13 @@ fn main() -> Result<()> {
 
     let (entry_uri, entry_port, pipeline) = load_entry_addr(&args.config)?;
 
+    // Binary if requested on the CLI or in the config. EOS stays JSON regardless.
+    let wire_format = if args.binary || yaml_source_binary(&args.config) {
+        WireFormat::Binary
+    } else {
+        WireFormat::Json
+    };
+
     let addr = match (&args.entry, &args.external_entry) {
         (Some(e), _) => e.clone(),
         (_, Some(e)) => e.clone(),
@@ -365,6 +433,7 @@ fn main() -> Result<()> {
         ("sensors",   &args.sensors.to_string()),
         ("entry_addr",&addr),
         ("stages",    &pipeline.len().to_string()),
+        ("format",    if wire_format == WireFormat::Binary { "binary" } else { "json" }),
     ]);
 
     // ── ZMQ PUSH ──────────────────────────────────────────────────────────────
@@ -411,6 +480,7 @@ fn main() -> Result<()> {
     let args_wave_min     = args.wave_min;
     let args_wave_period  = args.wave_period;
     let args_blast        = args.blast;
+    let args_format       = wire_format;
 
     let producer = std::thread::spawn(move || {
         if args_profile == "tp" {
@@ -439,7 +509,7 @@ fn main() -> Result<()> {
                 // outpace (and therefore actually measure) the transport under
                 // test. bench_ts is frozen at build time, so DO NOT read e2e
                 // latency from a --blast run.
-                let (cached, _) = sensors[0].reading(0);
+                let (cached, _) = sensors[0].reading(0, args_format);
                 log_prod.info("tp blast mode (cached event, latency invalid)", &[
                     ("bytes", &cached.len().to_string()),
                     ("count", &tp_count.to_string()),
@@ -454,7 +524,7 @@ fn main() -> Result<()> {
                 while running_c.load(Ordering::Relaxed) && sent_n < tp_count {
                     let sensor = &mut sensors[si % n_sensors];
                     si += 1;
-                    let (bytes, is_anom) = sensor.reading(seq);
+                    let (bytes, is_anom) = sensor.reading(seq, args_format);
                     seq += 1;
                     match push.send(&bytes as &[u8], 0) {
                         Ok(_)  => {
@@ -528,7 +598,7 @@ fn main() -> Result<()> {
             for _ in 0..n_emit {
                 let sensor = &mut sensors[si % n_sensors];
                 si += 1;
-                let (bytes, is_anom) = sensor.reading(seq);
+                let (bytes, is_anom) = sensor.reading(seq, args_format);
                 seq += 1;
                 if is_anom { anom_n += 1; }
                 match push.send(&bytes as &[u8], zmq::DONTWAIT) {
