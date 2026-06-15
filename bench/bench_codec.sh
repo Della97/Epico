@@ -157,6 +157,7 @@ edges:
 deploy:
   host: localhost
   this_host: local
+  port_base: 9100
   source_format: $fmt
   event_format: $fmt
   ingress: $INGRESS
