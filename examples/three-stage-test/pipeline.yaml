@@ -41,10 +41,17 @@ types:
 #   profile: steady
 #   sensors: 50
 
+# Sinusoidal load: trough=3k EPS, peak=100k EPS, 40s period, 180s total.
+# Three stages with deliberately different scaling policies so that each
+# dispatcher queue reacts to the same wave at a different speed.
 source:
   kind: loadgen
-  profile: tp
-  count: 1000000
+  profile: wave
+  rate: 100000
+  wave_min: 3000
+  wave_period: 40
+  duration: 180
+  sensors: 100
 
 # The pipeline. `warmup` is an identity pass-through whose only job is to
 # absorb the first-stage process warmup costs (page-cache miss on the
@@ -58,11 +65,12 @@ stages:
     out: reading
     src: ./stages/normalize.rs
     scaling:
-      min: 0
-      max: 1
-      queue_up: 50
-      cooldown_up_s: 20
-      cooldown_down_s: 20
+      min: 1
+      max: 8
+      queue_up: 100
+      queue_down: 10
+      cooldown_up_s: 1
+      cooldown_down_s: 3
 
   - name: detect
     placement: local
@@ -70,11 +78,12 @@ stages:
     out: enriched
     src: ./stages/detect.rs
     scaling:
-      min: 0
-      max: 1
-      queue_up: 50
-      cooldown_up_s: 20
-      cooldown_down_s: 20
+      min: 1
+      max: 8
+      queue_up: 200
+      queue_down: 20
+      cooldown_up_s: 2
+      cooldown_down_s: 6
 
   - name: finalize
     placement: local
@@ -82,11 +91,12 @@ stages:
     out: enriched
     src: ./stages/finalize.rs
     scaling:
-      min: 0
-      max: 1
-      queue_up: 50
-      cooldown_up_s: 20
-      cooldown_down_s: 20
+      min: 1
+      max: 8
+      queue_up: 400
+      queue_down: 40
+      cooldown_up_s: 3
+      cooldown_down_s: 12
 
 edges:
   - normalize -> detect

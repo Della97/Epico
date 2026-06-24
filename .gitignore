@@ -12,6 +12,9 @@ plots/ablation_test/*
 
 # Deprecated code
 /deprecated/
+/bench/
+/macbook_tmp/
+/logs/
 
 # Pub folder
 /publications/

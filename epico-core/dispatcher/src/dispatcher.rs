@@ -47,7 +47,7 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0")]
     bind: String,
 
-    #[arg(long, default_value_t = 50_000)]
+    #[arg(long, default_value_t = 5_000)]
     max_queue: usize,
 
     #[arg(long)]
@@ -320,6 +320,7 @@ fn main() {
         // ── Frontend: receive events in one pass ──────────────────────────────
         if poll_frontend && items.len() > 2 && items[2].is_readable() {
             loop {
+                if event_buffer.len() >= args.max_queue { break; }
                 match frontend.recv_bytes(zmq::DONTWAIT) {
                     Ok(event) if !event.is_empty() => { event_buffer.push_back(event); }
                     Ok(_)                          => continue,
