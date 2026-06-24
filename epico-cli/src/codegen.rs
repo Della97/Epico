@@ -1086,6 +1086,8 @@ fn write_runtime_yaml(
          event_format: {event_format}\n\
          source_format: {source_format}\n\
          ingress_mode: {ingress_mode}\n\
+         edge_impl: {edge_impl}\n\
+         spsc_ring_cap: {spsc_ring_cap}\n\
          {st}\
          {cm}\n\
          {nodes}\n\
@@ -1099,6 +1101,8 @@ fn write_runtime_yaml(
         event_format = spec.event_format,
         source_format = spec.source_format,
         ingress_mode = spec.ingress_mode,
+        edge_impl = spec.edge_impl,
+        spsc_ring_cap = spec.spsc_ring_cap,
         st = source_threads_line,
         cm = compile_mode_line,
         nodes = nodes_block,

@@ -177,21 +177,51 @@ pub(crate) struct Config {
     pub source_format: String,
     /// Ingress spine mode for co-located sources: `socket` (default) keeps the
     /// ZMQ ingress dispatcher; `inprocess` lets the host collapse the spine to
-    /// in-process rings when the source resolves to this host (roadmap item 1).
+    /// in-process rings when the source resolves to this host.
     #[serde(default = "default_ingress_mode")]
     pub ingress_mode: String,
     /// In-process source fan-in width (pump threads). `None` = host default /
-    /// `EPICO_SOURCE_THREADS` env override (roadmap item 1).
+    /// `EPICO_SOURCE_THREADS` env override.
     #[serde(default)]
     pub source_threads: Option<usize>,
+    /// Transport for stage-to-stage in-process edges:
+    ///   "zmq"  — use ZMQ dispatcher (default, same as no inproc)
+    ///   "mpmc" — crossbeam bounded ring, shared across all replica pairs
+    ///   "spsc" — FastFlow-style N×M SPSC mesh (one ring per producer/consumer
+    ///            pair); requires min_replicas == max_replicas on every stage
+    /// Env var `EPICO_EDGE_IMPL` overrides this value for ad-hoc experiments.
+    #[serde(default = "default_edge_impl")]
+    pub edge_impl: String,
+    /// Capacity (slots) of each in-process edge ring. Only relevant when
+    /// `edge_impl` is "mpmc" or "spsc". Default 1024.
+    /// Env var `EPICO_EDGE_CAP` overrides.
+    #[serde(default = "default_edge_cap")]
+    pub edge_cap: usize,
+    /// Capacity of each individual SPSC ring in the mesh. Only relevant when
+    /// `edge_impl` is "spsc". Default 64.
+    /// Env var `EPICO_SPSC_RING_CAP` overrides.
+    #[serde(default = "default_spsc_ring_cap")]
+    pub spsc_ring_cap: usize,
 }
 
 pub(crate) fn default_source_format() -> String {
-    "json".to_string()
+    "binary".to_string()
 }
 
 pub(crate) fn default_ingress_mode() -> String {
     "socket".to_string()
+}
+
+pub(crate) fn default_edge_impl() -> String {
+    "zmq".to_string()
+}
+
+pub(crate) fn default_edge_cap() -> usize {
+    1024
+}
+
+pub(crate) fn default_spsc_ring_cap() -> usize {
+    256
 }
 
 pub(crate) fn default_resource_sample_interval_ms() -> u64 {
@@ -203,7 +233,7 @@ pub(crate) fn default_compile_mode() -> String {
 }
 
 pub(crate) fn default_event_format() -> String {
-    "json".to_string()
+    "binary".to_string()
 }
 
 // ---------------------------------------------------------------------------

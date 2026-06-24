@@ -43,7 +43,7 @@ set -euo pipefail
 # -- knobs (env-overridable) --------------------------------------------------
 TRANSPORTS=${TRANSPORTS:-"zeromq mpmc spsc"}
 CODECS=${CODECS:-"json binary"}
-REPS=${REPS:-3}
+REPS=${REPS:-2}
 TP_COUNT=${TP_COUNT:-2000000}
 LAT_RATE=${LAT_RATE:-30000}
 LAT_DURATION=${LAT_DURATION:-20}
@@ -145,13 +145,13 @@ stages:
     in:  msg
     out: msg
     src: ./stages/relay.rs
-    scaling: { min: 1, max: 1, queue_up: 50, cooldown_up_s: 20, cooldown_down_s: 20 }
+    scaling: { min: 5, max: 5, queue_up: 50, cooldown_up_s: 20, cooldown_down_s: 20 }
   - name: forward
     placement: local
     in:  msg
     out: msg
     src: ./stages/forward.rs
-    scaling: { min: 1, max: 1, queue_up: 50, cooldown_up_s: 20, cooldown_down_s: 20 }
+    scaling: { min: 5, max: 5, queue_up: 50, cooldown_up_s: 20, cooldown_down_s: 20 }
 edges:
   - relay -> forward
 deploy:

@@ -1,0 +1,66 @@
+package: epico:wave_autoscale@1.0.0
+
+nodes:
+  - name: local
+    host: 127.0.0.1
+    force_tcp: false
+
+types:
+  msg:
+    sensor_id: string
+    value:     f64
+
+# Sinusoidal load: trough=3k EPS, peak=100k EPS, period=40s, run=180s
+# This exercises 1..6 replicas per stage across each cycle.
+source:
+  kind: loadgen
+  profile: wave
+  rate: 100000
+  wave_min: 3000
+  wave_period: 40
+  duration: 180
+  sensors: 100
+
+stages:
+  - name: relay
+    placement: local
+    in:  msg
+    out: msg
+    src: ./stages/relay.rs
+    # Aggressive: reacts to small queues, scales down quickly
+    scaling:
+      min: 1
+      max: 8
+      queue_up: 5
+      queue_down: 1
+      cooldown_up_s: 2
+      cooldown_down_s: 5
+
+  - name: forward
+    placement: local
+    in:  msg
+    out: msg
+    src: ./stages/forward.rs
+    # Conservative: needs deeper queue to act, holds replicas much longer
+    scaling:
+      min: 1
+      max: 8
+      queue_up: 25
+      queue_down: 5
+      cooldown_up_s: 2
+      cooldown_down_s: 12
+
+edges:
+  - relay -> forward
+
+deploy:
+  host: localhost
+  this_host: local
+  ingress: ipc:///tmp/epico-wave-push
+  source_format: json
+  event_format: json
+  # ZeroMQ transport (defaults: ingress_mode=socket, edge_impl=zmq)
+  # Each stage gets its own dispatcher process — shows independent scaling.
+  credit_window: 16
+  batch_events: 1
+  resource_sample_interval_ms: 0

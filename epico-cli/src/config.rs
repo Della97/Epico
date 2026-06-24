@@ -129,12 +129,17 @@ pub struct PipelineSpec {
     pub source_format: String,
     /// Ingress spine mode for co-located sources: `socket` (default) collapses
     /// nothing; `inprocess` lets the host replace the ZMQ ingress dispatcher
-    /// with in-process rings when the source resolves to this host. Roadmap
-    /// item 1.
+    /// with in-process rings when the source resolves to this host.
     pub ingress_mode: String,
     /// In-process source fan-in width (pump threads). `None` = host default /
-    /// `EPICO_SOURCE_THREADS`. Roadmap item 1.
+    /// `EPICO_SOURCE_THREADS`.
     pub source_threads: Option<usize>,
+    /// Transport for stage-to-stage in-process edges:
+    /// `zmq` (default) | `mpmc` | `spsc`
+    pub edge_impl: String,
+    /// Slot capacity of each individual SPSC ring. Only used when
+    /// `edge_impl: spsc`. Default 256. Env override: EPICO_SPSC_RING_CAP.
+    pub spsc_ring_cap: usize,
 }
 
 /// A native boundary node (source or sink) compiled into the per-pipeline
@@ -370,7 +375,7 @@ struct DeploySpec {
     /// which governs interior edges — a pipeline may take binary in while
     /// keeping JSON edges, or vice versa (roadmap item 2).
     source_format: Option<String>,
-    /// Ingress/egress spine mode for co-located sources (roadmap item 1):
+    /// Ingress/egress spine mode for co-located sources:
     /// `socket` (default — ZMQ ingress dispatcher) or `inprocess` (collapse the
     /// spine to in-process rings when the source resolves to this host). The
     /// host still falls back to sockets when an external producer is declared.
@@ -378,6 +383,14 @@ struct DeploySpec {
     /// Source fan-in width — number of in-process source pump threads. Mirrors
     /// the `EPICO_SOURCE_THREADS` env override so it is reproducible from YAML.
     source_threads: Option<usize>,
+    /// Transport for stage-to-stage in-process edges:
+    ///   `zmq`  — ZMQ dispatcher (default, same as no inproc)
+    ///   `mpmc` — crossbeam bounded ring shared across all replica pairs
+    ///   `spsc` — FastFlow-style N×M SPSC mesh (one ring per prod/cons pair)
+    edge_impl: Option<String>,
+    /// Slot capacity of each individual SPSC ring in the mesh. Only used when
+    /// `edge_impl: spsc`. Default 256. Env override: EPICO_SPSC_RING_CAP.
+    spsc_ring_cap: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -714,13 +727,13 @@ fn from_new_format(raw: NewFormat, yaml_dir: &Path) -> Result<PipelineSpec> {
         None => None,
     };
 
-    let event_format = raw.deploy.event_format.unwrap_or_else(|| "json".to_string());
+    let event_format = raw.deploy.event_format.unwrap_or_else(|| "binary".to_string());
     match event_format.as_str() {
         "json" | "binary" | "epico-binary" => {}
         other => bail!("deploy.event_format {:?} is invalid; expected `json` or `binary`", other),
     }
 
-    let source_format = raw.deploy.source_format.unwrap_or_else(|| "json".to_string());
+    let source_format = raw.deploy.source_format.unwrap_or_else(|| "binary".to_string());
     match source_format.as_str() {
         "json" | "binary" | "epico-binary" => {}
         other => bail!("deploy.source_format {:?} is invalid; expected `json` or `binary`", other),
@@ -730,6 +743,12 @@ fn from_new_format(raw: NewFormat, yaml_dir: &Path) -> Result<PipelineSpec> {
     match ingress_mode.as_str() {
         "socket" | "inprocess" | "inproc" => {}
         other => bail!("deploy.ingress_mode {:?} is invalid; expected `socket` or `inprocess`", other),
+    }
+
+    let edge_impl = raw.deploy.edge_impl.unwrap_or_else(|| "zmq".to_string());
+    match edge_impl.as_str() {
+        "zmq" | "mpmc" | "spsc" => {}
+        other => bail!("deploy.edge_impl {:?} is invalid; expected `zmq`, `mpmc`, or `spsc`", other),
     }
 
     Ok(PipelineSpec {
@@ -756,6 +775,8 @@ fn from_new_format(raw: NewFormat, yaml_dir: &Path) -> Result<PipelineSpec> {
         source_format,
         ingress_mode,
         source_threads: raw.deploy.source_threads,
+        edge_impl,
+        spsc_ring_cap: raw.deploy.spsc_ring_cap.unwrap_or(256),
     })
 }
 
@@ -866,5 +887,8 @@ fn from_old_format(raw: OldFormat, yaml_dir: &Path) -> Result<PipelineSpec> {
         source_format: "json".to_string(),
         ingress_mode: "socket".to_string(),
         source_threads: None,
+        // Old-format YAMLs predate in-process edges; keep ZMQ path unchanged.
+        edge_impl: "zmq".to_string(),
+        spsc_ring_cap: 256,
     })
 }

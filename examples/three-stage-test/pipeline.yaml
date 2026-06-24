@@ -7,8 +7,8 @@
 package: epico:temps@1.0.0
 
 variables:
-  default_min: &min_replicas 1
-  default_max: &max_replicas 1
+  default_min: &min_replicas 3
+  default_max: &max_replicas 3
 
 # Physical nodes. Each node has a name (referenced by `placement` below
 # and by `deploy.this_host`) and an IP/hostname.

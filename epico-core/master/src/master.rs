@@ -40,9 +40,6 @@ use crate::config::{default_wasm_path, stage_owned_by, Config};
 use crate::inproc::Edge;
 use crate::spsc::{SpscMesh, EdgeInSrc, EdgeOutSrc};
 
-/// In-flight bound for an in-process edge (prototype). Plays the role
-/// `credit_window` plays on the zmq path; promote to per-edge config later.
-const INPROC_EDGE_CAPACITY: usize = 1024;
 /// Substring every EOS marker contains; the collector scans for it (cheap)
 /// before the confirming JSON parse. Must be matched with a window of its own
 /// length — a wrong window size silently never matches and the run never ends.
@@ -252,28 +249,30 @@ pub fn run_agent(
         || source_gen
         || std::env::var("EPICO_INPROC_INGRESS")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+            .unwrap_or(false)
+        || matches!(config.ingress_mode.as_str(), "inprocess" | "inproc");
     let inproc_edges = inproc_ingress
         || std::env::var("EPICO_INPROC_EDGES")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+            .unwrap_or(false)
+        || matches!(config.edge_impl.as_str(), "mpmc" | "spsc");
     let mut input_edges:  HashMap<String, EdgeInSrc>  = HashMap::new();
     let mut output_edges: HashMap<String, EdgeOutSrc> = HashMap::new();
     let mut skip_dispatchers: HashSet<String> = HashSet::new();
     let mut ingress_source_edge: Option<Edge> = None;
     let mut egress_sink_edge:    Option<Edge> = None;
-    // Edge capacity is a throughput/latency knob in the in-process regime, so
-    // make it sweepable without a recompile. Falls back to the compiled default.
+    // Env var overrides the config value for ad-hoc experiments; config drives
+    // the default so the YAML is the single source of truth for reproducible runs.
     let edge_cap = std::env::var("EPICO_EDGE_CAP")
         .ok().and_then(|v| v.parse::<usize>().ok()).filter(|&c| c > 0)
-        .unwrap_or(INPROC_EDGE_CAPACITY);
-    // Transport for the in-process edges: "" / "ring" = crossbeam MPMC ring,
-    // "spsc" = FastFlow-style N×M mesh of SPSC rings. The spsc path requires
-    // min==max replicas (it round-robins over a fixed-size mesh).
-    let edge_impl = std::env::var("EPICO_EDGE_IMPL").unwrap_or_default();
+        .unwrap_or(config.edge_cap);
+    // Transport: env var overrides config; config drives the default.
+    // "" / "zmq" / anything unknown → MPMC (crossbeam ring) for backward compat.
+    let edge_impl = std::env::var("EPICO_EDGE_IMPL")
+        .unwrap_or_else(|_| config.edge_impl.clone());
     let spsc_ring_cap = std::env::var("EPICO_SPSC_RING_CAP")
         .ok().and_then(|v| v.parse::<usize>().ok()).filter(|&c| c > 0)
-        .unwrap_or(64);
+        .unwrap_or(config.spsc_ring_cap);
     if inproc_edges {
         for pair in config.pipeline.windows(2) {
             let (prod, cons) = (&pair[0], &pair[1]);
@@ -1219,9 +1218,9 @@ fn run_collector(
         }
 
         recv_count += 1;
-        if recv_count % 10_000 == 0 {
-            log.info("collector progress", &[("received", &recv_count.to_string())]);
-        }
+        //if recv_count % 10_000 == 0 {
+        //    log.info("collector progress", &[("received", &recv_count.to_string())]);
+        //}
     }
 
     log.info("collector stopped", &[("total_received", &recv_count.to_string())]);
