@@ -1,0 +1,4 @@
+Grid search results — 2026-06-25 21:11
+total_cores=16  runs_per_config=1
+
+Candidates: 0

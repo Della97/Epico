@@ -17,7 +17,11 @@ plots/ablation_test/*
 /logs/
 
 # Pub folder
-/publications/
+#/publications/
+publications/vhpc/**/*.json
+publications/vhpc/**/*.pdf
+publications/vhpc/**/*.png
+publications/vhpc/**/*.csv
 
 # Prog folder
 /prog/

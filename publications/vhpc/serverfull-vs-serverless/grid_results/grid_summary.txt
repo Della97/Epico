@@ -1,0 +1,44 @@
+Grid search results — 2026-06-26 08:41
+total_cores=16  runs_per_config=1
+
+Candidates: 10
+
+  sl_n5_d5_f6_qu150_cd5
+    SF P50=1.1 ms  SL P50=1.1 ms  ΔP50=+0.2%
+    savings=37.8%  scale_downs=95
+
+  sl_n6_d5_f5_qu50_cd5
+    SF P50=1.2 ms  SL P50=1.2 ms  ΔP50=-0.5%
+    savings=26.3%  scale_downs=71
+
+  sl_n5_d5_f6_qu50_cd5
+    SF P50=1.1 ms  SL P50=1.2 ms  ΔP50=+2.0%
+    savings=27.1%  scale_downs=74
+
+  sl_n5_d6_f5_qu150_cd10
+    SF P50=1.2 ms  SL P50=1.2 ms  ΔP50=+3.0%
+    savings=27.0%  scale_downs=46
+
+  sl_n5_d5_f6_qu150_cd10
+    SF P50=1.1 ms  SL P50=1.1 ms  ΔP50=-3.3%
+    savings=27.2%  scale_downs=45
+
+  sl_n6_d5_f5_qu150_cd10
+    SF P50=1.2 ms  SL P50=1.2 ms  ΔP50=+4.0%
+    savings=26.3%  scale_downs=44
+
+  sl_n6_d5_f5_qu150_cd5
+    SF P50=1.2 ms  SL P50=1.2 ms  ΔP50=+5.4%
+    savings=38.5%  scale_downs=92
+
+  sl_n5_d6_f5_qu50_cd5
+    SF P50=1.2 ms  SL P50=1.2 ms  ΔP50=+5.5%
+    savings=25.8%  scale_downs=70
+
+  sl_n5_d6_f5_qu150_cd5
+    SF P50=1.2 ms  SL P50=1.3 ms  ΔP50=+9.3%
+    savings=37.6%  scale_downs=92
+
+  sl_n8_d4_f4_qu150_cd10
+    SF P50=1.1 ms  SL P50=1.4 ms  ΔP50=+29.2%
+    savings=24.8%  scale_downs=43
