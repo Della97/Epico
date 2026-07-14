@@ -1,0 +1,81 @@
+# .leak_test.yaml — event-conservation test under scale-up/scale-down cycles.
+#
+# Goal: verify that every event entering the pipeline reaches the collector
+# while replicas scale 0→N→0 repeatedly. The pulse source sends an exactly
+# known count (blocking sends, no loadgen-side drops) in bursts, with idle
+# gaps longer than cooldown_down_s so replicas drain between bursts; the EOS
+# marker carries the exact sent count. The harness (tests/no_leak_scaling.sh)
+# compares counters.events_received in the summary against it and asserts the
+# scaling block actually shows up/down activity (else the run is inconclusive).
+#
+# Run:  tests/no_leak_scaling.sh    (from repo root; iterates edge transports)
+
+package: epico:leaktest@1.0.0
+
+nodes:
+  - name: local
+    host: 127.0.0.1
+    force_tcp: false
+
+types:
+  msg:
+    sensor_id: string
+    value:     f64
+
+# 4 bursts of 50k events, 4 s of silence between bursts. Each burst floods the
+# queues (scale-up from 0/low), each gap out-waits cooldown_down_s=1 s so the
+# autoscalers drain replicas before the next burst arrives.
+source:
+  kind: loadgen
+  profile: pulse
+  count: 200000
+  pulse_events: 50000
+  pulse_idle_s: 4.0
+  sensors: 100
+
+stages:
+  - name: relay
+    placement: local
+    in:  msg
+    out: msg
+    src: ./stages/relay.rs
+    scaling:
+      min: 0
+      max: 4
+      queue_up: 20
+      queue_down: 0
+      cooldown_up_s: 0.05
+      cooldown_down_s: 1.0
+
+  - name: forward
+    placement: local
+    in:  msg
+    out: msg
+    src: ./stages/forward.rs
+    scaling:
+      min: 0
+      max: 4
+      queue_up: 20
+      queue_down: 0
+      cooldown_up_s: 0.05
+      cooldown_down_s: 1.0
+
+edges:
+  - relay -> forward
+
+deploy:
+  host: localhost
+  this_host: local
+  ingress: ipc:///tmp/epico-leaktest-push
+  source_format: json
+  event_format:  json
+
+  # In-process fabric (transport policy: in-node edges are in-proc queues).
+  # The harness overrides edge_impl per run via EPICO_EDGE_IMPL (spsc | mpmc).
+  ingress_mode: inprocess
+  edge_impl: spsc
+  spsc_ring_cap: 512
+
+  credit_window: 16
+  batch_events:  1
+  resource_sample_interval_ms: 0

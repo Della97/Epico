@@ -1,7 +1,7 @@
 //! `epico-logger` — structured runtime logger used by the agent, dispatcher,
 //! and load generator.
 //!
-//! Every call to [`Logger::info`] etc. writes to two places:
+//! Every log call writes to two places:
 //!
 //! - **Stderr** — human-readable, minimal, aligned. ANSI colour only when
 //!   stderr is a TTY. Warnings and errors are coloured; info/debug are not,
@@ -10,6 +10,26 @@
 //!
 //! - **JSONL file** — one JSON object per line, line-buffered.
 //!   Path: `<log_dir>/<component>_<YYYYMMDD_HHMMSS>.jsonl`
+//!
+//! # Logging
+//!
+//! Prefer the field macros — any `Display` value works, no manual
+//! `.to_string()`:
+//!
+//! ```ignore
+//! use epico_logger::{info, warn};
+//!
+//! info!(log, "scale up", qd = qd, current = current, new = current + 1);
+//! warn!(log, "worker gone", rid = String::from_utf8_lossy(&id));
+//! info!(log, "ready");                       // no fields
+//! info!(log, "bound", "socket-addr" = addr); // non-ident keys as literals
+//! ```
+//!
+//! The slice methods ([`Logger::info`] etc.) remain for dynamically built
+//! field lists.
+//!
+//! The minimum level is `info` by default; set `EPICO_LOG=debug` (or
+//! `warn`/`error`) to change it at process start.
 //!
 //! Call [`Logger::finalize`] at the end of a run to write a companion
 //! `_summary.json` that the HTML report generator reads.
@@ -40,18 +60,45 @@ const DIM:   &str   = "\x1b[38;5;244m"; // soft grey for metadata
 const MUTE:  &str   = "\x1b[38;5;240m"; // softer grey for fields / debug
 const YEL:   &str   = "\x1b[33m";
 const RED:   &str   = "\x1b[31m";
-const CYAN:  &str   = "\x1b[36m";
+const VAL:   &str   = "\x1b[38;5;250m"; // field values: brighter than keys
 
-fn use_colour() -> bool {
-    #[cfg(unix)]
-    {
-        extern "C" { fn isatty(fd: i32) -> i32; }
-        // Respect NO_COLOR convention (https://no-color.org).
-        if std::env::var_os("NO_COLOR").is_some() { return false; }
-        unsafe { isatty(2) != 0 }
+/// Stable, muted 256-colour palette for component names. Muted tones so the
+/// gutter stays calm; the message keeps full contrast.
+const COMP_COLOURS: &[&str] = &[
+    "\x1b[38;5;73m",  // teal
+    "\x1b[38;5;110m", // steel blue
+    "\x1b[38;5;139m", // mauve
+    "\x1b[38;5;108m", // sage
+    "\x1b[38;5;180m", // sand
+    "\x1b[38;5;146m", // lavender grey
+];
+
+/// Deterministic colour per component name (FNV-1a over the bytes).
+fn component_colour(name: &str) -> &'static str {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
     }
-    #[cfg(not(unix))]
-    { false }
+    COMP_COLOURS[(h % COMP_COLOURS.len() as u64) as usize]
+}
+
+/// TTY + NO_COLOR detection, computed once per process. The old version ran
+/// an env lookup plus an isatty syscall for every painted fragment — several
+/// times per log line.
+fn use_colour() -> bool {
+    static USE_COLOUR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *USE_COLOUR.get_or_init(|| {
+        #[cfg(unix)]
+        {
+            extern "C" { fn isatty(fd: i32) -> i32; }
+            // Respect NO_COLOR convention (https://no-color.org).
+            if std::env::var_os("NO_COLOR").is_some() { return false; }
+            unsafe { isatty(2) != 0 }
+        }
+        #[cfg(not(unix))]
+        { false }
+    })
 }
 
 fn paint(code: &str, text: &str) -> String {
@@ -111,7 +158,14 @@ pub struct Logger {
     inner:            Arc<Mutex<Inner>>,
     pub jsonl_path:   PathBuf,
     pub summary_path: PathBuf,
-    pub min_level:    Level,
+    /// Minimum level rendered to STDERR. From `EPICO_LOG` (default: info).
+    /// The human view is a filtered projection; the JSONL file is the record.
+    pub stderr_level: Level,
+    /// Minimum level written to the JSONL file. Default: debug — the file
+    /// records everything, so `debug!` telemetry (e.g. worker boot phase
+    /// breakdowns) is always available to analysis scripts without re-running
+    /// with a different log level.
+    pub file_level:   Level,
     /// Width to pad component to on stderr. Default 18. Longer names overflow
     /// gracefully rather than getting truncated.
     pub comp_width:   usize,
@@ -139,7 +193,8 @@ impl Logger {
             inner:        Arc::new(Mutex::new(Inner { writer: BufWriter::new(file) })),
             jsonl_path:   jsonl_path.clone(),
             summary_path: summary_path.clone(),
-            min_level:    Level::Info,
+            stderr_level: level_from_env(),
+            file_level:   Level::Debug,
             comp_width:   18,
         };
 
@@ -157,7 +212,8 @@ impl Logger {
             inner:        self.inner.clone(),
             jsonl_path:   self.jsonl_path.clone(),
             summary_path: self.summary_path.clone(),
-            min_level:    self.min_level,
+            stderr_level: self.stderr_level,
+            file_level:   self.file_level,
             comp_width:   self.comp_width,
         }
     }
@@ -198,7 +254,9 @@ impl Logger {
     // ── Core emit ────────────────────────────────────────────────────────────
 
     fn emit(&self, level: Level, msg: &str, fields: &[(&str, &str)]) {
-        if level < self.min_level { return; }
+        let to_stderr = level >= self.stderr_level;
+        let to_file   = level >= self.file_level;
+        if !to_stderr && !to_file { return; }
 
         let ts       = wall_now();
         let wall_str = format_wall_time(ts);
@@ -213,7 +271,7 @@ impl Logger {
         // The whole left gutter (time + tag + component) is dim except for the
         // level tag when warn/error/debug. The message is the only high-contrast
         // element (unless warn/error, then it matches the tag colour).
-        {
+        if to_stderr {
             let time_col = paint(DIM, &wall_str);
 
             let tag_raw = level.tag();
@@ -231,26 +289,32 @@ impl Logger {
             } else {
                 format!("{:<width$}", self.component, width = self.comp_width)
             };
-            let comp_col = paint(DIM, &comp_padded);
+            // Stable per-component colour so interleaved threads are
+            // visually separable at a glance (autoscaler/relay vs
+            // worker/forward etc.). Dim greys stay for time and fields.
+            let comp_col = paint(component_colour(&self.component), &comp_padded);
 
             let msg_col = match level.msg_colour() {
                 Some(col) => paint(col, msg),
                 None      => msg.to_owned(),
             };
 
+            // `key=` recedes (mute), the value carries the information
+            // (brighter grey) — scanning a line reads values, not keys.
             let kv = if fields.is_empty() {
                 String::new()
             } else {
                 let pairs: Vec<String> = fields.iter()
-                    .map(|(k, v)| format!("{}={}", k, v))
+                    .map(|(k, v)| format!("{}{}", paint(MUTE, &format!("{}=", k)), paint(VAL, v)))
                     .collect();
-                format!("  {}", paint(MUTE, &pairs.join("  ")))
+                format!("  {}", pairs.join("  "))
             };
 
             eprintln!("{}  {}  {}  {}{}", time_col, tag_col, comp_col, msg_col, kv);
         }
 
         // ── JSONL ──
+        if !to_file { return; }
         let mut obj = serde_json::Map::new();
         obj.insert("ts".into(),        json!(round4(ts)));
         obj.insert("level".into(),     json!(level));
@@ -269,10 +333,62 @@ impl Logger {
     }
 }
 
-// Suppress unused-warning for CYAN if no consumer uses it; keep it in palette
-// so callers extending the logger have a cool-toned accent available.
-#[allow(dead_code)]
-const _KEEP_CYAN: &str = CYAN;
+// ── Field macros ─────────────────────────────────────────────────────────────
+
+/// Internal: turn a field key token (bare ident or string literal) into &str.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __field_key {
+    ($k:ident)   => { stringify!($k) };
+    ($k:literal) => { $k };
+}
+
+/// Internal: shared expansion for the level macros. Values are formatted via
+/// `Display`; the temporary Strings live to the end of the statement, so the
+/// borrowed slice is valid for the call.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __log_at {
+    ($method:ident, $log:expr, $msg:expr $(, $k:tt = $v:expr)* $(,)?) => {
+        $log.$method($msg, &[ $( ($crate::__field_key!($k), ::std::format!("{}", $v).as_str()) ),* ])
+    };
+}
+
+/// `info!(log, "message", key = value, ...)` — values are any `Display` type.
+#[macro_export]
+macro_rules! info {
+    ($($t:tt)*) => { $crate::__log_at!(info, $($t)*) };
+}
+
+/// `warn!(log, "message", key = value, ...)`
+#[macro_export]
+macro_rules! warn {
+    ($($t:tt)*) => { $crate::__log_at!(warn, $($t)*) };
+}
+
+/// `error!(log, "message", key = value, ...)`
+#[macro_export]
+macro_rules! error {
+    ($($t:tt)*) => { $crate::__log_at!(error, $($t)*) };
+}
+
+/// `debug!(log, "message", key = value, ...)` — emitted only when
+/// `EPICO_LOG=debug`.
+#[macro_export]
+macro_rules! debug {
+    ($($t:tt)*) => { $crate::__log_at!(debug, $($t)*) };
+}
+
+// ── Level from env ───────────────────────────────────────────────────────────
+
+fn level_from_env() -> Level {
+    match std::env::var("EPICO_LOG").ok().as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("debug") => Level::Debug,
+        Some("warn")  => Level::Warn,
+        Some("error") => Level::Error,
+        _             => Level::Info,
+    }
+}
 
 // ── Time helpers ─────────────────────────────────────────────────────────────
 

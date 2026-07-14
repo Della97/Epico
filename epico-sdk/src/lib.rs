@@ -4,7 +4,11 @@
 //!
 //! ## Quick example
 //!
-//! ```no_run
+//! Marked `ignore`: `stage!` expands `wit_bindgen::generate!`, which needs the
+//! per-stage `wit/` directory that only exists inside a generated stage crate,
+//! so this snippet cannot compile as a doctest.
+//!
+//! ```ignore
 //! use epico_sdk::stage;
 //!
 //! stage! {

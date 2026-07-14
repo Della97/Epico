@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use bytes::Bytes;
 use clap::Parser;
 use epico_logger::Logger;
-use serde_json::json;
+use epico_logger::{error, info, warn};
 
 mod autoscaler;
 mod config;
@@ -22,9 +22,9 @@ pub mod envelope;
 mod host;
 mod inproc;
 mod pipeline_validator;
-mod resources;
 mod spsc;
 mod supervisor;
+mod telemetry;
 pub mod typed;
 mod worker;
 
@@ -39,6 +39,7 @@ pub use epico_wire as wire;
 use crate::config::{default_wasm_path, stage_owned_by, Config};
 use crate::inproc::Edge;
 use crate::spsc::{SpscMesh, EdgeInSrc, EdgeOutSrc};
+use crate::telemetry::{collector::CollectorStats, summary::build_summary, RunTelemetry};
 
 /// Substring every EOS marker contains; the collector scans for it (cheap)
 /// before the confirming JSON parse. Must be matched with a window of its own
@@ -69,117 +70,6 @@ pub struct Args {
     /// before sending traffic, so early events aren't lost to cold sockets.
     #[arg(long)]
     ready_file: Option<PathBuf>,
-}
-
-// ── Shared telemetry collected across the whole run ──────────────────────────
-
-/// A single point in the master's CPU + RSS time series.
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct ResourceSample {
-    /// Seconds since test_start.
-    pub t_s:       f64,
-    /// Process CPU utilization normalized to the CPUs available to this
-    /// process (typically affinity/cgroup constrained). 100% means this
-    /// process saturates all CPUs it can run on.
-    pub cpu_pct:   f32,
-    /// Resident Set Size in bytes.
-    pub rss_bytes: u64,
-}
-
-/// A single scale-up/scale-down/cold-start/drain event recorded by an
-/// autoscaler. Written once per decision; used to reconstruct the
-/// replica-count timeline for the paper's scaling plots.
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct ScalingEvent {
-    /// Seconds since test_start.
-    pub t_s:         f64,
-    pub stage:       String,
-    /// "cold_start" | "spawn" | "drain".
-    pub action:      String,
-    /// Active replica count *after* this action took effect.
-    pub new_count:   usize,
-    /// For `cold_start` events only: how long the first event took to
-    /// reach `process-event` and return. None for spawn/drain.
-    pub cold_start_ms:      Option<f64>,
-    /// Cranelift JIT compilation time for this stage's component. Only
-    /// set on "init" events, None on spawn/drain/cold_start.
-    pub compile_ms:         Option<f64>,
-    /// linker.instantiate_pre() time. Only set on "init" events.
-    pub instantiate_pre_ms: Option<f64>,
-}
-
-/// Accumulated by the collector thread, the autoscalers, and the resource
-/// sampler; read at shutdown to build the summary.
-#[derive(Default)]
-pub(crate) struct RunTelemetry {
-    // ── E2E latency (existing) ────────────────────────────────────────────
-    /// All e2e latencies in milliseconds (recv_ts_wall - bench_ts_wall).
-    pub e2e_ms:         Vec<f64>,
-    /// All ingress waits in milliseconds (entry-stage hop[0].enter_ts -
-    /// bench_ts_wall). This is the time each event spent sitting in the
-    /// first dispatcher's frontend queue before the entry stage's worker
-    /// started processing it. Tracked in lockstep with `e2e_ms` — same
-    /// length, same sampling regime, so percentiles computed from the
-    /// two are directly comparable. At saturation this dominates e2e;
-    /// at steady state it should be sub-millisecond.
-    pub ingress_wait_ms: Vec<f64>,
-    /// Per-second received count (for throughput chart).
-    pub recv_per_second: std::collections::HashMap<u64, u64>,
-
-    // ── Per-stage timing (new) ─────────────────────────────────────────────
-    /// For each stage name, the list of per-event residence times in ms
-    /// (hop.exit_ts - hop.enter_ts). Populated by the collector when it
-    /// parses bench_hops off arriving events.
-    pub per_stage_latency_ms: std::collections::HashMap<String, Vec<f64>>,
-    /// For each stage name, the count of events that passed through it.
-    /// At steady state this equals the collector's recv_count; during
-    /// scale-up it may briefly lag.
-    pub per_stage_count:      std::collections::HashMap<String, u64>,
-
-    // ── Per-replica timing (new) ───────────────────────────────────────────
-    /// Residence times keyed by the full hop label `stage#replica`. Same
-    /// samples as per_stage_latency_ms, but split by which replica actually
-    /// processed the event — powers per-replica box/violin plots and
-    /// load-balance checks. Empty on runs predating replica-tagged hops.
-    pub per_replica_latency_ms: std::collections::HashMap<String, Vec<f64>>,
-    /// Event count per `stage#replica` label (load-balance fairness check).
-    pub per_replica_count:      std::collections::HashMap<String, u64>,
-
-    // ── Autoscaler events (new) ────────────────────────────────────────────
-    pub scaling_events: Vec<ScalingEvent>,
-
-    // ── Per-event raw log (new) ────────────────────────────────────────────
-    /// One row per event arriving at the collector, capturing enough to
-    /// reconstruct per-second latency percentiles and per-edge transport
-    /// delays in post-processing. Fields:
-    ///   .0 — recv_t_s:  seconds since test start at collector recv
-    ///   .1 — e2e_ms:    end-to-end latency in milliseconds
-    ///   .2 — hops:      Vec<(stage_name, enter_ts_wall, exit_ts_wall)>
-    ///
-    /// Size is bounded at summary-write time via subsampling (see
-    /// `subsample_events_for_summary`) so large runs don't produce
-    /// multi-gigabyte JSON.
-    pub per_event_log: Vec<(f64, f64, Vec<(String, f64, f64)>)>,
-
-    // ── Resource sampling (new) ────────────────────────────────────────────
-    pub resource_samples: Vec<ResourceSample>,
-
-    // ── Worker timing breakdown ────────────────────────────────────────────
-    /// Per-stage total worker iteration time in NANOSECONDS (recv → deser →
-    /// wasm → ser → push). Keyed by stage name. Populated by autoscaler polling
-    /// the dispatcher ctrl socket and forwarding consumer metrics. (Field name
-    /// kept `_us` for churn reasons; values are ns since the worker switched to
-    /// as_nanos. Converted to µs floats in build_worker_timing_block.)
-    pub total_us_samples: std::collections::HashMap<String, Vec<u64>>,
-
-    /// Per-stage serialization time in NANOSECONDS (JSON parse + JSON serialize,
-    /// but NOT the wasm call). Subset of total_us_samples.
-    pub serde_us_samples: std::collections::HashMap<String, Vec<u64>>,
-
-    // ── Dispatcher queue depth time-series ────────────────────────────────
-    /// Sampled queue depth per stage over time. Each entry is
-    /// (t_s, queue_depth) where t_s is seconds since test_start.
-    pub queue_depth_samples: std::collections::HashMap<String, Vec<(f64, u64)>>,
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -213,7 +103,7 @@ pub fn run_agent(
     // for paper-quality benchmark numbers.
     #[cfg(feature = "profile")]
     let profiler_guard = {
-        log.info("profiler enabled at 99 Hz", &[]);
+        info!(log, "profiler enabled at 99 Hz");
         Some(
             pprof::ProfilerGuardBuilder::default()
                 .frequency(99)
@@ -223,10 +113,7 @@ pub fn run_agent(
         )
     };
 
-    log.info("starting", &[
-        ("config",  &args.config.display().to_string()),
-        ("log_dir", &args.log_dir.display().to_string()),
-    ]);
+    info!(log, "starting", config = args.config.display(), log_dir = args.log_dir.display());
 
     let mut config = load_config(&args.config, &log);
     validate_pipeline(&config, &log);
@@ -288,11 +175,7 @@ pub fn run_agent(
             }
             let bare = cons.name.strip_prefix("fn-").unwrap_or(&cons.name);
             skip_dispatchers.insert(format!("dispatch-{}", bare));
-            log.info("in-process edge", &[
-                ("from", &prod.name),
-                ("to",   &cons.name),
-                ("cap",  &edge_cap.to_string()),
-            ]);
+            info!(log, "in-process edge", from = prod.name, to = cons.name, cap = edge_cap);
         }
     }
     if inproc_ingress {
@@ -304,10 +187,7 @@ pub fn run_agent(
             ingress_source_edge = Some(edge);
             let bare = first.name.strip_prefix("fn-").unwrap_or(&first.name);
             skip_dispatchers.insert(format!("dispatch-{}", bare));
-            log.info("in-process ingress (source pump)", &[
-                ("to",  &first.name),
-                ("cap", &edge_cap.to_string()),
-            ]);
+            info!(log, "in-process ingress (source pump)", to = first.name, cap = edge_cap);
         }
         // Last stage → sink: the collector drains the last stage's Edge in
         // process instead of binding a PULL socket. No egress socket on a host.
@@ -315,10 +195,7 @@ pub fn run_agent(
             let edge = Edge::new(edge_cap);
             output_edges.insert(last.name.clone(), EdgeOutSrc::Ring(edge.clone()));
             egress_sink_edge = Some(edge);
-            log.info("in-process egress (sink drain)", &[
-                ("from", &last.name),
-                ("cap",  &edge_cap.to_string()),
-            ]);
+            info!(log, "in-process egress (sink drain)", from = last.name, cap = edge_cap);
         }
     }
 
@@ -327,7 +204,7 @@ pub fn run_agent(
     if args.launch_dispatchers {
         let bin = supervisor::resolve_dispatcher_binary(args.dispatcher_bin.as_deref())
             .unwrap_or_else(|e| {
-                log.error("dispatcher binary not found", &[("err", &e.to_string())]);
+                error!(log, "dispatcher binary not found", err = e);
                 std::process::exit(1);
             });
         let dispatchers_to_spawn: Vec<_> = config.dispatchers.iter()
@@ -339,7 +216,7 @@ pub fn run_agent(
 
     let total_max: usize = config.pipeline.iter().map(|s| s.slo.max_replicas).sum();
     let engine = host::build_engine(total_max);
-    log.info("engine ready", &[("max_replicas_total", &total_max.to_string())]);
+    info!(log, "engine ready", max_replicas_total = total_max);
 
     // ── Stage-shaped Cranelift warmup ────────────────────────────────────────
     // The microscopic WAT compile inside `build_engine` warms most of
@@ -365,20 +242,18 @@ pub fn run_agent(
             let t_warm = std::time::Instant::now();
             match wasmtime::component::Component::from_file(&engine, wasm_path) {
                 Ok(_throwaway) => {
-                    log.info("cranelift stage warmup complete", &[
-                        ("stage",     &first_stage.name),
-                        ("wasm",      wasm_path),
-                        ("warmup_ms", &format!(
+                    info!(log, "cranelift stage warmup complete",
+                          stage = first_stage.name,
+                          wasm = wasm_path,
+                          warmup_ms = format!(
                             "{:.2}",
                             t_warm.elapsed().as_secs_f64() * 1000.0
-                        )),
-                    ]);
+                        ));
                 }
                 Err(e) => {
-                    log.warn("cranelift stage warmup failed (continuing)", &[
-                        ("stage", &first_stage.name),
-                        ("err",   &e.to_string()),
-                    ]);
+                    warn!(log, "cranelift stage warmup failed (continuing)",
+                          stage = first_stage.name,
+                          err = e);
                 }
             }
         }
@@ -408,7 +283,7 @@ pub fn run_agent(
     let col_log       = log.with_component("master/collector");
     let col_egress    = egress_sink_edge;
 
-    std::thread::spawn(move || {
+    let collector_handle = std::thread::spawn(move || {
         run_collector(&last_stage_output, col_telemetry, col_running2, col_log, test_start, col_egress, custom_sink);
     });
 
@@ -468,7 +343,7 @@ pub fn run_agent(
             });
         }
     } else if custom_source.is_some() {
-        log.warn("custom source ignored: no in-process ingress edge", &[]);
+        warn!(log, "custom source ignored: no in-process ingress edge");
     }
 
     // ── Resource sampler thread ───────────────────────────────────────────────
@@ -480,7 +355,7 @@ pub fn run_agent(
     // periodic multi-millisecond jitter that propagates into the master's
     // event-handling threads.
     if config.resource_sample_interval_ms > 0 {
-        resources::spawn(
+        telemetry::resources::spawn(
             telemetry.clone(),
             col_running.clone(),
             test_start_instant,
@@ -488,7 +363,7 @@ pub fn run_agent(
             log.with_component("master/resources"),
         );
     } else {
-        log.info("resource sampler disabled (interval=0)", &[]);
+        info!(log, "resource sampler disabled (interval=0)");
     }
 
     // ── libzmq PUSH-init warm-up ──────────────────────────────────────────────
@@ -526,7 +401,7 @@ pub fn run_agent(
         let dispatcher = config.dispatchers.iter()
             .find(|d| d.name == dispatch_name)
             .unwrap_or_else(|| {
-                log.error("no dispatcher for stage", &[("stage", &stage.name)]);
+                error!(log, "no dispatcher for stage", stage = stage.name);
                 std::process::exit(1);
             });
 
@@ -549,7 +424,7 @@ pub fn run_agent(
         }));
     }
 
-    log.info("running", &[("stages", &stage_names.join(","))]);
+    info!(log, "running", stages = stage_names.join(","));
 
     // Signal readiness to any orchestrator (e.g. the `epico` CLI when it
     // is also launching loadgen). Written *after* autoscalers are live and
@@ -557,29 +432,36 @@ pub fn run_agent(
     // the first dispatcher will accept connections immediately.
     if let Some(ref rf) = args.ready_file {
         match std::fs::File::create(rf) {
-            Ok(_)  => log.info("ready file written", &[("path", &rf.display().to_string())]),
-            Err(e) => log.error("ready file write failed",
-                &[("path", &rf.display().to_string()), ("err", &e.to_string())]),
+            Ok(_)  => info!(log, "ready file written", path = rf.display()),
+            Err(e) => error!(log, "ready file write failed", path = rf.display(), err = e),
         }
     }
 
     // ── Supervisor loop ───────────────────────────────────────────────────────
     while !supervisor::SHUTDOWN.load(Ordering::Relaxed) {
         if handles.iter().all(|h| h.is_finished()) {
-            log.error("all autoscaler threads exited unexpectedly", &[]);
+            error!(log, "all autoscaler threads exited unexpectedly");
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
 
     // ── Shutdown ──────────────────────────────────────────────────────────────
-    log.info("shutting down", &[]);
+    info!(log, "shutting down");
     col_running.store(false, Ordering::Relaxed);
 
     // Give collector a moment to drain any last events
     std::thread::sleep(Duration::from_millis(500));
 
     supervisor::kill_children(&log);
+
+    // The collector accumulates its stats thread-locally and merges them into
+    // the shared telemetry once, on exit — the summary must not be built
+    // before that merge. Join is bounded: with col_running now false the
+    // collector exits within one recv timeout (200 ms).
+    if collector_handle.join().is_err() {
+        error!(log, "collector thread panicked; summary will be incomplete");
+    }
 
     // ── Build and write summary ───────────────────────────────────────────────
     let test_end = std::time::SystemTime::now()
@@ -630,7 +512,7 @@ pub fn run_agent(
 
     let summary = build_summary(&log, telemetry, test_start, test_duration, &stage_names, run_config);
     if let Err(e) = log.finalize(&summary) {
-        log.error("failed to write summary", &[("err", &e.to_string())]);
+        error!(log, "failed to write summary", err = e);
     }
 
     // ── Write flamegraph if profiler was enabled ──────────────────────────────
@@ -642,32 +524,20 @@ pub fn run_agent(
                 match std::fs::File::create(&path) {
                     Ok(file) => {
                         if let Err(e) = report.flamegraph(file) {
-                            log.error("flamegraph write failed",
-                                      &[("err", &e.to_string())]);
+                            error!(log, "flamegraph write failed", err = e);
                         } else {
-                            log.info("flamegraph written",
-                                     &[("path", &path.display().to_string())]);
+                            info!(log, "flamegraph written", path = path.display());
                         }
                     }
-                    Err(e) => log.error("flamegraph file create failed",
-                                        &[("err", &e.to_string())]),
+                    Err(e) => error!(log, "flamegraph file create failed", err = e),
                 }
             }
-            Err(e) => log.error("pprof report build failed",
-                                &[("err", &e.to_string())]),
+            Err(e) => error!(log, "pprof report build failed", err = e),
         }
     }
 }
 
 // ── Collector thread ──────────────────────────────────────────────────────────
-
-// Maximum number of raw per-event rows kept live in RunTelemetry.per_event_log
-// during a run. Once full, new entries replace old ones via reservoir sampling
-// so the distribution remains representative. This bounds RSS growth to
-// roughly EVENTS_LIVE_CAP * ~200 bytes ≈ 10 MB regardless of run duration.
-// The summary-time subsampler (EVENTS_SAMPLE_CAP) operates on this already-
-// bounded reservoir, so nothing downstream needs to change.
-const EVENTS_LIVE_CAP: usize = 200_000;
 
 /// Given the collector's bind address, derive the address for the tee
 /// PUB socket. This needs to be deterministic so external consumers
@@ -741,11 +611,10 @@ pub trait EventSink: Send {
 fn run_source_native(out_edge: Edge, mut factory: SourceFactory, threads: usize, log: Logger) {
     let k = threads.max(1);
     let deadline = source_deadline();
-    log.info("source driver started (native, in-process)", &[
-        ("threads", &k.to_string()),
-        ("seconds", &deadline.map(|_| std::env::var("EPICO_SOURCE_SECONDS")
-            .unwrap_or_default()).unwrap_or_else(|| "∞".into())),
-    ]);
+    info!(log, "source driver started (native, in-process)",
+          threads = k,
+          seconds = deadline.map(|_| std::env::var("EPICO_SOURCE_SECONDS")
+            .unwrap_or_default()).unwrap_or_else(|| "∞".into()));
 
     let total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut handles = Vec::with_capacity(k);
@@ -780,7 +649,7 @@ fn run_source_native(out_edge: Edge, mut factory: SourceFactory, threads: usize,
         "loadgen_done_ts": wall_now(),
     })).unwrap_or_default();
     let _ = out_edge.push(Bytes::from(eos), &supervisor::SHUTDOWN);
-    log.info("source driver done", &[("count", &n.to_string()), ("threads", &k.to_string())]);
+    info!(log, "source driver done", count = n, threads = k);
 }
 
 /// Generating source. Produces events in-process — no socket, no loadgen — and
@@ -798,14 +667,13 @@ fn run_source_native(out_edge: Edge, mut factory: SourceFactory, threads: usize,
 fn run_source_gen(out_edge: Edge, count: u64, sensors: usize, threads: usize, binary: bool, log: Logger) {
     let k = threads.max(1);
     let deadline = source_deadline();
-    log.info("source generating (in-process, no socket)", &[
-        ("count",   &count.to_string()),
-        ("sensors", &sensors.max(1).to_string()),
-        ("threads", &k.to_string()),
-        ("format",  if binary { "binary" } else { "json" }),
-        ("seconds", &deadline.map(|_| std::env::var("EPICO_SOURCE_SECONDS")
-            .unwrap_or_default()).unwrap_or_else(|| "∞".into())),
-    ]);
+    info!(log, "source generating (in-process, no socket)",
+          count = count,
+          sensors = sensors.max(1),
+          threads = k,
+          format = if binary { "binary" } else { "json" },
+          seconds = deadline.map(|_| std::env::var("EPICO_SOURCE_SECONDS")
+            .unwrap_or_default()).unwrap_or_else(|| "∞".into()));
 
     let total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut handles = Vec::with_capacity(k);
@@ -828,7 +696,7 @@ fn run_source_gen(out_edge: Edge, count: u64, sensors: usize, threads: usize, bi
         "loadgen_done_ts": wall_now(),
     })).unwrap_or_default();
     let _ = out_edge.push(Bytes::from(eos), &supervisor::SHUTDOWN);
-    log.info("source done (generated)", &[("count", &sent.to_string()), ("threads", &k.to_string())]);
+    info!(log, "source done (generated)", count = sent, threads = k);
 }
 
 /// Optional wall-clock cap shared by both source paths. When
@@ -932,17 +800,17 @@ fn run_source(ingress_uri: String, out_edge: Edge, log: Logger) {
     let ctx  = zmq::Context::new();
     let pull = match ctx.socket(zmq::PULL) {
         Ok(s)  => s,
-        Err(e) => { log.error("source socket failed", &[("err", &e.to_string())]); return; }
+        Err(e) => { error!(log, "source socket failed", err = e); return; }
     };
     // Short timeout so the loop can observe shutdown; large recv HWM so the
     // socket can buffer ahead of the Edge without stalling the producer early.
     pull.set_rcvtimeo(100).ok();
     pull.set_rcvhwm(100_000).ok();
     if let Err(e) = pull.bind(&ingress_uri) {
-        log.error("source bind failed", &[("addr", &ingress_uri), ("err", &e.to_string())]);
+        error!(log, "source bind failed", addr = ingress_uri, err = e);
         return;
     }
-    log.info("source bound (in-process ingress)", &[("addr", &ingress_uri)]);
+    info!(log, "source bound (in-process ingress)", addr = ingress_uri);
 
     loop {
         if supervisor::SHUTDOWN.load(Ordering::Relaxed) { break; }
@@ -956,7 +824,7 @@ fn run_source(ingress_uri: String, out_edge: Edge, log: Logger) {
             Err(_)                  => break,
         }
     }
-    log.info("source stopped", &[]);
+    info!(log, "source stopped");
 }
 
 fn run_collector(
@@ -984,23 +852,23 @@ fn run_collector(
     // Socket-backed egress binds a PULL (and a PUB tee). In-process egress
     // (sink) skips both — the collector drains the Edge directly.
     let (pull, pub_socket): (Option<zmq::Socket>, Option<zmq::Socket>) = if egress_edge.is_some() {
-        log.info("collector draining in-process egress edge (no socket)", &[]);
+        info!(log, "collector draining in-process egress edge (no socket)");
         (None, None)
     } else {
         let ctx  = zmq::Context::new();
         let pull = match ctx.socket(zmq::PULL) {
             Ok(s) => s,
-            Err(e) => { log.error("collector socket failed", &[("err", &e.to_string())]); return; }
+            Err(e) => { error!(log, "collector socket failed", err = e); return; }
         };
         pull.set_rcvtimeo(200).ok();
         pull.set_rcvhwm(100_000).ok();
 
         if let Err(e) = pull.bind(&bind_addr) {
-            log.error("collector bind failed", &[("addr", &bind_addr), ("err", &e.to_string())]);
+            error!(log, "collector bind failed", addr = bind_addr, err = e);
             return;
         }
 
-        log.info("collector bound", &[("addr", &bind_addr)]);
+        info!(log, "collector bound", addr = bind_addr);
 
         // Also bind a PUB socket on collector_port + 1 so external consumers
         // (dashboards, recorders, anything wanting a copy of finished events)
@@ -1009,7 +877,7 @@ fn run_collector(
         let pub_socket = match ctx.socket(zmq::PUB) {
             Ok(s) => s,
             Err(e) => {
-                log.error("collector pub socket failed", &[("err", &e.to_string())]);
+                error!(log, "collector pub socket failed", err = e);
                 return;
             }
         };
@@ -1019,16 +887,21 @@ fn run_collector(
         pub_socket.set_sndhwm(1000).ok();
         pub_socket.set_sndtimeo(0).ok();
         if let Err(e) = pub_socket.bind(&pub_addr) {
-            log.warn("collector pub bind failed (continuing without tee)",
-                     &[("addr", &pub_addr), ("err", &e.to_string())]);
+            warn!(log, "collector pub bind failed (continuing without tee)",
+                  addr = pub_addr,
+                  err = e);
         } else {
-            log.info("collector pub bound", &[("addr", &pub_addr)]);
+            info!(log, "collector pub bound", addr = pub_addr);
         }
         (Some(pull), Some(pub_socket))
     };
 
     let mut recv_count: u64 = 0;
     let mut eos_received = false;
+
+    // Collector-owned stats: accumulated lock-free per event, merged into the
+    // shared telemetry once at loop exit (see telemetry::collector docs).
+    let mut stats = CollectorStats::new();
 
     while running.load(Ordering::Relaxed) {
         let bytes = match &egress_edge {
@@ -1071,11 +944,10 @@ fn run_collector(
                         .and_then(|v| v.as_u64()).unwrap_or(0);
                     let expected = ev.get("expected_count")
                         .and_then(|v| v.as_u64()).unwrap_or(0);
-                    log.info("EOS received at collector", &[
-                        ("recv_count",   &recv_count.to_string()),
-                        ("loadgen_sent", &loadgen_sent.to_string()),
-                        ("expected",     &expected.to_string()),
-                    ]);
+                    info!(log, "EOS received at collector",
+                          recv_count = recv_count,
+                          loadgen_sent = loadgen_sent,
+                          expected = expected);
                     eos_received = true;
                     // Trigger the supervisor loop's shutdown path. The main
                     // thread will tear down dispatchers, build the summary,
@@ -1113,108 +985,7 @@ fn run_collector(
                 serde_json::from_slice::<serde_json::Value>(&bytes).ok()
             };
         if let Some(ev) = ev_parsed {
-            if let Some(bench_ts) = ev["bench_ts_wall"].as_f64() {
-                if recv_ts > bench_ts {
-                    let lat_ms = (recv_ts - bench_ts) * 1000.0;
-                    let bucket = (recv_ts as u64).saturating_sub(0); // absolute second
-
-                    // Parse hops once, outside the lock — avoids holding the
-                    // mutex across a JSON walk that can include dozens of
-                    // allocations per event at high rates.
-                    let mut hops_vec: Vec<(String, f64, f64)> = Vec::new();
-                    if let Some(hops) = ev.get("bench_hops").and_then(|v| v.as_array()) {
-                        hops_vec.reserve(hops.len());
-                        for hop in hops {
-                            let arr = match hop.as_array() { Some(a) => a, None => continue };
-                            if arr.len() < 3 { continue; }
-                            let name = match arr[0].as_str() { Some(n) => n, None => continue };
-                            let enter = match arr[1].as_f64() { Some(v) => v, None => continue };
-                            let exit  = match arr[2].as_f64() { Some(v) => v, None => continue };
-                            if exit >= enter {
-                                hops_vec.push((name.to_string(), enter, exit));
-                            }
-                        }
-                    }
-
-                    // Compute ingress wait once, before grabbing the lock.
-                    // This is `enter_ts[stage 0] - bench_ts_wall`. We compute
-                    // it here (rather than at summary time from per_event_log)
-                    // so it tracks the full event population in lockstep with
-                    // `e2e_ms`, not the reservoir subsample. That keeps the
-                    // two metrics directly comparable: same sampling regime,
-                    // same n. We drop negative values defensively (clock skew
-                    // between processes can produce them in rare cases).
-                    let ingress_wait_ms = hops_vec.first().map(|(_, enter, _)| {
-                        (enter - bench_ts) * 1000.0
-                    }).filter(|v| *v >= 0.0);
-
-                    if let Ok(mut tel) = telemetry.try_lock() {
-                        tel.e2e_ms.push(lat_ms);
-                        if let Some(w) = ingress_wait_ms {
-                            tel.ingress_wait_ms.push(w);
-                        }
-                        *tel.recv_per_second.entry(bucket).or_default() += 1;
-
-                        // Per-stage latencies and counts. Hop names carry a
-                        // `#replica` suffix since replica-tagged hops landed;
-                        // strip it here so per_stage_* keys stay bare stage
-                        // names (analyze scripts unchanged), and aggregate the
-                        // full label separately for the per_replica block.
-                        for (name, enter, exit) in &hops_vec {
-                            let res_ms = (exit - enter) * 1000.0;
-                            let base = name.split('#').next().unwrap_or(name);
-                            tel.per_stage_latency_ms
-                                .entry(base.to_string())
-                                .or_default()
-                                .push(res_ms);
-                            *tel.per_stage_count
-                                .entry(base.to_string())
-                                .or_default() += 1;
-                            if name.contains('#') {
-                                tel.per_replica_latency_ms
-                                    .entry(name.clone())
-                                    .or_default()
-                                    .push(res_ms);
-                                *tel.per_replica_count
-                                    .entry(name.clone())
-                                    .or_default() += 1;
-                            }
-                        }
-
-                        // Per-event raw row. recv_t_s is normalized to the
-                        // run's start so Python can bin without knowing
-                        // wall-clock zero. Event hops are stored with raw
-                        // wall-clock timestamps — Python differences them to
-                        // get per-segment durations.
-                        //
-                        // Reservoir sampling keeps the live log bounded at
-                        // EVENTS_LIVE_CAP entries regardless of run length or
-                        // event rate. Each incoming event has an equal
-                        // probability of appearing in the final reservoir,
-                        // preserving the statistical properties needed for
-                        // CDF and percentile computation at summary time.
-                        // Without this cap, a 60-second run at 2000 ev/s
-                        // accumulates ~120k entries × ~200 bytes ≈ 24 MB of
-                        // heap that is never freed until shutdown, giving
-                        // the OS a reason to compact memory mid-run and
-                        // causing the latency spike visible in the scatter
-                        // plot at ~t=20s.
-                        let recv_t_s = recv_ts - test_start;
-                        let log_len = tel.per_event_log.len();
-                        if log_len < EVENTS_LIVE_CAP {
-                            tel.per_event_log.push((recv_t_s, lat_ms, hops_vec));
-                        } else {
-                            // Replace a uniformly random earlier entry.
-                            // Using recv_count as a cheap pseudo-random index
-                            // avoids pulling in a random crate in the hot path;
-                            // it advances by 1 per event so the replacement
-                            // pattern is uniform across the reservoir.
-                            let slot = (recv_count as usize) % EVENTS_LIVE_CAP;
-                            tel.per_event_log[slot] = (recv_t_s, lat_ms, hops_vec);
-                        }
-                    }
-                }
-            }
+            stats.observe(recv_ts, test_start, &ev);
         }
 
         recv_count += 1;
@@ -1223,741 +994,9 @@ fn run_collector(
         //}
     }
 
-    log.info("collector stopped", &[("total_received", &recv_count.to_string())]);
-}
+    stats.merge_into(&telemetry, &log);
 
-// ── Summary builder ───────────────────────────────────────────────────────────
-
-fn build_summary(
-    log:           &Logger,
-    telemetry:     Arc<Mutex<RunTelemetry>>,
-    test_start:    f64,
-    test_duration: f64,
-    stage_names:   &[String],
-    run_config:    serde_json::Value,
-) -> serde_json::Value {
-    let tel = match telemetry.lock() {
-        Ok(t)  => t,
-        Err(_) => return json!({}),
-    };
-
-    let mut e2e = tel.e2e_ms.clone();
-    e2e.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = e2e.len();
-
-    let pct = |arr: &[f64], p: f64| -> f64 {
-        if arr.is_empty() { return 0.0; }
-        let idx = ((arr.len() as f64 * p) as usize).min(arr.len() - 1);
-        (arr[idx] * 100_000.0).round() / 100_000.0
-    };
-
-    // Histogram (50 buckets, capped at 3×p99) — kept for backward compat
-    // with the existing plot pipeline. Paper plots should be generated
-    // from the raw `e2e_ms_samples` list below, not these 50 buckets.
-    let (hist_labels, hist_counts) = if n > 0 {
-        let max_lat = (pct(&e2e, 0.99) * 3.0).max(1.0).min(*e2e.last().unwrap());
-        let bw      = max_lat / 50.0;
-        let labels: Vec<f64> = (0..50).map(|i| (i as f64 * bw + bw / 2.0) * 1e5).map(|v| v.round() / 1e5).collect();
-        let counts: Vec<usize> = (0..50)
-            .map(|i| e2e.iter().filter(|&&l| l >= i as f64 * bw && l < (i + 1) as f64 * bw).count())
-            .collect();
-        (labels, counts)
-    } else { (vec![], vec![]) };
-
-    // CDF
-    let step = (n / 200).max(1);
-    let cdf_x: Vec<f64> = (0..n).step_by(step).map(|i| pct(&e2e, i as f64 / n as f64)).collect();
-    let cdf_y: Vec<f64> = (0..n).step_by(step).map(|i| ((i + 1) as f64 / n as f64 * 100.0 * 100.0).round() / 100.0).collect();
-
-    // Per-second received counts, aligned to test_start.
-    let recv_buckets = &tel.recv_per_second;
-    let mut bucket_keys: Vec<u64> = recv_buckets.keys().copied().collect();
-    bucket_keys.sort();
-    let lat_ts_labels: Vec<u64> = bucket_keys.iter()
-        .map(|&b| b.saturating_sub(test_start as u64))
-        .collect();
-    let recv_per_s: Vec<u64> = bucket_keys.iter().map(|b| recv_buckets[b]).collect();
-
-    let dispatcher_names: Vec<String> = stage_names.iter()
-        .map(|s| format!("dispatch-{}", s.trim_start_matches("fn-")))
-        .collect();
-
-    log.info("e2e summary", &[
-        ("n",    &n.to_string()),
-        ("p50",  &format!("{:.3}ms", pct(&e2e, 0.50))),
-        ("p99",  &format!("{:.3}ms", pct(&e2e, 0.99))),
-        ("max",  &format!("{:.3}ms", if n > 0 { e2e[n-1] } else { 0.0 })),
-    ]);
-
-    // ── New paper-grade blocks ────────────────────────────────────────────────
-
-    // Environment. Captured once at summary time; static for the run.
-    let env_block = build_environment_block();
-
-    // Counters. recv_count is the total event arrivals at the collector.
-    let recv_count: u64 = recv_per_s.iter().sum();
-    let counters_block = json!({
-        "events_received":     recv_count,
-        "per_stage_count":     tel.per_stage_count,
-    });
-
-    // Throughput. Sustained ev/s over the full test_duration; reviewers
-    // typically want a warm-up-trimmed version too, so we supply both.
-    let sustained_eps = if test_duration > 0.0 { recv_count as f64 / test_duration } else { 0.0 };
-    let trim = 5.0_f64.min(test_duration * 0.1);        // skip first max(5s, 10%) of the run
-    let warm_from = (test_start + trim) as u64;
-    let warm_count: u64 = recv_buckets.iter()
-        .filter(|(&k, _)| k >= warm_from)
-        .map(|(_, v)| *v)
-        .sum();
-    let warm_window = (test_duration - trim).max(0.001);
-    let warm_eps = warm_count as f64 / warm_window;
-
-    let per_stage_eps: std::collections::HashMap<String, f64> = tel.per_stage_count
-        .iter()
-        .map(|(k, v)| (k.clone(), if test_duration > 0.0 { *v as f64 / test_duration } else { 0.0 }))
-        .collect();
-
-    let throughput_block = json!({
-        "sustained_eps":                 round3(sustained_eps),
-        "sustained_eps_warmup_trimmed":  round3(warm_eps),
-        "warmup_trim_s":                 round3(trim),
-        "per_stage_eps":                 per_stage_eps,
-    });
-
-    // Latency. E2E percentiles + full sample list (so a Python consumer
-    // can compute any percentile it wants) + per-stage percentiles.
-    let per_stage_latency_block: serde_json::Map<String, serde_json::Value> = tel
-        .per_stage_latency_ms
-        .iter()
-        .map(|(name, samples)| {
-            let mut s = samples.clone();
-            s.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let stats = json!({
-                "count":   s.len(),
-                "p50":     pct(&s, 0.50),
-                "p95":     pct(&s, 0.95),
-                "p99":     pct(&s, 0.99),
-                "p999":    pct(&s, 0.999),
-                "max":     s.last().copied().unwrap_or(0.0),
-                "mean":    if s.is_empty() { 0.0 } else { s.iter().sum::<f64>() / s.len() as f64 },
-            });
-            (name.clone(), stats)
-        })
-        .collect();
-
-    let latency_block = json!({
-        "e2e": {
-            "count":   n,
-            "p50":     pct(&e2e, 0.50),
-            "p90":     pct(&e2e, 0.90),
-            "p95":     pct(&e2e, 0.95),
-            "p99":     pct(&e2e, 0.99),
-            "p999":    pct(&e2e, 0.999),
-            "max":     if n > 0 { e2e[n-1] } else { 0.0 },
-            "mean":    if n > 0 { e2e.iter().sum::<f64>() / n as f64 } else { 0.0 },
-            // Full sample list enabling arbitrary percentile / CDF
-            // computation downstream. Subsampled at 1 in K if the run is
-            // large, to keep JSON size bounded — a 10 M event run with
-            // raw samples would be ~80 MB of JSON.
-            "samples":              subsample_f64(&e2e, 100_000),
-            "samples_subsample_rate": subsample_rate(n, 100_000),
-        },
-        "per_stage": per_stage_latency_block,
-    });
-
-    // Scaling. Per-stage replica-count-over-time reconstructed from the
-    // event log by prefix-summing spawn/drain actions.
-    let scaling_block = build_scaling_block(&tel.scaling_events, stage_names);
-
-    // Inter-stage transport latency. For each consecutive pair of stages
-    // in the pipeline, compute the gap between `hop[i].exit_ts` and
-    // `hop[i+1].enter_ts`. This is queue + serialize + network + parse
-    // time — everything between `process-event` boundaries. On
-    // single-stage pipelines this produces an empty block.
-    let inter_stage_block = build_inter_stage_block(&tel.per_event_log);
-
-    // Ingress wait at stage 0. The gap between loadgen's send timestamp
-    // (`bench_ts_wall`, recovered from `recv_ts - e2e_ms`) and the moment
-    // the first stage's worker actually starts processing the event
-    // (`hops[0].enter_ts`). This is where the queue piles up when the
-    // pipeline is oversubscribed — it's hidden inside e2e but separate
-    // from any per-edge transport number, since events sit in the very
-    // first dispatcher's frontend buffer before any worker has touched
-    // them. Reporting it explicitly lets readers see the difference
-    // between "queue-bound latency" and "actual processing latency".
-    //
-    // We pass `tel.ingress_wait_ms` (the full population) rather than
-    // recomputing from the reservoir-sampled `per_event_log`, so the
-    // ingress and e2e percentiles are directly comparable: same sample
-    // set, same regime, ingress ≤ e2e by construction.
-    let ingress_wait_block = build_ingress_wait_block(&tel.ingress_wait_ms, stage_names);
-
-    // Per-event raw log. Powers latency-over-time plots and any ad-hoc
-    // analysis downstream. Subsampled to EVENTS_SAMPLE_CAP to keep the
-    // JSON file reasonable at high rates (300k events * ~100 bytes per
-    // row ≈ 30 MB uncapped).
-    const EVENTS_SAMPLE_CAP: usize = 100_000;
-    let events_sample = subsample_events(&tel.per_event_log, EVENTS_SAMPLE_CAP);
-    let events_block = json!({
-        "count":             tel.per_event_log.len(),
-        "subsample_rate":    subsample_rate(tel.per_event_log.len(), EVENTS_SAMPLE_CAP),
-        // Each row: [recv_t_s, e2e_ms, [[stage, enter_ts, exit_ts], ...]].
-        // Compact positional encoding — ~3x smaller than named-field JSON.
-        "rows":              events_sample,
-    });
-
-    // Resources. Direct sample list — rounded to avoid gigantic floats.
-    let resource_cpu: Vec<(f64, f32)> = tel.resource_samples.iter()
-        .map(|s| (round3(s.t_s), (s.cpu_pct * 100.0).round() / 100.0))
-        .collect();
-    let resource_rss: Vec<(f64, u64)> = tel.resource_samples.iter()
-        .map(|s| (round3(s.t_s), s.rss_bytes / 1024 / 1024))
-        .collect();
-    let resources_block = json!({
-        "cpu_pct_unit":    "percent_of_available_cpus",
-        "cpu_pct_samples": resource_cpu,
-        "rss_mb_samples":  resource_rss,
-        "sample_count":    tel.resource_samples.len(),
-    });
-
-    // Worker timing breakdown.
-    let worker_timing_block = build_worker_timing_block(
-        &tel.total_us_samples,
-        &tel.serde_us_samples,
-        &tel.per_stage_latency_ms,
-    );
-
-    // Per-replica residence times: stage -> replica -> stats. Built from the
-    // `stage#replica` hop labels; empty object on runs without tagged hops.
-    let per_replica_block = build_per_replica_block(
-        &tel.per_replica_latency_ms,
-        &tel.per_replica_count,
-    );
-
-    // Dispatcher queue depth time-series per stage.
-    let queue_depth_block: serde_json::Map<String, serde_json::Value> = tel
-        .queue_depth_samples
-        .iter()
-        .map(|(stage, samples)| (stage.clone(), json!(samples)))
-        .collect();
-
-    json!({
-        // ── Run configuration (for cross-run comparison/sweeps) ──────────────
-        "run_config":    run_config,
-
-        // ── Paper-grade blocks (primary export) ───────────────────────────────
-        "environment":   env_block,
-        "counters":      counters_block,
-        "throughput":    throughput_block,
-        "latency_ms":    latency_block,
-        "inter_stage":   inter_stage_block,
-        "ingress_wait":  ingress_wait_block,
-        "scaling":       scaling_block,
-        "resources":     resources_block,
-        "events":        events_block,
-        "worker_timing": worker_timing_block,
-        "per_replica":   per_replica_block,
-        "queue_depth":   serde_json::Value::Object(queue_depth_block),
-
-        // ── Legacy fields (kept for existing plot scripts) ────────────────────
-        "stage_names":       stage_names,
-        "dispatcher_names":  dispatcher_names,
-        "test_start_wall":   test_start,
-        "duration":          (test_duration * 10.0).round() / 10.0,
-        "e2e_count":         n,
-        "p50":               pct(&e2e, 0.50),
-        "p90":               pct(&e2e, 0.90),
-        "p99":               pct(&e2e, 0.99),
-        "p999":              pct(&e2e, 0.999),
-        "min":               if n > 0 { pct(&e2e, 0.0) } else { 0.0 },
-        "max":               if n > 0 { e2e[n-1] }       else { 0.0 },
-        "mean":              if n > 0 { (e2e.iter().sum::<f64>() / n as f64 * 1e5).round() / 1e5 } else { 0.0 },
-        "cold_start_e2e_ms": if n > 0 { Some(pct(&e2e, 0.0)) } else { None::<f64> },
-        "hist_labels":       hist_labels,
-        "hist_counts":       hist_counts,
-        "cdf_x":             cdf_x,
-        "cdf_y":             cdf_y,
-        "lat_ts_labels":     lat_ts_labels,
-        "recv_per_second":   recv_per_s,
-        "lat_ts_p50": [], "lat_ts_p99": [],
-        "has_bench_hops":    !tel.per_stage_latency_ms.is_empty(),
-        "cold_start_data":   [],
-        "cold_start_list":   [],
-        "cold_start_milestones": {},
-    })
-}
-
-// ── Summary helpers ──────────────────────────────────────────────────────────
-
-fn round3(x: f64) -> f64 { (x * 1000.0).round() / 1000.0 }
-
-/// Build the worker_timing block for the summary JSON.
-///
-/// For each stage, computes percentile statistics for:
-///   - `total_us`  — full worker iteration (recv → deser → wasm → ser → push)
-///   - `serde_us`  — JSON deserialization + serialization only
-///   - `wasm_us`   — WASM process-event call (derived from per_stage_latency_ms)
-///   - `overhead_us` — total_us − wasm_us (everything except WASM itself)
-///
-/// The `wasm_us` values come from `per_stage_latency_ms` (already collected
-/// by the collector thread from bench_hops). `total_us` and `serde_us` come
-/// from the autoscaler forwarding worker metric payloads.
-fn build_worker_timing_block(
-    total_us_samples:  &std::collections::HashMap<String, Vec<u64>>,
-    serde_us_samples:  &std::collections::HashMap<String, Vec<u64>>,
-    wasm_ms_samples:   &std::collections::HashMap<String, Vec<f64>>,
-) -> serde_json::Value {
-    let pct_u64 = |arr: &[u64], p: f64| -> f64 {
-        if arr.is_empty() { return 0.0; }
-        let idx = ((arr.len() as f64 * p) as usize).min(arr.len() - 1);
-        arr[idx] as f64
-    };
-    let pct_f64 = |arr: &[f64], p: f64| -> f64 {
-        if arr.is_empty() { return 0.0; }
-        let idx = ((arr.len() as f64 * p) as usize).min(arr.len() - 1);
-        arr[idx]
-    };
-    let mean_u64 = |arr: &[u64]| -> f64 {
-        if arr.is_empty() { return 0.0; }
-        arr.iter().sum::<u64>() as f64 / arr.len() as f64
-    };
-    let mean_f64 = |arr: &[f64]| -> f64 {
-        if arr.is_empty() { return 0.0; }
-        arr.iter().sum::<f64>() / arr.len() as f64
-    };
-
-    // Collect all stage names across all three maps.
-    let mut all_stages: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for k in total_us_samples.keys() { all_stages.insert(k.clone()); }
-    for k in serde_us_samples.keys() { all_stages.insert(k.clone()); }
-    for k in wasm_ms_samples.keys()  { all_stages.insert(k.clone()); }
-
-    if all_stages.is_empty() {
-        return serde_json::Value::Object(Default::default());
-    }
-
-    let mut per_stage: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-
-    for stage in &all_stages {
-        let empty_u: Vec<u64> = vec![];
-        let empty_f: Vec<f64> = vec![];
-
-        // total/serde samples now arrive in NANOSECONDS (worker switched
-        // from as_micros to as_nanos so sub-µs serialization no longer
-        // floors to 0). Convert to µs as f64 here: the summary keys stay
-        // named *_us and stay in microseconds for downstream consumers,
-        // but now carry sub-µs precision instead of truncating.
-        let mut total: Vec<f64> = total_us_samples.get(stage).cloned().unwrap_or_default()
-            .iter().map(|&ns| ns as f64 / 1000.0).collect();
-        let mut serde: Vec<f64> = serde_us_samples.get(stage).cloned().unwrap_or_default()
-            .iter().map(|&ns| ns as f64 / 1000.0).collect();
-        // wasm residence comes from bench hops in ms → µs.
-        let mut wasm_us: Vec<f64> = wasm_ms_samples.get(stage).cloned().unwrap_or_default()
-            .iter().map(|&ms| ms * 1000.0).collect();
-
-        total.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        serde.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        wasm_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-        // Overhead = total - wasm. Pair-wise on sorted arrays is not
-        // meaningful, so we compute it from percentile arithmetic. For the
-        // sample list we approximate via the means.
-        let overhead_p50  = (pct_f64(&total, 0.50) - pct_f64(&wasm_us, 0.50)).max(0.0);
-        let overhead_p99  = (pct_f64(&total, 0.99) - pct_f64(&wasm_us, 0.99)).max(0.0);
-        let overhead_mean = (mean_f64(&total)       - mean_f64(&wasm_us)).max(0.0);
-
-        // Serde fraction at p50 (how much of total is serialization).
-        // Unit-independent ratio — nonzero now that serde isn't floored.
-        let serde_frac_p50 = if pct_f64(&total, 0.50) > 0.0 {
-            pct_f64(&serde, 0.50) / pct_f64(&total, 0.50)
-        } else { 0.0 };
-
-        let n = total.len().max(wasm_us.len()).max(serde.len());
-
-        // 3-decimal µs == ns precision; keeps JSON compact.
-        let r3 = |x: f64| (x * 1000.0).round() / 1000.0;
-
-        per_stage.insert(stage.clone(), serde_json::json!({
-            "n": n,
-            "total_us": {
-                "p50":  r3(pct_f64(&total, 0.50)),
-                "p95":  r3(pct_f64(&total, 0.95)),
-                "p99":  r3(pct_f64(&total, 0.99)),
-                "p999": r3(pct_f64(&total, 0.999)),
-                "max":  r3(total.last().copied().unwrap_or(0.0)),
-                "mean": r3(mean_f64(&total)),
-                "samples": subsample_f64(&total, 50_000),
-            },
-            "serde_us": {
-                "p50":  r3(pct_f64(&serde, 0.50)),
-                "p95":  r3(pct_f64(&serde, 0.95)),
-                "p99":  r3(pct_f64(&serde, 0.99)),
-                "max":  r3(serde.last().copied().unwrap_or(0.0)),
-                "mean": r3(mean_f64(&serde)),
-                "samples": subsample_f64(&serde, 50_000),
-            },
-            "wasm_us": {
-                "p50":  r3(pct_f64(&wasm_us, 0.50)),
-                "p95":  r3(pct_f64(&wasm_us, 0.95)),
-                "p99":  r3(pct_f64(&wasm_us, 0.99)),
-                "p999": r3(pct_f64(&wasm_us, 0.999)),
-                "max":  r3(wasm_us.last().copied().unwrap_or(0.0)),
-                "mean": r3(mean_f64(&wasm_us)),
-                "samples": subsample_f64(&wasm_us, 50_000),
-            },
-            // overhead = total − wasm (recv + deser + val construction + ser + push)
-            "overhead_us": {
-                "p50":  r3(overhead_p50),
-                "p99":  r3(overhead_p99),
-                "mean": r3(overhead_mean),
-            },
-            "serde_frac_p50": (serde_frac_p50 * 1000.0).round() / 1000.0,
-        }));
-
-        let _ = (empty_u, empty_f, pct_u64, mean_u64); // suppress unused warnings
-    }
-
-    serde_json::Value::Object(per_stage)
-}
-
-/// Subsample a sorted u64 series to at most `cap` elements.
-#[allow(dead_code)] // retained for callers that still emit integer-µs samples
-fn subsample_u64(src: &[u64], cap: usize) -> Vec<u64> {
-    if src.len() <= cap { return src.to_vec(); }
-    let k = (src.len() + cap - 1) / cap;
-    src.iter().step_by(k).copied().collect()
-}
-
-/// Compute per-edge transport-latency distributions from the raw
-/// per-event log. An "edge" is a consecutive pair of stages in the hop
-/// sequence (e.g. `normalize → detect`); the gap measurement is
-/// `hop[i+1].enter_ts − hop[i].exit_ts`, which captures serialize +
-/// push + pull + dispatch + worker-recv + parse time between two
-/// `process-event` boundaries.
-///
-/// Events with fewer than 2 hops contribute nothing and are skipped.
-/// Edge labels are deduplicated by (from_stage, to_stage) so pipelines
-/// with repeating stage names still produce well-defined keys.
-/// Build the per_replica block: `{ stage: { "0": {stats}, "1": {stats} } }`.
-///
-/// Stats per replica: event count, residence-time percentiles (ms), and a
-/// capped sample list for distribution plots (box/violin per replica). The
-/// `share` field is this replica's fraction of the stage's events — a direct
-/// load-balance fairness readout (1/R when the transport balances perfectly).
-fn build_per_replica_block(
-    latency_ms: &std::collections::HashMap<String, Vec<f64>>,
-    counts:     &std::collections::HashMap<String, u64>,
-) -> serde_json::Value {
-    use std::collections::BTreeMap;
-    if latency_ms.is_empty() {
-        return serde_json::Value::Object(Default::default());
-    }
-    let pct = |arr: &[f64], p: f64| -> f64 {
-        if arr.is_empty() { return 0.0; }
-        let idx = ((arr.len() as f64 * p) as usize).min(arr.len() - 1);
-        arr[idx]
-    };
-    let r4 = |x: f64| (x * 10_000.0).round() / 10_000.0;
-
-    // stage -> replica -> sorted samples
-    let mut grouped: BTreeMap<String, BTreeMap<u32, Vec<f64>>> = BTreeMap::new();
-    for (label, samples) in latency_ms {
-        let mut it = label.splitn(2, '#');
-        let stage = it.next().unwrap_or(label).to_string();
-        let rep: u32 = it.next().and_then(|r| r.parse().ok()).unwrap_or(0);
-        let mut s = samples.clone();
-        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        grouped.entry(stage).or_default().insert(rep, s);
-    }
-
-    let mut out: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-    for (stage, reps) in &grouped {
-        let stage_total: u64 = reps.keys()
-            .map(|r| counts.get(&format!("{stage}#{r}")).copied().unwrap_or(0))
-            .sum();
-        let mut rep_map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-        for (rep, samples) in reps {
-            let n_evt = counts.get(&format!("{stage}#{rep}")).copied().unwrap_or(samples.len() as u64);
-            let mean = if samples.is_empty() { 0.0 }
-                       else { samples.iter().sum::<f64>() / samples.len() as f64 };
-            rep_map.insert(rep.to_string(), json!({
-                "count":   n_evt,
-                "share":   if stage_total > 0 { r4(n_evt as f64 / stage_total as f64) } else { 0.0 },
-                "p50":     r4(pct(samples, 0.50)),
-                "p95":     r4(pct(samples, 0.95)),
-                "p99":     r4(pct(samples, 0.99)),
-                "max":     r4(samples.last().copied().unwrap_or(0.0)),
-                "mean":    r4(mean),
-                "samples": subsample_f64(samples, 20_000),
-            }));
-        }
-        out.insert(stage.clone(), serde_json::Value::Object(rep_map));
-    }
-    serde_json::Value::Object(out)
-}
-
-fn build_inter_stage_block(
-    events: &[(f64, f64, Vec<(String, f64, f64)>)],
-) -> serde_json::Value {
-    use std::collections::HashMap;
-
-    // Collect per-edge gap samples. BTreeMap over the sorted key so the
-    // JSON output is deterministic across runs with the same edges.
-    let mut per_edge: HashMap<(String, String), Vec<f64>> = HashMap::new();
-    for (_, _, hops) in events {
-        for pair in hops.windows(2) {
-            let (from_name, _, from_exit) = &pair[0];
-            let (to_name, to_enter, _)    = &pair[1];
-            if *to_enter >= *from_exit {
-                let gap_ms = (to_enter - from_exit) * 1000.0;
-                // Hop labels are `stage#replica`; the edge key aggregates
-                // over replicas so it stays `relay -> forward`, matching the
-                // pipeline topology and existing analyze scripts.
-                let from_base = from_name.split('#').next().unwrap_or(from_name).to_string();
-                let to_base   = to_name.split('#').next().unwrap_or(to_name).to_string();
-                per_edge
-                    .entry((from_base, to_base))
-                    .or_default()
-                    .push(gap_ms);
-            }
-        }
-    }
-
-    if per_edge.is_empty() {
-        // Single-stage pipelines land here — signal explicitly so the
-        // plotter can print a friendly "no inter-stage data" message.
-        return json!({ "edges": [], "note": "single-stage pipeline or no multi-hop events observed" });
-    }
-
-    let pct = |arr: &[f64], p: f64| -> f64 {
-        if arr.is_empty() { return 0.0; }
-        let idx = ((arr.len() as f64 * p) as usize).min(arr.len() - 1);
-        arr[idx]
-    };
-
-    let mut edges: Vec<serde_json::Value> = per_edge.into_iter()
-        .map(|((from, to), mut samples)| {
-            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let n = samples.len();
-            json!({
-                "from":      from,
-                "to":        to,
-                "count":     n,
-                "p50":       pct(&samples, 0.50),
-                "p95":       pct(&samples, 0.95),
-                "p99":       pct(&samples, 0.99),
-                "p999":      pct(&samples, 0.999),
-                "max":       samples.last().copied().unwrap_or(0.0),
-                "mean":      if n > 0 { samples.iter().sum::<f64>() / n as f64 } else { 0.0 },
-                // Sample list for downstream distribution plots. Capped
-                // at the same 100k limit used for e2e samples — at that
-                // cap the distribution shape is preserved but the JSON
-                // stays tractable.
-                "samples":   subsample_f64(&samples, 100_000),
-            })
-        })
-        .collect();
-    // Stable order: by (from, to) alphabetically.
-    edges.sort_by(|a, b| {
-        let ka = (a["from"].as_str().unwrap_or(""), a["to"].as_str().unwrap_or(""));
-        let kb = (b["from"].as_str().unwrap_or(""), b["to"].as_str().unwrap_or(""));
-        ka.cmp(&kb)
-    });
-    json!({ "edges": edges })
-}
-
-/// Build the ingress-wait block.
-///
-/// Ingress wait is the time between loadgen pressing "send" on an event
-/// and the entry stage's worker actually starting to process it. When
-/// the pipeline is oversubscribed the bulk of e2e latency lives here —
-/// events stack up in the first dispatcher's frontend buffer, and the
-/// existing inter-stage transport metric won't surface this because it
-/// only measures gaps *between* worker-touched timestamps.
-///
-/// Sourced from `tel.ingress_wait_ms` rather than reservoir-sampled
-/// `per_event_log`, so percentiles here track the full event population
-/// in lockstep with `e2e_ms`. The two metrics use the same sampling
-/// regime (none — every event), making them directly comparable: one
-/// is always a component of the other, and `ingress p50 ≤ e2e p50`
-/// holds by construction (modulo dropped clock-skew samples). When this
-/// invariant is violated in practice it means upstream telemetry
-/// processing dropped values; check the warn-log for hint.
-///
-/// Reports under the entry stage's name (taken from `stage_names[0]`)
-/// so the JSON shape is uniform with `inter_stage` (a list of named
-/// entries) and survives later non-linear topologies cleanly.
-fn build_ingress_wait_block(
-    samples:     &[f64],
-    stage_names: &[String],
-) -> serde_json::Value {
-    if samples.is_empty() || stage_names.is_empty() {
-        return json!({ "stages": [], "note": "no ingress wait samples" });
-    }
-
-    let mut sorted: Vec<f64> = samples.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = sorted.len();
-
-    let pct = |arr: &[f64], p: f64| -> f64 {
-        if arr.is_empty() { return 0.0; }
-        let idx = ((arr.len() as f64 * p) as usize).min(arr.len() - 1);
-        arr[idx]
-    };
-
-    json!({
-        "stages": [
-            {
-                "stage":  &stage_names[0],
-                "count":  n,
-                "p50":    pct(&sorted, 0.50),
-                "p95":    pct(&sorted, 0.95),
-                "p99":    pct(&sorted, 0.99),
-                "p999":   pct(&sorted, 0.999),
-                "max":    sorted.last().copied().unwrap_or(0.0),
-                "mean":   if n > 0 { sorted.iter().sum::<f64>() / n as f64 } else { 0.0 },
-            }
-        ]
-    })
-}
-
-/// Subsample the per-event log to at most `cap` rows, preserving
-/// arrival order. The output JSON layout is positional for compactness:
-///
-///   `[recv_t_s, e2e_ms, [[stage, enter_ts, exit_ts], ...]]`
-///
-/// This is ~3x smaller than an equivalent named-field encoding and
-/// maps directly to a pandas/polars DataFrame with one `explode` call
-/// on the hops column.
-fn subsample_events(
-    src: &[(f64, f64, Vec<(String, f64, f64)>)],
-    cap: usize,
-) -> Vec<serde_json::Value> {
-    if src.len() <= cap {
-        return src.iter().map(event_row).collect();
-    }
-    let k = (src.len() + cap - 1) / cap;
-    src.iter().step_by(k).map(event_row).collect()
-}
-
-fn event_row(e: &(f64, f64, Vec<(String, f64, f64)>)) -> serde_json::Value {
-    let (recv_t_s, e2e_ms, hops) = e;
-    // Round time-since-start to microsecond precision — finer than we
-    // can reliably measure and plenty for per-second binning.
-    let recv = (recv_t_s * 1_000_000.0).round() / 1_000_000.0;
-    let lat  = (e2e_ms  * 10_000.0).round() / 10_000.0;
-    let hops_json: Vec<serde_json::Value> = hops.iter()
-        .map(|(name, enter, exit)| json!([name, enter, exit]))
-        .collect();
-    json!([recv, lat, hops_json])
-}
-
-/// Downsample a sorted float series to at most `cap` elements by keeping
-/// every K-th value. Paper plots typically don't need more than ~100k
-/// samples for a CDF; above that you're just bloating the output JSON.
-fn subsample_f64(src: &[f64], cap: usize) -> Vec<f64> {
-    if src.len() <= cap { return src.to_vec(); }
-    let k = (src.len() + cap - 1) / cap;
-    src.iter().step_by(k).copied().collect()
-}
-
-fn subsample_rate(n: usize, cap: usize) -> usize {
-    if n <= cap { 1 } else { (n + cap - 1) / cap }
-}
-
-/// Collect static information about the machine and build the run was
-/// produced on. Exposed in the summary so reviewers (and future us)
-/// know what hardware a given number came from.
-fn build_environment_block() -> serde_json::Value {
-    let mut sys = sysinfo::System::new();
-    sys.refresh_cpu();
-    sys.refresh_memory();
-
-    let cpu_model = sys.cpus().first()
-        .map(|c| c.brand().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let cpu_cores_logical = sys.cpus().len();
-    let cpu_cores_physical = sys.physical_core_count().unwrap_or(cpu_cores_logical);
-    let ram_total_kb = sys.total_memory() / 1024;
-
-    let os_name = sysinfo::System::name().unwrap_or_else(|| "unknown".to_string());
-    let os_version = sysinfo::System::os_version().unwrap_or_else(|| "unknown".to_string());
-    let kernel = sysinfo::System::kernel_version().unwrap_or_else(|| "unknown".to_string());
-    let host = sysinfo::System::host_name().unwrap_or_else(|| "unknown".to_string());
-
-    // Tool versions. `rustc_version` and `git_commit` are baked at build
-    // time by build.rs; they're static strings here.
-    let rustc   = option_env!("EPICO_RUSTC_VERSION").unwrap_or("unknown");
-    let commit  = option_env!("EPICO_GIT_COMMIT").unwrap_or("unknown");
-    let dirty   = option_env!("EPICO_GIT_DIRTY").unwrap_or("0") == "1";
-    // Wasmtime is pinned in Cargo.toml; reading the literal here means the
-    // summary is always correct without runtime crate-version introspection.
-    let wasmtime_version = "26";
-
-    json!({
-        "host":                host,
-        "os_name":             os_name,
-        "os_version":          os_version,
-        "kernel":              kernel,
-        "cpu_model":           cpu_model,
-        "cpu_cores_physical":  cpu_cores_physical,
-        "cpu_cores_logical":   cpu_cores_logical,
-        "ram_total_mb":        ram_total_kb / 1024,
-        "rustc":               rustc,
-        "wasmtime":            wasmtime_version,
-        "git_commit":          commit,
-        "git_dirty":           dirty,
-    })
-}
-
-/// Reconstruct per-stage replica-count timeline and summarize scaling
-/// activity from the raw event log. `(t_s, replica_count)` pairs are
-/// ready to plot as a step function.
-fn build_scaling_block(
-    events:      &[ScalingEvent],
-    stage_names: &[String],
-) -> serde_json::Value {
-    let mut per_stage: serde_json::Map<String, serde_json::Value> =
-        serde_json::Map::new();
-
-    for name in stage_names {
-        let stage_events: Vec<&ScalingEvent> = events.iter()
-            .filter(|e| e.stage == *name).collect();
-
-        // Replicas-over-time: start at 0, emit a point for every event.
-        let mut replicas: Vec<(f64, usize)> = vec![(0.0, 0)];
-        for e in &stage_events {
-            replicas.push((round3(e.t_s), e.new_count));
-        }
-
-        let scale_up_count   = stage_events.iter().filter(|e| e.action == "spawn"
-                                                    || e.action == "cold_start").count();
-        let scale_down_count = stage_events.iter().filter(|e| e.action == "drain").count();
-        let cold_start_count = stage_events.iter().filter(|e| e.action == "cold_start").count();
-        let cold_start_ms: Vec<f64> = stage_events.iter()
-            .filter_map(|e| e.cold_start_ms).collect();
-        let compile_ms: Vec<f64> = stage_events.iter()
-            .filter_map(|e| e.compile_ms).collect();
-        let instantiate_pre_ms: Vec<f64> = stage_events.iter()
-            .filter_map(|e| e.instantiate_pre_ms).collect();
-
-        per_stage.insert(name.clone(), json!({
-            "replicas_over_time":   replicas,
-            "scale_up_count":       scale_up_count,
-            "scale_down_count":     scale_down_count,
-            "cold_start_count":     cold_start_count,
-            "cold_start_ms":        cold_start_ms,
-            "compile_ms":           compile_ms,
-            "instantiate_pre_ms":   instantiate_pre_ms,
-            "events":               stage_events,
-        }));
-    }
-
-    json!({
-        "per_stage":    per_stage,
-        "total_events": events.len(),
-    })
+    info!(log, "collector stopped", total_received = recv_count);
 }
 
 // ── Startup helpers ───────────────────────────────────────────────────────────
@@ -1966,12 +1005,12 @@ fn load_config(path: &std::path::Path, log: &Logger) -> Config {
     let yaml_path = path.to_string_lossy().to_string();
     let yaml_content = std::fs::read_to_string(&yaml_path)
         .unwrap_or_else(|e| {
-            log.error("failed to read config", &[("path", &yaml_path), ("err", &e.to_string())]);
+            error!(log, "failed to read config", path = yaml_path, err = e);
             std::process::exit(1);
         });
     let mut config: Config = serde_yaml::from_str(&yaml_content)
         .unwrap_or_else(|e| {
-            log.error("failed to parse YAML", &[("path", &yaml_path), ("err", &e.to_string())]);
+            error!(log, "failed to parse YAML", path = yaml_path, err = e);
             std::process::exit(1);
         });
     let yaml_dir = std::path::Path::new(&yaml_path)
@@ -1992,11 +1031,11 @@ fn validate_pipeline(config: &Config, log: &Logger) {
         .collect();
     match pipeline_validator::validate_pipeline_components(&stages) {
         Ok(report) => {
-            log.info("pipeline validated", &[("stages", &config.pipeline.len().to_string())]);
-            for line in &report { log.info("validator", &[("detail", line.as_str())]); }
+            info!(log, "pipeline validated", stages = config.pipeline.len());
+            for line in &report { info!(log, "validator", detail = line); }
         }
         Err(e) => {
-            log.error("pipeline validation failed", &[("err", &format!("{:#}", e))]);
+            error!(log, "pipeline validation failed", err = format!("{:#}", e));
             std::process::exit(1);
         }
     }
@@ -2007,12 +1046,11 @@ fn apply_placement_filter(config: &mut Config, log: &Logger) {
     config.pipeline.retain(|s| stage_owned_by(s, &config.this_host));
     config.dispatchers.retain(|d| d.placement == config.this_host);
     let kept = config.pipeline.len();
-    log.info("placement filter", &[
-        ("this_host", &config.this_host),
-        ("owning",    &format!("{}/{}", kept, total)),
-    ]);
+    info!(log, "placement filter",
+          this_host = config.this_host,
+          owning = format!("{}/{}", kept, total));
     if kept == 0 {
-        log.error("no stages placed on this host", &[("this_host", &config.this_host)]);
+        error!(log, "no stages placed on this host", this_host = config.this_host);
         std::process::exit(1);
     }
 }

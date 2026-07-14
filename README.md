@@ -2,13 +2,14 @@
 
 <img src="assets/logo.png" alt="Epico" width="220"/>
 </div>
+
 # Epico
 
 **A broker-free stream-processing runtime where every stage is a WebAssembly component.**
 
 No Kafka. No Redis. No Kubernetes. One binary, one YAML, one `.rs` file per stage.
 
-[![Build](https://img.shields.io/badge/build-passing-brightgreen)](#)
+[![CI](https://github.com/Della97/Epico/actions/workflows/ci.yml/badge.svg)](https://github.com/Della97/Epico/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-2024-orange)](#)
 [![WASI](https://img.shields.io/badge/wasi-p2-purple)](https://github.com/WebAssembly/WASI)
 
@@ -255,7 +256,7 @@ On shutdown the master writes `master_<ts>_summary.json` containing:
 
 ## Status & roadmap
 
-Actively developed. Core runtime is ~7 400 LOC of Rust.
+Actively developed. Core runtime is ~6 000 LOC of Rust.
 
 **Supported today:** linear DAGs · WASIp2 components · per-stage autoscaling · credit-based flow control (sliding-window dispatcher↔worker protocol) · AOT / JIT / startup-JIT compilation modes · pipeline component validation · structured JSONL telemetry + summary JSON · declarative load-generator source · single-host deployment.
 

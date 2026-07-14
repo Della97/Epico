@@ -11,38 +11,16 @@ use wasmtime_wasi::{ResourceTable, WasiCtxBuilder};
 use wasmtime_wasi_http::WasiHttpCtx;
 
 use epico_logger::Logger;
+use epico_logger::{error, info, warn};
 
 use crate::config::{make_pull_endpoint, make_push_endpoint, PipelineStage};
 use crate::host::HostState;
 use crate::spsc::{EdgeInSrc, EdgeOutSrc};
+use crate::telemetry::{record_event, stats::round3, RunTelemetry, ScalingEvent};
 use crate::worker::{spawn_worker, WorkerHandle};
-use crate::{RunTelemetry, ScalingEvent};
 
 const TICK_MS: u64 = 1;
 const SPAWN_SETTLE_TICKS: u32 = 3;
-
-fn record_event(
-    telemetry:  &Arc<Mutex<RunTelemetry>>,
-    test_start: Instant,
-    stage:      &str,
-    action:     &str,
-    new_count:  usize,
-    cold_start_ms:      Option<f64>,
-    compile_ms:         Option<f64>,
-    instantiate_pre_ms: Option<f64>,
-) {
-    if let Ok(mut tel) = telemetry.lock() {
-        tel.scaling_events.push(ScalingEvent {
-            t_s:                test_start.elapsed().as_secs_f64(),
-            stage:              stage.to_string(),
-            action:             action.to_string(),
-            new_count,
-            cold_start_ms,
-            compile_ms,
-            instantiate_pre_ms,
-        });
-    }
-}
 
 /// Load a stage's Wasm component, preferring an AOT .cwasm artifact next
 /// to the .wasm if it exists. Returns the loaded component, the wall-clock
@@ -64,17 +42,15 @@ fn load_component(
         match unsafe { Component::deserialize_file(engine, &cwasm_path) } {
             Ok(c) => {
                 let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
-                log.info("AOT component loaded", &[
-                    ("path",        &cwasm_path.display().to_string()),
-                    ("load_ms",     &format!("{:.3}", load_ms)),
-                ]);
+                info!(log, "AOT component loaded",
+                      path = cwasm_path.display(),
+                      load_ms = format!("{:.3}", load_ms));
                 return (c, load_ms, "aot");
             }
             Err(e) => {
-                log.warn("AOT deserialize failed; falling back to JIT", &[
-                    ("path", &cwasm_path.display().to_string()),
-                    ("err",  &e.to_string()),
-                ]);
+                warn!(log, "AOT deserialize failed; falling back to JIT",
+                      path = cwasm_path.display(),
+                      err = e);
             }
         }
     }
@@ -82,14 +58,13 @@ fn load_component(
     let t_jit = Instant::now();
     let component = Component::from_file(engine, wasm_path)
         .unwrap_or_else(|e| {
-            log.error("failed to load wasm component", &[("err", &e.to_string())]);
+            error!(log, "failed to load wasm component", err = e);
             std::process::exit(1);
         });
     let compile_ms = t_jit.elapsed().as_secs_f64() * 1000.0;
-    log.info("JIT component compiled", &[
-        ("path",       wasm_path),
-        ("compile_ms", &format!("{:.3}", compile_ms)),
-    ]);
+    info!(log, "JIT component compiled",
+          path = wasm_path,
+          compile_ms = format!("{:.3}", compile_ms));
     (component, compile_ms, "jit")
 }
 
@@ -108,25 +83,23 @@ fn jit_compile_and_instantiate(
 ) -> (wasmtime::component::InstancePre<HostState>, f64, f64) {
     let t_jit = Instant::now();
     let wasm_bytes = std::fs::read(wasm_path).unwrap_or_else(|e| {
-        log.error("JIT: failed to read wasm", &[("path", wasm_path), ("err", &e.to_string())]);
+        error!(log, "JIT: failed to read wasm", path = wasm_path, err = e);
         std::process::exit(1);
     });
     let cwasm_bytes = engine.precompile_component(&wasm_bytes).unwrap_or_else(|e| {
-        log.error("JIT: precompile_component failed", &[("path", wasm_path), ("err", &e.to_string())]);
+        error!(log, "JIT: precompile_component failed", path = wasm_path, err = e);
         std::process::exit(1);
     });
     let cwasm_path = Path::new(wasm_path).with_extension("cwasm");
     std::fs::write(&cwasm_path, &cwasm_bytes).unwrap_or_else(|e| {
-        log.error("JIT: cwasm write failed", &[
-            ("path", &cwasm_path.display().to_string()), ("err", &e.to_string()),
-        ]);
+        error!(log, "JIT: cwasm write failed", path = cwasm_path.display(), err = e);
         std::process::exit(1);
     });
     let compile_ms = t_jit.elapsed().as_secs_f64() * 1000.0;
     // SAFETY: we just wrote this artifact from the same engine version.
     let component = unsafe { Component::deserialize_file(engine, &cwasm_path) }
         .unwrap_or_else(|e| {
-            log.error("JIT: cwasm deserialize failed", &[("err", &e.to_string())]);
+            error!(log, "JIT: cwasm deserialize failed", err = e);
             std::process::exit(1);
         });
     let t_pre = Instant::now();
@@ -134,11 +107,10 @@ fn jit_compile_and_instantiate(
         .instantiate_pre(&component)
         .expect("JIT: failed to create InstancePre");
     let instantiate_pre_ms = t_pre.elapsed().as_secs_f64() * 1000.0;
-    log.info("JIT: compiled at cold-start", &[
-        ("wasm",                wasm_path),
-        ("compile_ms",          &format!("{:.3}", compile_ms)),
-        ("instantiate_pre_ms",  &format!("{:.3}", instantiate_pre_ms)),
-    ]);
+    info!(log, "JIT: compiled at cold-start",
+          wasm = wasm_path,
+          compile_ms = format!("{:.3}", compile_ms),
+          instantiate_pre_ms = format!("{:.3}", instantiate_pre_ms));
     (instance_pre, compile_ms, instantiate_pre_ms)
 }
 
@@ -168,11 +140,10 @@ pub(crate) fn run_autoscaler_loop(
     let out_endpoint = make_push_endpoint(&stage.output);
 
     let wasm_path = stage.wasm.clone().expect("wasm path resolved in main()");
-    log.info("loading component", &[
-        ("wasm",         &wasm_path),
-        ("stage",        &stage.name),
-        ("compile_mode", &compile_mode),
-    ]);
+    info!(log, "loading component",
+          wasm = wasm_path,
+          stage = stage.name,
+          compile_mode = compile_mode);
 
     // ── Component loading: AOT/startup-JIT at startup; deferred-JIT at cold-start ──
     //
@@ -189,13 +160,12 @@ pub(crate) fn run_autoscaler_loop(
         wasmtime_wasi::add_to_linker_sync(&mut linker)
             .expect("Failed to add wasi to component linker");
         if let Err(e) = wasmtime_wasi_http::add_only_http_to_linker_sync(&mut linker) {
-            log.warn("wasi:http not wired", &[("err", &e.to_string())]);
+            warn!(log, "wasi:http not wired", err = e);
         }
-        log.info("autoscaler ready (JIT: compilation deferred to cold-start)", &[
-            ("stage",   &stage.name),
-            ("max_rep", &stage.slo.max_replicas.to_string()),
-            ("min_rep", &stage.slo.min_replicas.to_string()),
-        ]);
+        info!(log, "autoscaler ready (JIT: compilation deferred to cold-start)",
+              stage = stage.name,
+              max_rep = stage.slo.max_replicas,
+              min_rep = stage.slo.min_replicas);
         (Some(linker), None)
     } else {
         // AOT or startup-JIT: compile/load now, before the loop.
@@ -205,7 +175,7 @@ pub(crate) fn run_autoscaler_loop(
         wasmtime_wasi::add_to_linker_sync(&mut linker)
             .expect("Failed to add wasi to component linker");
         if let Err(e) = wasmtime_wasi_http::add_only_http_to_linker_sync(&mut linker) {
-            log.warn("wasi:http not wired", &[("err", &e.to_string())]);
+            warn!(log, "wasi:http not wired", err = e);
         }
 
         let t_pre = Instant::now();
@@ -213,11 +183,10 @@ pub(crate) fn run_autoscaler_loop(
             .instantiate_pre(&component)
             .expect("Failed to create component InstancePre");
         let instantiate_pre_ms = t_pre.elapsed().as_secs_f64() * 1000.0;
-        log.info("instance_pre ready", &[
-            ("stage",               &stage.name),
-            ("mode",                mode),
-            ("instantiate_pre_ms",  &format!("{:.3}", instantiate_pre_ms)),
-        ]);
+        info!(log, "instance_pre ready",
+              stage = stage.name,
+              mode = mode,
+              instantiate_pre_ms = format!("{:.3}", instantiate_pre_ms));
 
         // ── Warmup instantiate ────────────────────────────────────────────────
         // The first `instance_pre.instantiate(&mut store)` in a process is
@@ -247,19 +216,17 @@ pub(crate) fn run_autoscaler_loop(
             match instance_pre.instantiate(&mut warmup_store) {
                 Ok(_inst) => {
                     let warmup_ms = t_warm.elapsed().as_secs_f64() * 1000.0;
-                    log.info("wasmtime warmup complete", &[
-                        ("stage",     &stage.name),
-                        ("warmup_ms", &format!("{:.3}", warmup_ms)),
-                    ]);
+                    info!(log, "wasmtime warmup complete",
+                          stage = stage.name,
+                          warmup_ms = format!("{:.3}", warmup_ms));
                 }
                 Err(e) => {
                     // Non-fatal: if warmup fails, the real first worker will
                     // surface the same error. Don't abort agent startup over
                     // an instrumentation step.
-                    log.warn("wasmtime warmup failed (continuing)", &[
-                        ("stage", &stage.name),
-                        ("err",   &e.to_string()),
-                    ]);
+                    warn!(log, "wasmtime warmup failed (continuing)",
+                          stage = stage.name,
+                          err = e);
                 }
             }
         }
@@ -270,13 +237,12 @@ pub(crate) fn run_autoscaler_loop(
             0, None, Some(compile_ms), Some(instantiate_pre_ms),
         );
 
-        log.info("autoscaler ready", &[
-            ("max_rep",         &stage.slo.max_replicas.to_string()),
-            ("min_rep",         &stage.slo.min_replicas.to_string()),
-            ("queue_up",        &stage.slo.queue_up.unwrap_or(50.0).to_string()),
-            ("queue_down",      &stage.slo.queue_down.unwrap_or(0.0).to_string()),
-            ("mode",            mode),
-        ]);
+        info!(log, "autoscaler ready",
+              max_rep = stage.slo.max_replicas,
+              min_rep = stage.slo.min_replicas,
+              queue_up = stage.slo.queue_up.unwrap_or(50.0),
+              queue_down = stage.slo.queue_down.unwrap_or(0.0),
+              mode = mode);
 
         (None, Some(Arc::new(instance_pre)))
     };
@@ -319,6 +285,14 @@ pub(crate) fn run_autoscaler_loop(
     let avg_latency_us = Arc::new(AtomicU64::new(100));
 
     let mut workers: Vec<WorkerHandle> = Vec::new();
+    // Free replica indices. Popped (lowest first) at spawn, reclaimed when a
+    // worker's `done` flag confirms its thread has fully exited. `workers.len()`
+    // must NOT be used as the index: after a drain+respawn it collides with a
+    // still-live worker's index, which on the SPSC mesh path puts two consumers
+    // on one ring (UB) and on the zmq path merges two workers' hop labels.
+    let mut free_indices: std::collections::BTreeSet<usize> = (0..max_rep).collect();
+    // Monotonic tick counter, for decimating time-series samples below.
+    let mut tick: u64 = 0;
     let mut up_votes: u32 = 0;
     let mut down_votes: u32 = 0;
     let mut ticks_since_spawn: u32 = u32::MAX;
@@ -330,7 +304,15 @@ pub(crate) fn run_autoscaler_loop(
 
     loop {
         std::thread::sleep(Duration::from_millis(TICK_MS));
-        workers.retain(|w| !w.done.load(Ordering::Relaxed));
+        tick = tick.wrapping_add(1);
+        workers.retain(|w| {
+            if w.done.load(Ordering::Relaxed) {
+                free_indices.insert(w.replica_idx);
+                false
+            } else {
+                true
+            }
+        });
         let current = workers.len();
         ticks_since_spawn = ticks_since_spawn.saturating_add(1);
 
@@ -351,7 +333,6 @@ pub(crate) fn run_autoscaler_loop(
         if let Some(metrics) = dispatcher_metrics.as_ref() {
         if !metrics.worker_samples.is_empty() {
             if let Ok(mut tel) = telemetry.try_lock() {
-                let t_s = test_start.elapsed().as_secs_f64();
                 for (total, serde) in &metrics.worker_samples {
                     tel.total_us_samples
                         .entry(stage.name.clone())
@@ -362,11 +343,6 @@ pub(crate) fn run_autoscaler_loop(
                         .or_default()
                         .push(*serde);
                 }
-                tel.queue_depth_samples
-                    .entry(stage.name.clone())
-                    .or_default()
-                    .push((round3(t_s), qd as u64));
-
                 // Back-fill cold_start_ms into the pending cold_start event
                 // once the worker's first refill message has propagated back.
                 if let Some(idx) = pending_cs_event_idx {
@@ -381,11 +357,24 @@ pub(crate) fn run_autoscaler_loop(
         }
         }
 
+        // Queue-depth time series — recorded for BOTH transports every 50th
+        // tick (~50 ms). Previously this lived inside the dispatcher-metrics
+        // block above, so in-proc stages (dispatcher_metrics == None) produced
+        // an empty queue_depth block in the summary and nothing to plot.
+        if tick % 50 == 0 {
+            if let Ok(mut tel) = telemetry.try_lock() {
+                let t_s = test_start.elapsed().as_secs_f64();
+                tel.queue_depth_samples
+                    .entry(stage.name.clone())
+                    .or_default()
+                    .push((round3(t_s), qd as u64));
+            }
+        }
+
         if current > max_rep {
-            log.warn("invariant breach: current > max_rep, draining surplus", &[
-                ("current", &current.to_string()),
-                ("max_rep", &max_rep.to_string()),
-            ]);
+            warn!(log, "invariant breach: current > max_rep, draining surplus",
+                  current = current,
+                  max_rep = max_rep);
             for w in workers.iter().take(current - max_rep) {
                 w.drain_flag.store(true, Ordering::Relaxed);
             }
@@ -417,11 +406,18 @@ pub(crate) fn run_autoscaler_loop(
                 shared_instance_pre = Some(Arc::new(ip));
             }
             let instance_pre = shared_instance_pre.as_ref().unwrap();
-            log.info("cold start: spawning replica", &[
-                ("qd",      &format!("{:.0}", qd)),
-                ("max_rep", &max_rep.to_string()),
-            ]);
-            let replica_idx = workers.len();
+            info!(log, "cold start: spawning replica",
+                  qd = format!("{:.0}", qd),
+                  max_rep = max_rep);
+            let replica_idx = match free_indices.pop_first() {
+                Some(i) => i,
+                None => {
+                    // All max_rep indices are held by live or still-draining
+                    // workers; retry next tick once one is reclaimed.
+                    warn!(log, "no free replica index; deferring spawn", live = workers.len());
+                    continue;
+                }
+            };
             workers.push(spawn_worker(
                 &stage, replica_idx, &in_endpoint, &out_endpoint,
                 input_edge.for_replica(replica_idx), output_edge.for_replica(replica_idx),
@@ -461,11 +457,16 @@ pub(crate) fn run_autoscaler_loop(
                 shared_instance_pre = Some(Arc::new(ip));
             }
             let instance_pre = shared_instance_pre.as_ref().unwrap();
-            log.info("below min: spawning replica", &[
-                ("current", &current.to_string()),
-                ("min_rep", &min_rep.to_string()),
-            ]);
-            let replica_idx = workers.len();
+            info!(log, "below min: spawning replica", current = current, min_rep = min_rep);
+            let replica_idx = match free_indices.pop_first() {
+                Some(i) => i,
+                None => {
+                    // All max_rep indices are held by live or still-draining
+                    // workers; retry next tick once one is reclaimed.
+                    warn!(log, "no free replica index; deferring spawn", live = workers.len());
+                    continue;
+                }
+            };
             workers.push(spawn_worker(
                 &stage, replica_idx, &in_endpoint, &out_endpoint,
                 input_edge.for_replica(replica_idx), output_edge.for_replica(replica_idx),
@@ -497,13 +498,20 @@ pub(crate) fn run_autoscaler_loop(
                 shared_instance_pre = Some(Arc::new(ip));
             }
             let instance_pre = shared_instance_pre.as_ref().unwrap();
-            log.info("scale up", &[
-                ("qd",      &format!("{:.0}", qd)),
-                ("current", &current.to_string()),
-                ("new",     &(current + 1).to_string()),
-                ("max_rep", &max_rep.to_string()),
-            ]);
-            let replica_idx = workers.len();
+            info!(log, "scale up",
+                  qd = format!("{:.0}", qd),
+                  current = current,
+                  new = (current + 1),
+                  max_rep = max_rep);
+            let replica_idx = match free_indices.pop_first() {
+                Some(i) => i,
+                None => {
+                    // All max_rep indices are held by live or still-draining
+                    // workers; retry next tick once one is reclaimed.
+                    warn!(log, "no free replica index; deferring spawn", live = workers.len());
+                    continue;
+                }
+            };
             workers.push(spawn_worker(
                 &stage, replica_idx, &in_endpoint, &out_endpoint,
                 input_edge.for_replica(replica_idx), output_edge.for_replica(replica_idx),
@@ -532,11 +540,10 @@ pub(crate) fn run_autoscaler_loop(
                 }
             }
             if drained {
-                log.info("scale down", &[
-                    ("qd",      &format!("{:.0}", qd)),
-                    ("current", &current.to_string()),
-                    ("min_rep", &min_rep.to_string()),
-                ]);
+                info!(log, "scale down",
+                      qd = format!("{:.0}", qd),
+                      current = current,
+                      min_rep = min_rep);
                 record_event(&telemetry, test_start, &stage.name, "drain",
                              current.saturating_sub(1), None, None, None);
             }
@@ -545,10 +552,9 @@ pub(crate) fn run_autoscaler_loop(
 
         if qd > queue_up && current >= max_rep {
             if up_votes == cooldown_up_ticks.saturating_sub(1) || up_votes == 0 {
-                log.warn("SLO breach: queue depth at max replicas", &[
-                    ("qd",      &format!("{:.0}", qd)),
-                    ("max_rep", &max_rep.to_string()),
-                ]);
+                warn!(log, "SLO breach: queue depth at max replicas",
+                      qd = format!("{:.0}", qd),
+                      max_rep = max_rep);
             }
         }
     }
@@ -619,5 +625,3 @@ fn now_secs_f64() -> f64 {
         .unwrap()
         .as_secs_f64()
 }
-
-fn round3(x: f64) -> f64 { (x * 1000.0).round() / 1000.0 }

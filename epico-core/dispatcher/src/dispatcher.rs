@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use epico_logger::Logger;
+use epico_logger::{info, warn};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -197,16 +198,15 @@ fn main() {
             .expect("bind ctrl ipc");
     }
 
-    log.info("ready", &[
-        ("frontend",        &frontend_bound),
-        ("pull_port",       &args.pull_port.to_string()),
-        ("ctrl_port",       &args.ctrl_port.to_string()),
-        ("ipc",             &args.enable_ipc.to_string()),
-        ("poll_timeout_ms", &args.poll_timeout_ms.to_string()),
-        ("dispatch_batch",  &args.dispatch_batch.to_string()),
-        ("credit_window",   &args.credit_window.to_string()),
-        ("batch_events",    &args.batch_events.to_string()),
-    ]);
+    info!(log, "ready",
+          frontend = frontend_bound,
+          pull_port = args.pull_port,
+          ctrl_port = args.ctrl_port,
+          ipc = args.enable_ipc,
+          poll_timeout_ms = args.poll_timeout_ms,
+          dispatch_batch = args.dispatch_batch,
+          credit_window = args.credit_window,
+          batch_events = args.batch_events);
 
     // ── Shutdown flag ─────────────────────────────────────────────────────────
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -230,10 +230,9 @@ fn main() {
     // ── Main loop ─────────────────────────────────────────────────────────────
     loop {
         if shutdown.load(Ordering::Relaxed) {
-            log.info("shutting down", &[
-                ("events_buffered", &event_buffer.len().to_string()),
-                ("workers_active",  &workers.len().to_string()),
-            ]);
+            info!(log, "shutting down",
+                  events_buffered = event_buffer.len(),
+                  workers_active = workers.len());
             break;
         }
 
@@ -298,10 +297,9 @@ fn main() {
                 });
 
                 if is_new {
-                    log.info("worker connected", &[
-                        ("rid",    &String::from_utf8_lossy(&identity).to_string()),
-                        ("active", &(worker_count + 1).to_string()),
-                    ]);
+                    info!(log, "worker connected",
+                          rid = String::from_utf8_lossy(&identity),
+                          active = (worker_count + 1));
                     wake_logged = false;
                 }
 
@@ -368,9 +366,7 @@ fn main() {
 
         // Scale-from-zero visibility: log once per "dry spell"
         if !event_buffer.is_empty() && workers.is_empty() && !wake_logged {
-            log.warn("events queued but no workers yet", &[
-                ("queue_depth", &event_buffer.len().to_string()),
-            ]);
+            warn!(log, "events queued but no workers yet", queue_depth = event_buffer.len());
             wake_logged = true;
         }
     }
@@ -498,10 +494,9 @@ fn drain_dispatch(
                 // another worker. It was already removed from ready_workers
                 // (we popped it), so no stale entries remain.
                 workers.remove(&worker_id);
-                log.warn("worker gone", &[
-                    ("rid",    &String::from_utf8_lossy(&worker_id).to_string()),
-                    ("active", &workers.len().to_string()),
-                ]);
+                warn!(log, "worker gone",
+                      rid = String::from_utf8_lossy(&worker_id),
+                      active = workers.len());
             }
             Err(_) => {
                 // Transient error — return worker to the front, leave events,

@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 use epico_logger::Logger;
+use epico_logger::{error, info};
 
 use crate::config::DispatcherConfig;
 
@@ -27,7 +28,7 @@ pub(crate) fn spawn_dispatchers(
     dispatcher_bin: &Path,
     log: &Logger,
 ) {
-    log.info("dispatcher binary", &[("path", &dispatcher_bin.display().to_string())]);
+    info!(log, "dispatcher binary", path = dispatcher_bin.display());
 
     let mut children = CHILDREN.lock().unwrap();
     for d in dispatchers.iter().rev() {
@@ -39,14 +40,11 @@ pub(crate) fn spawn_dispatchers(
         let push_port = d.push_port;
         let push_uri  = d.push_uri.as_deref();
         if push_uri.is_none() && push_port.is_none() {
-            log.error(
-                "dispatcher missing both push_port and push_uri",
-                &[("name", &d.name)],
-            );
+            error!(log, "dispatcher missing both push_port and push_uri", name = d.name);
             std::process::exit(1);
         }
         let pull = d.pull_port.unwrap_or_else(|| {
-            log.error("dispatcher missing pull_port", &[("name", &d.name)]);
+            error!(log, "dispatcher missing pull_port", name = d.name);
             std::process::exit(1);
         });
         let ctrl = d.ctrl_port;
@@ -89,10 +87,7 @@ pub(crate) fn spawn_dispatchers(
         cmd.arg("--batch-events").arg(d.batch_events.to_string());
 
         let child = cmd.spawn().unwrap_or_else(|e| {
-            log.error("failed to spawn dispatcher", &[
-                ("name", &d.name),
-                ("err",  &e.to_string()),
-            ]);
+            error!(log, "failed to spawn dispatcher", name = d.name, err = e);
             std::process::exit(1);
         });
 
@@ -105,7 +100,7 @@ pub(crate) fn spawn_dispatchers(
 
 pub(crate) fn kill_children(log: &Logger) {
     let mut children = CHILDREN.lock().unwrap();
-    log.info("killing dispatcher children", &[("count", &children.len().to_string())]);
+    info!(log, "killing dispatcher children", count = children.len());
     for child in children.iter_mut() {
         let _ = child.kill();
     }

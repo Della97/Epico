@@ -17,6 +17,7 @@ use wasmtime_wasi::{ResourceTable, WasiCtxBuilder};
 use wasmtime_wasi_http::WasiHttpCtx;
 
 use epico_logger::Logger;
+use epico_logger::{debug, error, info, warn};
 
 use crate::config::PipelineStage;
 use crate::conversion::{extract_record_fields, extract_result_event_fields};
@@ -32,6 +33,11 @@ pub(crate) struct WorkerHandle {
     _handle:    std::thread::JoinHandle<()>,
     pub drain_flag: Arc<AtomicBool>,
     pub done:       Arc<AtomicBool>,
+    /// Mesh column / hop-label index owned by this worker for its whole life.
+    /// The autoscaler reclaims it into its free-list only after `done` is set,
+    /// so two live workers can never share an index — required by the SPSC
+    /// mesh contract (one consumer per ring) and by per-replica telemetry.
+    pub replica_idx: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -77,7 +83,7 @@ pub(crate) fn spawn_worker(
         done_clone.store(true, Ordering::Relaxed);
     });
 
-    WorkerHandle { _handle: handle, drain_flag, done }
+    WorkerHandle { _handle: handle, drain_flag, done, replica_idx }
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +216,16 @@ fn run_wasm_worker(
     // label for the new per_replica summary block.
     let hop_label = format!("{}#{}", stage.name, replica_idx);
 
+    // Output sends must never abort: an event that reaches the output side has
+    // already been consumed from the input, so dropping it because OUR drain
+    // flag happened to be raised while the downstream edge was momentarily
+    // full would leak it. Blocking here cannot wedge shutdown — worker threads
+    // die with the process, and a blocked mesh push registers in the edge's
+    // occupancy signal so the downstream autoscaler respawns a consumer.
+    let never_drain = AtomicBool::new(false);
+    // EOS deferred behind in-proc residue (see the is_eos handling below).
+    let mut eos_pending: Option<Bytes> = None;
+
     // Native-bypass experiment mode (`EPICO_NATIVE_STAGE`):
     //   "passthrough" — forward the input bytes untouched: no JSON parse, no
     //                   hop append. Measures transport + recv/push plumbing
@@ -226,14 +242,14 @@ fn run_wasm_worker(
             Some("passthrough") => Some("passthrough"),
             Some("serde")       => Some("serde"),
             Some(other) => {
-                log.warn("unknown EPICO_NATIVE_STAGE value; running normal wasm path",
-                         &[("value", other)]);
+                warn!(log, "unknown EPICO_NATIVE_STAGE value; running normal wasm path",
+                      value = other);
                 None
             }
             None => None,
         };
     if let Some(m) = native_mode {
-        log.info("NATIVE BYPASS ACTIVE — wasm is not being called", &[("mode", m)]);
+        info!(log, "NATIVE BYPASS ACTIVE — wasm is not being called", mode = m);
     }
 
     // First wall-clock read in this worker thread. Used to bound the gap
@@ -277,7 +293,7 @@ fn run_wasm_worker(
 
     if output_edge.is_none() {
         if let Err(e) = pusher.connect(&out_endpoint) {
-            log.error("PUSH connect failed", &[("addr", &out_endpoint), ("err", &e.to_string())]);
+            error!(log, "PUSH connect failed", addr = out_endpoint, err = e);
             return;
         }
     }
@@ -285,7 +301,7 @@ fn run_wasm_worker(
 
     if input_edge.is_none() {
         if let Err(e) = dealer.connect(&in_endpoint) {
-            log.error("DEALER connect failed", &[("addr", &in_endpoint), ("err", &e.to_string())]);
+            error!(log, "DEALER connect failed", addr = in_endpoint, err = e);
             return;
         }
     }
@@ -310,7 +326,7 @@ fn run_wasm_worker(
     let instance = match instance_pre.instantiate(&mut store) {
         Ok(i)  => i,
         Err(e) => {
-            log.error("component instantiation failed", &[("err", &e.to_string())]);
+            error!(log, "component instantiation failed", err = e);
             return;
         }
     };
@@ -339,14 +355,14 @@ fn run_wasm_worker(
     let process_fn = match process_fn_opt {
         Some(f) => f,
         None    => {
-            log.error("no process-event export found", &[("stage", &stage.name)]);
+            error!(log, "no process-event export found", stage = stage.name);
             return;
         }
     };
     let func_ty = match func_ty_opt {
         Some(t) => t,
         None    => {
-            log.error("could not introspect process-event type", &[("stage", &stage.name)]);
+            error!(log, "could not introspect process-event type", stage = stage.name);
             return;
         }
     };
@@ -355,11 +371,10 @@ fn run_wasm_worker(
     let result_types: Vec<Type> = func_ty.results().collect();
 
     if param_types.len() < 2 {
-        log.error("process-event has wrong param count", &[
-            ("stage",    &stage.name),
-            ("expected", "2"),
-            ("got",      &param_types.len().to_string()),
-        ]);
+        error!(log, "process-event has wrong param count",
+              stage = stage.name,
+              expected = "2",
+              got = param_types.len());
         return;
     }
 
@@ -371,7 +386,7 @@ fn run_wasm_worker(
     let envelope_format = match EnvelopeFormat::parse(&event_format) {
         Ok(f) => f,
         Err(e) => {
-            log.error("bad event_format", &[("err", &e.to_string())]);
+            error!(log, "bad event_format", err = e);
             return;
         }
     };
@@ -386,7 +401,7 @@ fn run_wasm_worker(
         envelope_format
     };
     if out_format == crate::envelope::EnvelopeFormat::Binary {
-        log.info("binary edges active: stage output uses binary envelope", &[]);
+        info!(log, "binary edges active: stage output uses binary envelope");
     }
 
     // Typed fast path: if the generated agent registered concrete types for
@@ -397,13 +412,13 @@ fn run_wasm_worker(
         match crate::typed::lookup(&stage.name) {
             Some(d) => match d.prepare(&mut store, process_fn) {
                 Ok(p) => {
-                    log.info("TYPED DISPATCH ACTIVE — Val layer bypassed",
-                             &[("stage", &stage.name)]);
+                    info!(log, "TYPED DISPATCH ACTIVE — Val layer bypassed", stage = stage.name);
                     Some(p)
                 }
                 Err(e) => {
-                    log.warn("typed dispatch prepare failed; using dynamic path",
-                             &[("stage", &stage.name), ("err", &e.to_string())]);
+                    warn!(log, "typed dispatch prepare failed; using dynamic path",
+                          stage = stage.name,
+                          err = e);
                     None
                 }
             },
@@ -444,24 +459,38 @@ fn run_wasm_worker(
     let phase_export_ms          = t_export_lookup_ms      - t_instantiate_ms;
     let phase_tail_ms            = boot_ms                 - t_export_lookup_ms;
 
-    log.info("worker booted", &[
-        ("rid",                  &rid_str[..8]),
-        ("boot_ms",              &format!("{:.3}", boot_ms)),
-        ("cold_start_ms",        &format!("{:.3}", cold_start_ms)),
-        ("spawn_to_thread_ms",   &format!("{:.3}", spawn_to_thread_ms)),
-        ("ph_ctx_ms",            &format!("{:.3}", phase_ctx_ms)),
-        ("ph_push_socket_ms",    &format!("{:.3}", phase_push_socket_ms)),
-        ("ph_push_setopt_ms",    &format!("{:.3}", phase_push_setopt_ms)),
-        ("ph_dealer_socket_ms",  &format!("{:.3}", phase_dealer_socket_ms)),
-        ("ph_dealer_setopt_ms",  &format!("{:.3}", phase_dealer_setopt_ms)),
-        ("ph_pusher_connect_ms", &format!("{:.3}", phase_pusher_connect_ms)),
-        ("ph_dealer_connect_ms", &format!("{:.3}", phase_dealer_connect_ms)),
-        ("ph_pre_inst_ms",       &format!("{:.3}", phase_pre_inst_ms)),
-        ("ph_instantiate_ms",    &format!("{:.3}", phase_instantiate_ms)),
-        ("ph_export_ms",         &format!("{:.3}", phase_export_ms)),
-        ("ph_tail_ms",           &format!("{:.3}", phase_tail_ms)),
-        ("credit_window",        &credit_window.to_string()),
-    ]);
+    // Human view: one readable line with the cold-start decomposition grouped
+    // into its four meaningful phases. Full ph_* granularity goes to a debug
+    // record below — hidden from stderr by default (EPICO_LOG=debug shows it)
+    // but ALWAYS present in the JSONL, so nothing is lost for analysis.
+    info!(log, "worker booted",
+          replica = replica_idx,
+          rid = &rid_str[..8],
+          cold_start_ms = format!("{:.3}", cold_start_ms),
+          spawn_ms = format!("{:.3}", spawn_to_thread_ms),
+          sockets_ms = format!("{:.3}",
+              phase_ctx_ms + phase_push_socket_ms + phase_push_setopt_ms
+              + phase_dealer_socket_ms + phase_dealer_setopt_ms
+              + phase_pusher_connect_ms + phase_dealer_connect_ms),
+          instantiate_ms = format!("{:.3}", phase_pre_inst_ms + phase_instantiate_ms),
+          export_ms = format!("{:.3}", phase_export_ms + phase_tail_ms),
+          credit_window = credit_window);
+    debug!(log, "worker boot phases",
+          rid = &rid_str[..8],
+          boot_ms = format!("{:.3}", boot_ms),
+          cold_start_ms = format!("{:.3}", cold_start_ms),
+          spawn_to_thread_ms = format!("{:.3}", spawn_to_thread_ms),
+          ph_ctx_ms = format!("{:.3}", phase_ctx_ms),
+          ph_push_socket_ms = format!("{:.3}", phase_push_socket_ms),
+          ph_push_setopt_ms = format!("{:.3}", phase_push_setopt_ms),
+          ph_dealer_socket_ms = format!("{:.3}", phase_dealer_socket_ms),
+          ph_dealer_setopt_ms = format!("{:.3}", phase_dealer_setopt_ms),
+          ph_pusher_connect_ms = format!("{:.3}", phase_pusher_connect_ms),
+          ph_dealer_connect_ms = format!("{:.3}", phase_dealer_connect_ms),
+          ph_pre_inst_ms = format!("{:.3}", phase_pre_inst_ms),
+          ph_instantiate_ms = format!("{:.3}", phase_instantiate_ms),
+          ph_export_ms = format!("{:.3}", phase_export_ms),
+          ph_tail_ms = format!("{:.3}", phase_tail_ms));
 
     // Initial credit grant. The dispatcher reads `n_credits` and
     // populates this worker's credit balance accordingly.
@@ -544,13 +573,19 @@ fn run_wasm_worker(
             let is_eos = event_bytes.len() >= EOS_PAT.len()
                 && event_bytes.windows(EOS_PAT.len()).any(|w| w == EOS_PAT);
             if is_eos {
-                log.info("EOS received (passthrough); forwarding and exiting",
-                         &[("stage", &stage.name)]);
-                worker_output.send(event_owned.clone(), &drain_flag);
+                if !worker_input.wants_credits() {
+                    // Same residue-ordering rule as the main EOS path below.
+                    eos_pending = Some(event_owned.clone());
+                    drain_flag.store(true, Ordering::Relaxed);
+                    continue;
+                }
+                info!(log, "EOS received (passthrough); forwarding and exiting",
+                      stage = stage.name);
+                worker_output.send(event_owned.clone(), &never_drain);
                 worker_input.send_control(b"");
                 break;
             }
-            worker_output.send(event_owned.clone(), &drain_flag);
+            worker_output.send(event_owned.clone(), &never_drain);
             invocation_count += 1;
             processed_since_refill += 1;
             if worker_input.wants_credits() && processed_since_refill >= refill_threshold {
@@ -577,7 +612,7 @@ fn run_wasm_worker(
         let envelope = match EventEnvelope::decode(envelope_format, event_owned.clone()) {
             Ok(v)  => v,
             Err(e) => {
-                log.warn("bad event envelope from dispatcher", &[("err", &e.to_string())]);
+                warn!(log, "bad event envelope from dispatcher", err = e);
                 worker_input.send_control(b"");
                 continue;
             }
@@ -585,10 +620,21 @@ fn run_wasm_worker(
         serde_ns += parse_t0.elapsed().as_nanos() as u64;
 
         if envelope.is_eos() {
-            log.info("EOS received; forwarding and exiting", &[
-                ("stage", &stage.name),
-            ]);
-            worker_output.send(event_owned.clone(), &drain_flag);
+            if !worker_input.wants_credits() {
+                // In-proc input: residue for THIS worker may still sit behind
+                // the EOS (a mesh column holds n_prod rings — EOS is last only
+                // within ONE producer's ring; the shared MPMC ring can hold
+                // events popped-later too). Forwarding EOS now would let it
+                // overtake that residue and shut the collector down early.
+                // Defer: raise our own drain flag — pop hands out the residue
+                // until the input is empty — and send EOS at loop exit.
+                info!(log, "EOS received; draining in-proc residue first", stage = stage.name);
+                eos_pending = Some(event_owned.clone());
+                drain_flag.store(true, Ordering::Relaxed);
+                continue;
+            }
+            info!(log, "EOS received; forwarding and exiting", stage = stage.name);
+            worker_output.send(event_owned.clone(), &never_drain);
             worker_input.send_control(b"");
             break;
         }
@@ -605,13 +651,13 @@ fn run_wasm_worker(
             let out = match envelope.encode_identity(&hop_label, enter_ts, exit_ts) {
                 Ok(b) => b,
                 Err(e) => {
-                    log.error("identity encode failed", &[("err", &e.to_string())]);
+                    error!(log, "identity encode failed", err = e);
                     worker_input.send_control(b"");
                     continue;
                 }
             };
             serde_ns += ser_t0.elapsed().as_nanos() as u64;
-            worker_output.send(out, &drain_flag);
+            worker_output.send(out, &never_drain);
             invocation_count += 1;
             processed_since_refill += 1;
             if worker_input.wants_credits() && processed_since_refill >= refill_threshold {
@@ -637,7 +683,7 @@ fn run_wasm_worker(
                     let latency_us = ((exit_ts - enter_ts) * 1e6).max(0.0) as u64;
                     let prev_us = avg_latency_us.load(Ordering::Relaxed);
                     avg_latency_us.store((prev_us * 3 + latency_us) / 4, Ordering::Relaxed);
-                    worker_output.send(out_bytes, &drain_flag);
+                    worker_output.send(out_bytes, &never_drain);
                     invocation_count += 1;
                     processed_since_refill += 1;
                     if worker_input.wants_credits()
@@ -656,7 +702,7 @@ fn run_wasm_worker(
                     }
                 }
                 Err(e) => {
-                    log.error("typed call failed", &[("err", &e.to_string())]);
+                    error!(log, "typed call failed", err = e);
                     worker_input.send_control(b"");
                 }
             }
@@ -666,7 +712,7 @@ fn run_wasm_worker(
         let ev_val = match envelope.input_val(&in_fields, &param_types[0]) {
             Ok(v) => v,
             Err(e) => {
-                log.error("event decode failed", &[("err", &e.to_string())]);
+                error!(log, "event decode failed", err = e);
                 worker_input.send_control(b"");
                 continue;
             }
@@ -674,7 +720,7 @@ fn run_wasm_worker(
         let bench_val = match envelope.bench_val(&param_types[1]) {
             Ok(v) => v,
             Err(e) => {
-                log.error("bench decode failed", &[("err", &e.to_string())]);
+                error!(log, "bench decode failed", err = e);
                 worker_input.send_control(b"");
                 continue;
             }
@@ -694,7 +740,7 @@ fn run_wasm_worker(
         let call_result = process_fn.call(&mut store, &[ev_val, bench_val], &mut results);
 
         if let Err(e) = call_result {
-            log.error("process-event call error", &[("err", &e.to_string())]);
+            error!(log, "process-event call error", err = e);
             worker_input.send_control(b"");
             // NOTE: no post_return here — it is only legal after a SUCCESSFUL
             // call; invoking it after a failed one panics inside wasmtime
@@ -752,7 +798,7 @@ fn run_wasm_worker(
             ) {
                 Ok(bytes) => bytes,
                 Err(e) => {
-                    log.error("event encode failed", &[("err", &e.to_string())]);
+                    error!(log, "event encode failed", err = e);
                     worker_input.send_control(b"");
                     let _ = process_fn.post_return(&mut store);
                     continue;
@@ -767,7 +813,7 @@ fn run_wasm_worker(
         let _ = process_fn.post_return(&mut store);
 
         if !final_bytes.is_empty() {
-            worker_output.send(final_bytes, &drain_flag);
+            worker_output.send(final_bytes, &never_drain);
         }
 
         let total_ns = total_t0.elapsed().as_nanos() as u64;
@@ -824,10 +870,15 @@ fn run_wasm_worker(
         }
     }
 
-    log.info("worker drained", &[
-        ("rid",         &rid_str[..8]),
-        ("invocations", &invocation_count.to_string()),
-    ]);
+    // Deferred EOS: the in-proc residue is fully processed (pop returned
+    // None with drain raised), so EOS is now genuinely last from this worker.
+    if let Some(eos) = eos_pending {
+        info!(log, "residue drained; forwarding EOS", stage = stage.name);
+        worker_output.send(eos, &never_drain);
+        worker_input.send_control(b"");
+    }
+
+    info!(log, "worker drained", rid = &rid_str[..8], invocations = invocation_count);
 }
 
 fn now_secs_f64() -> f64 {

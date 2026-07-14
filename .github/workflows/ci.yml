@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: check + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The zmq crate links against the system libzmq via pkg-config.
+      - name: Install libzmq
+        run: sudo apt-get update && sudo apt-get install -y libzmq3-dev pkg-config
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      # Caches ~/.cargo and target/ keyed on Cargo.toml/lock hashes; wasmtime
+      # is the heavy dependency, so this cuts warm CI runs from ~10 min to ~2.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo check (all targets)
+        run: cargo check --workspace --all-targets
+
+      - name: cargo test
+        run: cargo test --workspace

@@ -15,6 +15,12 @@ bench/results/
 # Deprecated code
 /deprecated/
 
+# Temp plot folder
+/plots/
+
+# Local review TODOs (not tracked)
+/TODOs/
+
 # Pub folder
 /publications/
 
@@ -26,7 +32,6 @@ bench/results/
 
 # Rust build artifacts
 **/*.rs.bk
-Cargo.lock
 
 # Logs and runtime output
 **/*.jsonl

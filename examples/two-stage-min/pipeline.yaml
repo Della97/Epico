@@ -32,7 +32,7 @@ types:
 source:
   kind: loadgen
   profile: tp
-  count: 500000
+  count: 100000
   sensors: 100
   blast: true
 
@@ -70,7 +70,7 @@ deploy:
   # Replace the ZMQ ingress dispatcher with a direct source→edge pump and
   # drain the collector from the last stage's edge in-process. Zero sockets
   # in the data path on a single host.
-  ingress_mode: inprocess
+  #ingress_mode: inprocess
 
   # SPSC mesh for the relay→forward interior hop. One lock-free ring per
   # producer/consumer pair; no shared state between concurrent replicas.

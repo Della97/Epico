@@ -9,6 +9,10 @@
 //!             accepts them, then emit an EOS marker. No duration target,
 //!             no token bucket, no per-tick sleeping. Used for measuring
 //!             peak end-to-end throughput.
+//!   pulse   — --count events in bursts of --pulse-events with --pulse-idle-s
+//!             of silence between bursts, then EOS. Blocking sends, so the
+//!             sent count is exact. Used for event-conservation tests across
+//!             scale-up/scale-down cycles.
 //!
 //! # End-of-stream (EOS)
 //!
@@ -29,6 +33,7 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use epico_logger::Logger;
+use epico_logger::{error, info};
 use rand::Rng;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -97,6 +102,16 @@ struct Args {
     /// (wave profile) Period of the sine in seconds.
     #[arg(long, default_value_t = 60)]
     wave_period: u64,
+
+    /// (pulse profile) Events per burst. `--count` events total are sent in
+    /// bursts of this size with `--pulse-idle-s` of silence between them.
+    #[arg(long, default_value_t = 20_000)]
+    pulse_events: u64,
+    /// (pulse profile) Idle seconds between bursts. Choose this longer than
+    /// the stages' cooldown_down_s so replicas drain to min between bursts —
+    /// each burst then re-exercises scale-up from (near) zero.
+    #[arg(long, default_value_t = 5.0)]
+    pulse_idle_s: f64,
 
     /// Force entry to be ipc/tcp regardless of config. For benchmarking.
     #[arg(long)]
@@ -392,6 +407,8 @@ fn profile_description(args: &Args) -> String {
         "wave"  => format!("wave {}–{} ev/s period {}s", args.wave_min, args.rate, args.wave_period),
         "tp"    => format!("throughput-max ({} events as fast as possible, then EOS)",
                            args.count),
+        "pulse" => format!("pulse ({} events in bursts of {}, {}s idle between, then EOS)",
+                           args.count, args.pulse_events, args.pulse_idle_s),
         _       => format!("steady {} ev/s", args.rate),
     }
 }
@@ -424,26 +441,34 @@ fn main() -> Result<()> {
         },
     };
 
-    log.info("configuration", &[
-        ("config",    &args.config),
-        ("profile",   &profile_description(&args)),
-        ("rate",      &args.rate.to_string()),
-        ("duration",  &args.duration.to_string()),
-        ("count",     &args.count.to_string()),
-        ("sensors",   &args.sensors.to_string()),
-        ("entry_addr",&addr),
-        ("stages",    &pipeline.len().to_string()),
-        ("format",    if wire_format == WireFormat::Binary { "binary" } else { "json" }),
-    ]);
+    info!(log, "configuration",
+          config = args.config,
+          profile = profile_description(&args),
+          rate = args.rate,
+          duration = args.duration,
+          count = args.count,
+          sensors = args.sensors,
+          entry_addr = addr,
+          stages = pipeline.len(),
+          format = if wire_format == WireFormat::Binary { "binary" } else { "json" });
 
     // ── ZMQ PUSH ──────────────────────────────────────────────────────────────
     let ctx  = zmq::Context::new();
     let push = ctx.socket(zmq::PUSH).context("creating PUSH socket")?;
     push.set_sndhwm(100_000).ok();
-    push.set_linger(0).ok();
+    // LINGER: how long context teardown waits to deliver queued messages.
+    // This must NOT be 0: `send()` returning only means the message entered
+    // zmq's local queue. When the producer outruns the pipeline (tp --blast),
+    // up to SNDHWM messages plus the EOS marker are still queued at exit, and
+    // linger=0 silently discards them — measured as a deterministic ~50k-event
+    // shortfall at the collector and a run that never sees EOS (the agent then
+    // sits until the CLI's EPICO_EOS_DRAIN_SECS SIGINT). A bounded linger
+    // blocks exit until the queue drains, with a cap so a dead consumer can't
+    // hang the loadgen forever.
+    push.set_linger(120_000).ok();
     push.connect(&addr).with_context(|| format!("connecting to {addr}"))?;
 
-    log.info("producer connected", &[("addr", &addr)]);
+    info!(log, "producer connected", addr = addr);
 
     let sent      = Arc::new(AtomicU64::new(0));
     let dropped   = Arc::new(AtomicU64::new(0));
@@ -481,6 +506,8 @@ fn main() -> Result<()> {
     let args_wave_period  = args.wave_period;
     let args_blast        = args.blast;
     let args_format       = wire_format;
+    let args_pulse_events = args.pulse_events;
+    let args_pulse_idle_s = args.pulse_idle_s;
 
     let producer = std::thread::spawn(move || {
         if args_profile == "tp" {
@@ -495,7 +522,7 @@ fn main() -> Result<()> {
             // the floor. The throughput we measure at the collector is then the
             // true sustained capacity of the pipeline, not the loadgen's
             // unbounded transmit rate.
-            log_prod.info("tp mode: starting", &[("count", &tp_count.to_string())]);
+            info!(log_prod, "tp mode: starting", count = tp_count);
             let mut si  = 0usize;
             let mut seq = 0u64;
             let mut sent_n = 0u64;
@@ -510,10 +537,9 @@ fn main() -> Result<()> {
                 // test. bench_ts is frozen at build time, so DO NOT read e2e
                 // latency from a --blast run.
                 let (cached, _) = sensors[0].reading(0, args_format);
-                log_prod.info("tp blast mode (cached event, latency invalid)", &[
-                    ("bytes", &cached.len().to_string()),
-                    ("count", &tp_count.to_string()),
-                ]);
+                info!(log_prod, "tp blast mode (cached event, latency invalid)",
+                      bytes = cached.len(),
+                      count = tp_count);
                 while running_c.load(Ordering::Relaxed) && sent_n < tp_count {
                     match push.send(&cached as &[u8], 0) {
                         Ok(_)  => sent_n += 1,
@@ -546,18 +572,81 @@ fn main() -> Result<()> {
             // include the actual N in the marker for diagnostics.
             let eos = eos_payload(sent_n, tp_count);
             match push.send(&eos as &[u8], 0) {
-                Ok(_) => log_prod.info("EOS sent", &[
-                    ("loadgen_sent", &sent_n.to_string()),
-                    ("expected",     &tp_count.to_string()),
-                ]),
-                Err(e) => log_prod.error("EOS send failed", &[("err", &e.to_string())]),
+                Ok(_) => info!(log_prod, "EOS sent", loadgen_sent = sent_n, expected = tp_count),
+                Err(e) => error!(log_prod, "EOS send failed", err = e),
             }
             running_c.store(false, Ordering::Relaxed);
-            log_prod.info("producer finished (tp)", &[
-                ("sent",     &sent_n.to_string()),
-                ("dropped",  &dropped_c.load(Ordering::Relaxed).to_string()),
-                ("anomalies",&anom_n.to_string()),
-            ]);
+            info!(log_prod, "producer finished (tp)",
+                  sent = sent_n,
+                  dropped = dropped_c.load(Ordering::Relaxed),
+                  anomalies = anom_n);
+            return;
+        }
+
+        if args_profile == "pulse" {
+            // ── Pulse mode (event-conservation testing) ──────────────────────
+            // `--count` events total, sent in bursts of `--pulse-events` with
+            // `--pulse-idle-s` of silence between bursts, then the EOS marker
+            // carrying the exact sent count. Sends are BLOCKING (like tp):
+            // backpressure slows the producer instead of dropping, so
+            // `loadgen_sent` is exact — the property a no-leak test needs.
+            // With idle gaps longer than the stages' cooldown_down_s, every
+            // burst re-triggers scale-up and every gap triggers scale-down,
+            // so one run exercises repeated 0→N→0 replica cycles while the
+            // event count stays exactly known.
+            info!(log_prod, "pulse mode: starting",
+                  count = tp_count,
+                  pulse_events = args_pulse_events,
+                  pulse_idle_s = args_pulse_idle_s);
+            let burst_size = args_pulse_events.max(1);
+            let idle       = Duration::from_secs_f64(args_pulse_idle_s.max(0.0));
+            let mut si  = 0usize;
+            let mut seq = 0u64;
+            let mut sent_n = 0u64;
+            let mut anom_n = 0u64;
+            let mut burst_n = 0u64;
+
+            'pulses: while running_c.load(Ordering::Relaxed) && sent_n < tp_count {
+                let burst_end = (sent_n + burst_size).min(tp_count);
+                while sent_n < burst_end {
+                    if !running_c.load(Ordering::Relaxed) { break 'pulses; }
+                    let sensor = &mut sensors[si % n_sensors];
+                    si += 1;
+                    let (bytes, is_anom) = sensor.reading(seq, args_format);
+                    seq += 1;
+                    match push.send(&bytes as &[u8], 0) {
+                        Ok(_)  => {
+                            sent_n += 1;
+                            if is_anom { anom_n += 1; }
+                        }
+                        Err(_) => { dropped_c.fetch_add(1, Ordering::Relaxed); }
+                    }
+                }
+                burst_n += 1;
+                info!(log_prod, "pulse burst complete", burst = burst_n, sent = sent_n);
+                if sent_n < tp_count {
+                    // Interruptible idle so Ctrl+C doesn't hang a gap.
+                    let t0 = Instant::now();
+                    while t0.elapsed() < idle {
+                        if !running_c.load(Ordering::Relaxed) { break 'pulses; }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+            sent_c.fetch_add(sent_n, Ordering::Relaxed);
+            anom_c.fetch_add(anom_n, Ordering::Relaxed);
+
+            // EOS marker with the exact count, blocking send (same as tp).
+            let eos = eos_payload(sent_n, tp_count);
+            match push.send(&eos as &[u8], 0) {
+                Ok(_) => info!(log_prod, "EOS sent", loadgen_sent = sent_n, expected = tp_count),
+                Err(e) => error!(log_prod, "EOS send failed", err = e),
+            }
+            running_c.store(false, Ordering::Relaxed);
+            info!(log_prod, "producer finished (pulse)",
+                  sent = sent_n,
+                  bursts = burst_n,
+                  dropped = dropped_c.load(Ordering::Relaxed));
             return;
         }
 
@@ -612,11 +701,10 @@ fn main() -> Result<()> {
             std::thread::sleep(TICK);
         }
         running_c.store(false, Ordering::Relaxed);
-        log_prod.info("producer finished", &[
-            ("sent",     &sent_c.load(Ordering::Relaxed).to_string()),
-            ("dropped",  &dropped_c.load(Ordering::Relaxed).to_string()),
-            ("anomalies",&anom_c.load(Ordering::Relaxed).to_string()),
-        ]);
+        info!(log_prod, "producer finished",
+              sent = sent_c.load(Ordering::Relaxed),
+              dropped = dropped_c.load(Ordering::Relaxed),
+              anomalies = anom_c.load(Ordering::Relaxed));
     });
 
     // ── Progress loop ─────────────────────────────────────────────────────────
@@ -626,21 +714,19 @@ fn main() -> Result<()> {
     while running.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(500));
         if last_print.elapsed() >= Duration::from_secs(2) {
-            log_progress.info("progress", &[
-                ("sent",     &sent.load(Ordering::Relaxed).to_string()),
-                ("dropped",  &dropped.load(Ordering::Relaxed).to_string()),
-                ("anomalies",&anomalies.load(Ordering::Relaxed).to_string()),
-            ]);
+            info!(log_progress, "progress",
+                  sent = sent.load(Ordering::Relaxed),
+                  dropped = dropped.load(Ordering::Relaxed),
+                  anomalies = anomalies.load(Ordering::Relaxed));
             last_print = Instant::now();
         }
     }
 
     let _ = producer.join();
-    log.info("exiting", &[
-        ("total_sent",      &sent.load(Ordering::Relaxed).to_string()),
-        ("total_dropped",   &dropped.load(Ordering::Relaxed).to_string()),
-        ("total_anomalies", &anomalies.load(Ordering::Relaxed).to_string()),
-    ]);
+    info!(log, "exiting",
+          total_sent = sent.load(Ordering::Relaxed),
+          total_dropped = dropped.load(Ordering::Relaxed),
+          total_anomalies = anomalies.load(Ordering::Relaxed));
 
     Ok(())
 }

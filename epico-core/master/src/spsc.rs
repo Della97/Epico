@@ -49,6 +49,14 @@ pub struct Swsr {
     size: usize,
     pwrite: CachePad<UnsafeCell<usize>>, // producer-owned
     pread: CachePad<UnsafeCell<usize>>,  // consumer-owned
+    /// True while the producer is inside a push attempt on this ring. Half of
+    /// the column-close handshake (Dekker pattern with `SpscMesh::closed`):
+    /// the producer sets `busy`, THEN checks `closed`; the closing consumer
+    /// sets `closed`, THEN waits for `!busy` before draining the residue. So a
+    /// push that started before the close is fully visible to the drain, and a
+    /// push that starts after sees `closed` and skips the column. Both sides'
+    /// stores/loads are SeqCst so they cannot reorder past each other.
+    busy: CachePad<AtomicBool>,
 }
 
 // The per-slot state byte provides all cross-thread ordering; the indices are
@@ -72,6 +80,7 @@ impl Swsr {
             size,
             pwrite: CachePad(UnsafeCell::new(0)),
             pread: CachePad(UnsafeCell::new(0)),
+            busy: CachePad(AtomicBool::new(false)),
         }
     }
 
@@ -146,6 +155,19 @@ pub struct SpscMesh {
     rings: Box<[Swsr]>,
     prod_cursor: Box<[CachePad<UnsafeCell<usize>>]>, // per producer: next consumer to try
     cons_cursor: Box<[CachePad<UnsafeCell<usize>>]>, // per consumer: next producer to poll
+    /// Per-consumer close flag. A closed column is skipped by `push`, so a
+    /// draining consumer can empty its residue and be sure nothing new lands
+    /// behind it. Without this, a drained consumer stranded up to
+    /// n_prod × ring_cap events forever (producers kept round-robining into
+    /// its rings until full) — measured as exactly 2048 = 4 × 512 leaked
+    /// events in the scale-down conservation test.
+    closed: Box<[AtomicBool]>,
+    /// Producers currently blocked in `MeshTx::push` backoff. Counted into
+    /// `len()` so the consumer stage's autoscaler still sees demand when every
+    /// column is closed AND empty — otherwise ring occupancy reads 0, no
+    /// consumer is ever respawned to reopen a column, and the blocked
+    /// producer deadlocks.
+    waiting: std::sync::atomic::AtomicUsize,
 }
 
 unsafe impl Send for SpscMesh {}
@@ -166,20 +188,19 @@ impl SpscMesh {
             .map(|_| CachePad(UnsafeCell::new(0)))
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        let closed = (0..n_cons)
+            .map(|_| AtomicBool::new(false))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         SpscMesh {
             n_prod,
             n_cons,
             rings,
             prod_cursor,
             cons_cursor,
+            closed,
+            waiting: std::sync::atomic::AtomicUsize::new(0),
         }
-    }
-
-    pub fn n_prod(&self) -> usize {
-        self.n_prod
-    }
-    pub fn n_cons(&self) -> usize {
-        self.n_cons
     }
 
     /// Producer `pi` enqueues `item`. Round-robins across its M outgoing rings,
@@ -193,7 +214,19 @@ impl SpscMesh {
         let mut item = item;
         for k in 0..self.n_cons {
             let j = (*cur + k) % self.n_cons;
-            match self.rings[pi * self.n_cons + j].push(item) {
+            let ring = &self.rings[pi * self.n_cons + j];
+            // Close handshake: declare intent (busy) BEFORE checking closed;
+            // close_consumer does the mirror (set closed, then wait !busy).
+            // SeqCst so the store/load pairs can't reorder — either we see
+            // closed and skip, or the closer sees busy and waits us out.
+            ring.busy.0.store(true, Ordering::SeqCst);
+            if self.closed[j].load(Ordering::SeqCst) {
+                ring.busy.0.store(false, Ordering::Release);
+                continue; // column closed, try the next consumer
+            }
+            let res = ring.push(item);
+            ring.busy.0.store(false, Ordering::Release);
+            match res {
                 Ok(()) => {
                     *cur = if j + 1 >= self.n_cons { 0 } else { j + 1 };
                     return Ok(());
@@ -201,7 +234,31 @@ impl SpscMesh {
                 Err(returned) => item = returned, // that ring full, try next consumer
             }
         }
-        Err(item) // every outgoing ring full
+        Err(item) // every OPEN outgoing ring full (or every column closed)
+    }
+
+    /// Close consumer `ci`'s column: producers stop selecting it, and any
+    /// producer already mid-push into it is waited out (the busy handshake),
+    /// so once this returns, the column's contents are final and the caller
+    /// can drain the residue race-free. Idempotent.
+    pub fn close_consumer(&self, ci: usize) {
+        debug_assert!(ci < self.n_cons);
+        if self.closed[ci].swap(true, Ordering::SeqCst) {
+            return; // already closed
+        }
+        for i in 0..self.n_prod {
+            let ring = &self.rings[i * self.n_cons + ci];
+            while ring.busy.0.load(Ordering::SeqCst) {
+                std::hint::spin_loop(); // window is a few instructions
+            }
+        }
+    }
+
+    /// Reopen consumer `ci`'s column — called when a replica (re)spawns on
+    /// this index, before it starts popping.
+    pub fn reopen_consumer(&self, ci: usize) {
+        debug_assert!(ci < self.n_cons);
+        self.closed[ci].store(false, Ordering::SeqCst);
     }
 
     /// Consumer `ci` dequeues one item. Round-robins across its N incoming rings
@@ -220,18 +277,24 @@ impl SpscMesh {
         None
     }
 
-    /// Total occupancy across all rings -- the SpscMesh analogue of the bounded
-    /// ring's `len()`, for feeding the autoscaler's queue-depth signal.
+    /// Total occupancy across all rings, PLUS producers currently blocked in
+    /// backpressure -- the SpscMesh analogue of the bounded ring's `len()`,
+    /// for feeding the autoscaler's queue-depth signal. Counting blocked
+    /// producers means an all-closed, all-empty mesh with a producer waiting
+    /// still reads > 0, so the autoscaler cold-starts a consumer that reopens
+    /// a column instead of deadlocking.
     pub fn len(&self) -> usize {
-        self.rings
-            .iter()
-            .map(|r| {
-                r.slots
-                    .iter()
-                    .filter(|s| s.state.load(Ordering::Relaxed) == FULL)
-                    .count()
-            })
-            .sum()
+        self.waiting.load(Ordering::Relaxed)
+            + self
+                .rings
+                .iter()
+                .map(|r| {
+                    r.slots
+                        .iter()
+                        .filter(|s| s.state.load(Ordering::Relaxed) == FULL)
+                        .count()
+                })
+                .sum::<usize>()
     }
 }
 
@@ -279,23 +342,29 @@ impl MeshTx {
         MeshTx { mesh, pi }
     }
     /// Blocking enqueue with backpressure. `false` if drain is raised mid-wait.
+    /// While blocked (every open column full, or every column closed), the
+    /// producer registers in `mesh.waiting` so the edge's `len()` still shows
+    /// demand and the consumer-stage autoscaler can respawn/reopen a column.
     #[inline]
     pub fn push(&self, item: Bytes, drain: &AtomicBool) -> bool {
         let mut pending = match self.mesh.push(self.pi, item) {
             Ok(()) => return true,
             Err(back) => back,
         };
+        self.mesh.waiting.fetch_add(1, Ordering::SeqCst);
         let mut backoff = Backoff::new();
-        loop {
+        let delivered = loop {
             if drain.load(Ordering::Relaxed) {
-                return false;
+                break false;
             }
             backoff.wait();
             match self.mesh.push(self.pi, pending) {
-                Ok(()) => return true,
+                Ok(()) => break true,
                 Err(back) => pending = back,
             }
-        }
+        };
+        self.mesh.waiting.fetch_sub(1, Ordering::SeqCst);
+        delivered
     }
 }
 
@@ -308,16 +377,26 @@ impl MeshRx {
     pub fn new(mesh: Arc<SpscMesh>, ci: usize) -> Self {
         MeshRx { mesh, ci }
     }
-    /// Blocking dequeue. `None` only if drain is raised while empty.
+    /// Blocking dequeue. `None` only after drain is raised AND this consumer's
+    /// column is fully empty. On the first pop after drain is observed, the
+    /// column is closed (producers stop feeding it — see the busy handshake),
+    /// then the residue is handed out event by event until exhausted. The
+    /// pre-fix behaviour ("one last look") stranded up to n_prod × ring_cap
+    /// events in the column of every drained consumer.
     #[inline]
     pub fn pop(&self, drain: &AtomicBool) -> Option<Bytes> {
+        if drain.load(Ordering::Relaxed) {
+            self.mesh.close_consumer(self.ci); // idempotent
+            return self.mesh.pop(self.ci);     // residue until empty, then None
+        }
         if let Some(item) = self.mesh.pop(self.ci) {
             return Some(item);
         }
         let mut backoff = Backoff::new();
         loop {
             if drain.load(Ordering::Relaxed) {
-                return self.mesh.pop(self.ci); // last look during shutdown
+                self.mesh.close_consumer(self.ci);
+                return self.mesh.pop(self.ci);
             }
             backoff.wait();
             if let Some(item) = self.mesh.pop(self.ci) {
@@ -373,7 +452,13 @@ impl EdgeInSrc {
         match self {
             EdgeInSrc::None => None,
             EdgeInSrc::Ring(e) => Some(EdgeIn::Ring(e.clone())),
-            EdgeInSrc::Mesh(m) => Some(EdgeIn::Mesh(MeshRx::new(m.clone(), r))),
+            EdgeInSrc::Mesh(m) => {
+                // A drained predecessor on this index closed the column;
+                // reopen it before the new replica starts popping so
+                // producers select it again.
+                m.reopen_consumer(r);
+                Some(EdgeIn::Mesh(MeshRx::new(m.clone(), r)))
+            }
         }
     }
     /// Queue-depth signal for the autoscaler (ring occupancy / total mesh occupancy).
@@ -403,9 +488,6 @@ impl EdgeOutSrc {
             EdgeOutSrc::Ring(e) => Some(EdgeOut::Ring(e.clone())),
             EdgeOutSrc::Mesh(m) => Some(EdgeOut::Mesh(MeshTx::new(m.clone(), r))),
         }
-    }
-    pub fn is_some(&self) -> bool {
-        !matches!(self, EdgeOutSrc::None)
     }
 }
 
@@ -471,6 +553,79 @@ mod tests {
         }
         prod.join().unwrap();
         assert_eq!(got, N);
+    }
+
+    #[test]
+    fn mesh_close_mid_stream_conserves_events() {
+        // Regression test for the scale-down stranding leak (TODO 1.6): a
+        // consumer drained mid-stream must close its column and hand out the
+        // residue; producers must reroute to the surviving consumer. Every
+        // pushed event must come out exactly once.
+        const NP: usize = 2;
+        const NC: usize = 2;
+        const PER: u64 = 200_000;
+        let mesh = Arc::new(SpscMesh::new(NP, NC, 64));
+        let received = Arc::new(AtomicU64::new(0));
+        let sum = Arc::new(AtomicU64::new(0));
+        let c1_drain = Arc::new(AtomicBool::new(false));
+        let c0_drain = Arc::new(AtomicBool::new(false));
+
+        let mut handles = Vec::new();
+        for pi in 0..NP {
+            let tx = MeshTx::new(mesh.clone(), pi);
+            let never = AtomicBool::new(false);
+            handles.push(thread::spawn(move || {
+                for k in 0..PER {
+                    let payload = (pi as u64) * PER + k; // globally unique
+                    assert!(tx.push(ev(payload), &never), "push must not abort");
+                }
+            }));
+        }
+        // Consumer 1: drained after ~5k events — must close its column, drain
+        // its residue completely, then observe None.
+        {
+            let rx = MeshRx::new(mesh.clone(), 1);
+            let recv = received.clone();
+            let s = sum.clone();
+            let drain = c1_drain.clone();
+            handles.push(thread::spawn(move || {
+                let mut n = 0u64;
+                while let Some(v) = rx.pop(&drain) {
+                    s.fetch_add(num(&v), O::Relaxed);
+                    recv.fetch_add(1, O::Relaxed);
+                    n += 1;
+                    if n == 5_000 {
+                        drain.store(true, Ordering::Relaxed); // self-drain, like EOS deferral
+                    }
+                }
+                // Column must be genuinely empty after None.
+                assert!(rx.mesh.pop(1).is_none(), "residue left after drain-None");
+            }));
+        }
+        // Consumer 0: keeps consuming; main raises its drain once producers
+        // are done, after which pop drains the rest and returns None.
+        let c0_handle = {
+            let rx = MeshRx::new(mesh.clone(), 0);
+            let recv = received.clone();
+            let s = sum.clone();
+            let drain = c0_drain.clone();
+            thread::spawn(move || {
+                while let Some(v) = rx.pop(&drain) {
+                    s.fetch_add(num(&v), O::Relaxed);
+                    recv.fetch_add(1, O::Relaxed);
+                }
+            })
+        };
+        for h in handles {
+            h.join().unwrap();
+        }
+        c0_drain.store(true, Ordering::Relaxed);
+        c0_handle.join().unwrap();
+
+        let total = (NP as u64) * PER;
+        assert_eq!(received.load(O::Relaxed), total, "events lost or duplicated");
+        let expect_sum = total.wrapping_mul(total - 1) / 2;
+        assert_eq!(sum.load(O::Relaxed), expect_sum, "payload corruption");
     }
 
     #[test]

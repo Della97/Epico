@@ -12,8 +12,9 @@
 //! sample series aligns with the other per-stage timestamps emitted by
 //! the autoscaler and collector.
 
-use crate::{ResourceSample, RunTelemetry};
+use super::{ResourceSample, RunTelemetry};
 use epico_logger::Logger;
+use epico_logger::{info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -67,11 +68,10 @@ fn sample_loop(
     );
     std::thread::sleep(Duration::from_millis(interval_ms));
 
-    log.info("resource sampler started", &[
-        ("interval_ms", &interval_ms.to_string()),
-        ("pid",         &pid.as_u32().to_string()),
-        ("cpu_norm_cpus", &cpu_norm_cpus.to_string()),
-    ]);
+    info!(log, "resource sampler started",
+          interval_ms = interval_ms,
+          pid = pid.as_u32(),
+          cpu_norm_cpus = cpu_norm_cpus);
 
     while running.load(Ordering::Relaxed) {
         sys.refresh_processes_specifics(
@@ -90,7 +90,7 @@ fn sample_loop(
             None => {
                 // We're our own process — this shouldn't happen except in
                 // extreme teardown scenarios.
-                log.warn("resource sampler: own pid missing", &[]);
+                warn!(log, "resource sampler: own pid missing");
                 break;
             }
         };
@@ -102,7 +102,7 @@ fn sample_loop(
         std::thread::sleep(Duration::from_millis(interval_ms));
     }
 
-    log.info("resource sampler stopped", &[]);
+    info!(log, "resource sampler stopped");
 }
 
 fn detect_available_cpus() -> usize {
