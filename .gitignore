@@ -15,6 +15,7 @@ plots/ablation_test/*
 /bench/
 /macbook_tmp/
 /logs/
+/TODOs/
 
 # Pub folder
 #/publications/
