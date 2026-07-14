@@ -73,10 +73,14 @@ enum Commands {
     Bootstrap {
         #[arg(long)]
         project_root: Option<PathBuf>,
-        /// Enable cold-start optimizations in the agent: pooling allocator,
-        /// CoW memory init, Cranelift Speed opt level, parallel compilation.
-        #[arg(long)]
+        /// Cold-start optimizations in the agent (pooling allocator,
+        /// CoW memory init, Cranelift Speed opt level, parallel compilation)
+        /// are enabled by default; this flag is a no-op kept for compatibility.
+        #[arg(long, overrides_with = "no_cold_start_opt")]
         cold_start_opt: bool,
+        /// Build the baseline agent without cold-start optimizations.
+        #[arg(long)]
+        no_cold_start_opt: bool,
     },
 }
 
@@ -91,8 +95,8 @@ fn main() -> Result<()> {
             cmd_validate(&config, project_root.as_deref()),
         Commands::Clean { config, project_root } =>
             cmd_clean(&config, project_root.as_deref()),
-        Commands::Bootstrap { project_root, cold_start_opt } =>
-            cmd_bootstrap(project_root.as_deref(), cold_start_opt),
+        Commands::Bootstrap { project_root, no_cold_start_opt, .. } =>
+            cmd_bootstrap(project_root.as_deref(), !no_cold_start_opt),
     }
 }
 
@@ -193,8 +197,8 @@ fn cmd_run(config_path: &Path, project_root: Option<&Path>, log_dir: &Path, aot:
             agent.display(),
             dispatcher.display()
         );
-        println!("    Running bootstrap first (no cold-start-opt)...");
-        build::bootstrap_runtime(&root, false)?;
+        println!("    Running bootstrap first (cold-start-opt enabled)...");
+        build::bootstrap_runtime(&root, true)?;
 
         if !agent.exists() || !dispatcher.exists() {
             bail!(
