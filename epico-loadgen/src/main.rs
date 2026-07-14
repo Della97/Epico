@@ -29,7 +29,8 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use epico_logger::Logger;
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -197,6 +198,13 @@ const SENSOR_TYPES: &[(&str, SensorType)] = &[
 const LOCATIONS: &[&str] = &["zone-A", "zone-B", "zone-C", "zone-D"];
 const ANOMALY_PROB: f64  = 0.002;
 
+/// Fixed RNG seed for sensor payload generation (initial value, per-reading
+/// noise, drift direction, anomaly occurrence/sign/magnitude). Each sensor
+/// derives its own stream from this seed plus its index, so payload content
+/// is bit-reproducible across runs regardless of --sensors or run order.
+
+const PAYLOAD_SEED: u64 = 0xE91C0_5EED;
+
 struct Sensor {
     id:          String,
     type_idx:    usize,
@@ -204,13 +212,14 @@ struct Sensor {
     value:       f64,
     drift_dir:   f64,
     drift_acc:   f64,
+    rng:         StdRng,
 }
 
 impl Sensor {
     fn new(idx: usize) -> Self {
         let type_idx = idx % SENSOR_TYPES.len();
         let st       = &SENSOR_TYPES[type_idx].1;
-        let mut rng  = rand::thread_rng();
+        let mut rng  = StdRng::seed_from_u64(PAYLOAD_SEED.wrapping_add(idx as u64));
         Sensor {
             id:        format!("sensor-{:04}", idx),
             type_idx,
@@ -218,6 +227,7 @@ impl Sensor {
             value:     st.mean + rng.gen::<f64>() * st.std,
             drift_dir: if rng.gen_bool(0.5) { 1.0 } else { -1.0 },
             drift_acc: 0.0,
+            rng,
         }
     }
 
@@ -229,12 +239,11 @@ impl Sensor {
             self.drift_dir *= -1.0;
         }
 
-        let mut rng    = rand::thread_rng();
-        let mut value  = self.value + self.drift_acc + rng.gen::<f64>() * st.std * 0.3;
-        let is_anomaly = rng.gen::<f64>() < ANOMALY_PROB;
+        let mut value  = self.value + self.drift_acc + self.rng.gen::<f64>() * st.std * 0.3;
+        let is_anomaly = self.rng.gen::<f64>() < ANOMALY_PROB;
         if is_anomaly {
-            let sign  = if rng.gen_bool(0.5) { 1.0 } else { -1.0 };
-            value    += sign * st.anomaly_mag * (0.8 + rng.gen::<f64>() * 0.4);
+            let sign  = if self.rng.gen_bool(0.5) { 1.0 } else { -1.0 };
+            value    += sign * st.anomaly_mag * (0.8 + self.rng.gen::<f64>() * 0.4);
         }
         self.value = value;
 
