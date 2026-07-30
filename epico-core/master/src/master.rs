@@ -19,6 +19,7 @@ mod autoscaler;
 mod config;
 mod conversion;
 pub mod envelope;
+mod eos;
 mod host;
 mod inproc;
 mod pipeline_validator;
@@ -395,6 +396,13 @@ pub fn run_agent(
     let stage_names: Vec<String> = config.pipeline.iter().map(|s| s.name.clone()).collect();
     let mut handles = Vec::new();
 
+    // One EOS barrier per stage (see eos.rs). expected_in = the stage's
+    // in-degree: 1 on today's linear topologies; the DAG milestone (M1) sets
+    // it from the edge list and adds the marker merge rule at fan-in.
+    let barriers: HashMap<String, Arc<eos::StageEosBarrier>> = config.pipeline.iter()
+        .map(|s| (s.name.clone(), Arc::new(eos::StageEosBarrier::new(1))))
+        .collect();
+
     for stage in config.pipeline.iter() {
         let bare = stage.name.strip_prefix("fn-").unwrap_or(&stage.name);
         let dispatch_name = format!("dispatch-{}", bare);
@@ -415,11 +423,12 @@ pub fn run_agent(
         let event_format_c = config.event_format.clone();
         let in_edge_c   = input_edges.get(&stage.name).cloned().unwrap_or(EdgeInSrc::None);
         let out_edge_c  = output_edges.get(&stage.name).cloned().unwrap_or(EdgeOutSrc::None);
+        let barrier_c   = barriers.get(&stage.name).cloned().expect("barrier per stage");
 
         handles.push(std::thread::spawn(move || {
             autoscaler::run_autoscaler_loop(
                 stage_c, ctrl_port, cw, in_edge_c, out_edge_c, engine_c, stage_log, tel_c,
-                test_start_instant, compile_mode_c, event_format_c,
+                test_start_instant, compile_mode_c, event_format_c, barrier_c,
             );
         }));
     }
@@ -755,6 +764,7 @@ fn gen_partition(out_edge: &Edge, count: u64, sensors: usize, index: usize, stri
                 .ts_wall(now_wall)
                 .ts(now_wall)
                 .seq(seq)
+                .key_hash(epico_wire::fnv1a64(id.as_bytes()))
                 .str_field("sensor_id", id.as_str())
                 .str_field("sensor_type", *type_name)
                 .str_field("location", *location)

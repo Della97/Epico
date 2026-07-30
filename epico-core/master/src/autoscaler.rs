@@ -1,4 +1,4 @@
-//! Per-stage autoscaler — one thread per stage, ticks every 20ms.
+//! Per-stage autoscaler — one thread per stage, ticks every `TICK_MS` (1 ms).
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +14,7 @@ use epico_logger::Logger;
 use epico_logger::{error, info, warn};
 
 use crate::config::{make_pull_endpoint, make_push_endpoint, PipelineStage};
+use crate::eos::StageEosBarrier;
 use crate::host::HostState;
 use crate::spsc::{EdgeInSrc, EdgeOutSrc};
 use crate::telemetry::{record_event, stats::round3, RunTelemetry, ScalingEvent};
@@ -126,6 +127,7 @@ pub(crate) fn run_autoscaler_loop(
     test_start:    Instant,
     compile_mode:  String,
     event_format:  String,
+    barrier:       Arc<StageEosBarrier>,
 ) {
     let min_rep  = stage.slo.min_replicas;
     let max_rep  = stage.slo.max_replicas;
@@ -299,7 +301,7 @@ pub(crate) fn run_autoscaler_loop(
     // Index into telemetry.scaling_events of the most-recently recorded
     // cold_start event whose cold_start_ms is still None.  We back-fill it
     // once the worker's first refill message arrives via the dispatcher metrics
-    // poll (usually within one 20 ms tick).  None means no pending back-fill.
+    // poll (usually within a few ticks).  None means no pending back-fill.
     let mut pending_cs_event_idx: Option<usize> = None;
 
     loop {
@@ -371,6 +373,30 @@ pub(crate) fn run_autoscaler_loop(
             }
         }
 
+        // ── EOS finishing gate (M0 barrier, see eos.rs) ─────────────────────
+        // Once every expected upstream marker has been reported, drain the
+        // whole stage: raise every replica's drain flag and stop scaling. On
+        // the zmq path, wait for the dispatcher's buffer to empty first —
+        // drained workers stop taking credits, so anything still queued there
+        // would strand. (In-proc queues drain THROUGH the workers' residue
+        // path, so no such wait is needed.) These drains are shutdown, not
+        // scaling — deliberately not recorded as scaling events.
+        if barrier.all_markers_seen() && !barrier.is_finishing() {
+            let dispatcher_empty = input_edge.is_some() || qd <= 0.0;
+            if dispatcher_empty && barrier.begin_finishing() {
+                info!(log, "EOS barrier complete; draining all replicas",
+                      stage = stage.name, live = workers.len());
+                for w in workers.iter() {
+                    w.drain_flag.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        if barrier.is_finishing() {
+            // No spawns or scaling while finishing; keep ticking so the
+            // retain() above reaps exiting workers (and frees indices).
+            continue;
+        }
+
         if current > max_rep {
             warn!(log, "invariant breach: current > max_rep, draining surplus",
                   current = current,
@@ -427,6 +453,7 @@ pub(crate) fn run_autoscaler_loop(
                 decision_ts,
                 worker_ctx.clone(),
                 event_format.clone(),
+                barrier.clone(),
                 log.with_component(&format!("worker/{}", stage.name)),
             ));
             if let Ok(mut tel) = telemetry.lock() {
@@ -476,6 +503,7 @@ pub(crate) fn run_autoscaler_loop(
                 decision_ts,
                 worker_ctx.clone(),
                 event_format.clone(),
+                barrier.clone(),
                 log.with_component(&format!("worker/{}", stage.name)),
             ));
             record_event(&telemetry, test_start, &stage.name, "spawn",
@@ -521,6 +549,7 @@ pub(crate) fn run_autoscaler_loop(
                 decision_ts,
                 worker_ctx.clone(),
                 event_format.clone(),
+                barrier.clone(),
                 log.with_component(&format!("worker/{}", stage.name)),
             ));
             record_event(&telemetry, test_start, &stage.name, "spawn",

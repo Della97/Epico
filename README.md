@@ -27,7 +27,7 @@ This makes Epico a **research vehicle for serverless stream processing on a sing
 | Per-stage isolation | WASM component | JVM thread | JVM thread | container |
 | Dynamic stage dispatch | ✅ (WIT introspection) | ❌ (recompile job) | ❌ | ✅ |
 | Scale-to-zero per stage | ✅ | ❌ | ❌ | ✅ |
-| Single-host footprint | ~7 400 LOC Rust | JVM + ZK | JVM + ZK | cloud-only |
+| Single-host footprint | ~8 700 LOC Rust | JVM + ZK | JVM + ZK | cloud-only |
 
 ---
 
@@ -256,7 +256,7 @@ On shutdown the master writes `master_<ts>_summary.json` containing:
 
 ## Status & roadmap
 
-Actively developed. Core runtime is ~6 000 LOC of Rust.
+Actively developed. Core runtime is ~8 700 LOC of Rust (code only, excluding examples; `tokei`).
 
 **Supported today:** linear DAGs · WASIp2 components · per-stage autoscaling · credit-based flow control (sliding-window dispatcher↔worker protocol) · AOT / JIT / startup-JIT compilation modes · pipeline component validation · structured JSONL telemetry + summary JSON · declarative load-generator source · single-host deployment.
 

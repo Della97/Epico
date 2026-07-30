@@ -533,9 +533,10 @@ fn build_environment_block() -> serde_json::Value {
     let rustc   = option_env!("EPICO_RUSTC_VERSION").unwrap_or("unknown");
     let commit  = option_env!("EPICO_GIT_COMMIT").unwrap_or("unknown");
     let dirty   = option_env!("EPICO_GIT_DIRTY").unwrap_or("0") == "1";
-    // Wasmtime is pinned in Cargo.toml; reading the literal here means the
-    // summary is always correct without runtime crate-version introspection.
-    let wasmtime_version = "26";
+    // Baked by build.rs from the workspace Cargo.lock, so a dependency bump
+    // can't leave a stale version in a results table (this used to be a
+    // hardcoded literal).
+    let wasmtime_version = option_env!("EPICO_WASMTIME_VERSION").unwrap_or("unknown");
 
     json!({
         "host":                host,

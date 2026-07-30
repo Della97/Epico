@@ -85,6 +85,24 @@ if leaked > 0:
 if leaked < 0:
     print(f"    FAIL: {-leaked} duplicate events observed")
     sys.exit(1)
+
+# EOS barrier discipline (M0): once the collector has seen EOS, the stage set
+# is finishing — no worker may boot after that point. Catches the old
+# min-replica respawn-after-EOS behaviour.
+jsonl = summary_path.replace("_summary.json", ".jsonl")
+try:
+    lines = open(jsonl).read().splitlines()
+    eos_at = next((i for i, l in enumerate(lines)
+                   if "EOS received at collector" in l), None)
+    if eos_at is not None:
+        late_boots = [l for l in lines[eos_at:] if "worker booted" in l]
+        if late_boots:
+            print(f"    FAIL: {len(late_boots)} worker(s) booted after EOS reached the collector")
+            sys.exit(1)
+        print("    PASS: no worker boots after EOS (barrier discipline holds)")
+except OSError:
+    print(f"    (skip EOS-ordering check: {jsonl} not found)")
+
 print("    PASS: all events conserved across scaling cycles")
 PYEOF
     [ $? -ne 0 ] && overall=1

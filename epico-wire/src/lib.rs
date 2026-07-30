@@ -11,10 +11,11 @@
 //!
 //! ```text
 //!   [0]   u8  magic   = 0xEB
-//!   [1]   u8  version = 0x01
+//!   [1]   u8  version = 0x01 (0x02 when a key hash is present)
 //!   [2]   u8  flags        (bit0 = EOS)
-//!   [3]   u8  bench bitmap (bit0 = ts_wall, bit1 = ts, bit2 = seq)
-//!   ...   [f64 ts_wall] [f64 ts] [u64 seq]  — present per bitmap, in this order
+//!   [3]   u8  bench bitmap (bit0 = ts_wall, bit1 = ts, bit2 = seq,
+//!                           bit3 = key_hash — v2 only)
+//!   ...   [f64 ts_wall] [f64 ts] [u64 seq] [u64 key_hash] — per bitmap, in order
 //!   u16 hop_count, then per hop:
 //!         u8 name_len, name bytes, f64 enter, f64 exit
 //!   u16 field_count, then per field:
@@ -34,6 +35,26 @@ use std::fmt;
 pub const BIN_MAGIC: u8 = 0xEB;
 /// Wire format version. Bump on any incompatible layout change.
 pub const BIN_VERSION: u8 = 0x01;
+/// Version emitted when the envelope carries a routing key hash (bench bitmap
+/// bit 3). Key-less envelopes keep emitting v1, byte-identical to before; a
+/// pre-key decoder rejects v2 loudly (BadMagic) instead of misparsing.
+pub const BIN_VERSION_KEYED: u8 = 0x02;
+
+/// FNV-1a 64 over raw bytes — the routing/shard key hash.
+///
+/// STABILITY CONTRACT: this function is part of the wire format. Key-affine
+/// routing and (future) cross-node shard maps require every producer and every
+/// node to hash identically, forever. Do not change the algorithm or constants;
+/// if a better hash is ever needed, add it as a NEW bitmap bit.
+#[inline]
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
 
 /// Field-kind wire tags. The numeric value is part of the on-wire format and
 /// must never be reordered; append new kinds at the end.
@@ -106,10 +127,12 @@ impl fmt::Display for WireError {
 
 impl std::error::Error for WireError {}
 
-/// True when the buffer carries the binary envelope magic + version prefix.
+/// True when the buffer carries the binary envelope magic + a known version.
 #[inline]
 pub fn is_binary(bytes: &[u8]) -> bool {
-    bytes.len() >= 4 && bytes[0] == BIN_MAGIC && bytes[1] == BIN_VERSION
+    bytes.len() >= 4
+        && bytes[0] == BIN_MAGIC
+        && (bytes[1] == BIN_VERSION || bytes[1] == BIN_VERSION_KEYED)
 }
 
 // ── Writer ──────────────────────────────────────────────────────────────────
@@ -126,11 +149,12 @@ pub fn write_header(
     ts_wall: Option<f64>,
     ts: Option<f64>,
     seq: Option<u64>,
+    key_hash: Option<u64>,
     hops: &[(String, f64, f64)],
     new_hop: Option<Hop<'_>>,
 ) {
     out.push(BIN_MAGIC);
-    out.push(BIN_VERSION);
+    out.push(if key_hash.is_some() { BIN_VERSION_KEYED } else { BIN_VERSION });
     out.push(0); // flags
     let mut bitmap = 0u8;
     if ts_wall.is_some() {
@@ -142,6 +166,9 @@ pub fn write_header(
     if seq.is_some() {
         bitmap |= 4;
     }
+    if key_hash.is_some() {
+        bitmap |= 8;
+    }
     out.push(bitmap);
     if let Some(v) = ts_wall {
         out.extend_from_slice(&v.to_le_bytes());
@@ -150,6 +177,9 @@ pub fn write_header(
         out.extend_from_slice(&v.to_le_bytes());
     }
     if let Some(v) = seq {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    if let Some(v) = key_hash {
         out.extend_from_slice(&v.to_le_bytes());
     }
 
@@ -218,6 +248,7 @@ pub struct EventBuilder {
     ts_wall: Option<f64>,
     ts: Option<f64>,
     seq: Option<u64>,
+    key_hash: Option<u64>,
     fields: Vec<(String, Scalar)>,
 }
 
@@ -235,6 +266,12 @@ impl EventBuilder {
     }
     pub fn seq(mut self, v: u64) -> Self {
         self.seq = Some(v);
+        self
+    }
+    /// Set the routing/shard key hash. Producers typically pass
+    /// `fnv1a64(key_field_bytes)`.
+    pub fn key_hash(mut self, v: u64) -> Self {
+        self.key_hash = Some(v);
         self
     }
     pub fn field(mut self, name: impl Into<String>, scalar: Scalar) -> Self {
@@ -269,7 +306,7 @@ impl EventBuilder {
     /// Serialize to a complete binary envelope.
     pub fn finish(self) -> Vec<u8> {
         let mut out = Vec::with_capacity(96 + self.fields.len() * 16);
-        write_header(&mut out, self.ts_wall, self.ts, self.seq, &[], None);
+        write_header(&mut out, self.ts_wall, self.ts, self.seq, self.key_hash, &[], None);
         let n = self.fields.len().min(u16::MAX as usize);
         out.extend_from_slice(&(n as u16).to_le_bytes());
         for (name, scalar) in self.fields.iter().take(u16::MAX as usize) {
@@ -354,6 +391,9 @@ pub struct Header {
     pub ts_wall: Option<f64>,
     pub ts: Option<f64>,
     pub seq: Option<u64>,
+    /// Routing/shard key hash (fnv1a64 over the key field's bytes). Read from
+    /// the header only — O(1) for routers, no field-section parse.
+    pub key_hash: Option<u64>,
     pub hops: Vec<(String, f64, f64)>,
 }
 
@@ -378,7 +418,7 @@ pub struct DecodedField {
 pub fn read_header(r: &mut Reader<'_>) -> Result<Header, WireError> {
     let magic = r.u8()?;
     let version = r.u8()?;
-    if magic != BIN_MAGIC || version != BIN_VERSION {
+    if magic != BIN_MAGIC || (version != BIN_VERSION && version != BIN_VERSION_KEYED) {
         return Err(WireError::BadMagic { magic, version });
     }
     let flags = r.u8()?;
@@ -386,6 +426,7 @@ pub fn read_header(r: &mut Reader<'_>) -> Result<Header, WireError> {
     let ts_wall = if bitmap & 1 != 0 { Some(r.f64()?) } else { None };
     let ts = if bitmap & 2 != 0 { Some(r.f64()?) } else { None };
     let seq = if bitmap & 4 != 0 { Some(r.u64()?) } else { None };
+    let key_hash = if bitmap & 8 != 0 { Some(r.u64()?) } else { None };
 
     let hop_count = r.u16()? as usize;
     let mut hops = Vec::with_capacity(hop_count);
@@ -401,6 +442,7 @@ pub fn read_header(r: &mut Reader<'_>) -> Result<Header, WireError> {
         ts_wall,
         ts,
         seq,
+        key_hash,
         hops,
     })
 }
@@ -464,7 +506,7 @@ mod tests {
     #[test]
     fn absent_field_preserves_kind() {
         let mut out = Vec::new();
-        write_header(&mut out, Some(1.0), None, None, &[], None);
+        write_header(&mut out, Some(1.0), None, None, None, &[], None);
         out.extend_from_slice(&1u16.to_le_bytes());
         // an absent option<u32> field: kind preserved, no payload
         write_field(&mut out, "maybe", tag::U32, None);
@@ -479,7 +521,7 @@ mod tests {
     fn header_with_hops_and_new_hop() {
         let mut out = Vec::new();
         let hops = vec![("relay#0".to_string(), 1.0, 1.5)];
-        write_header(&mut out, Some(5.0), Some(6.0), Some(2), &hops, Some(("forward#1", 2.0, 2.5)));
+        write_header(&mut out, Some(5.0), Some(6.0), Some(2), None, &hops, Some(("forward#1", 2.0, 2.5)));
         out.extend_from_slice(&0u16.to_le_bytes()); // no fields
 
         let h = decode_header_only(&out).unwrap();
@@ -503,12 +545,44 @@ mod tests {
         assert!(matches!(err, WireError::BadMagic { .. }));
     }
 
+    #[test]
+    fn key_hash_roundtrips_and_versions() {
+        // Key-less output is v1, byte-identical to the pre-key format.
+        let plain = EventBuilder::new().ts_wall(1.0).f64_field("v", 2.0).finish();
+        assert_eq!(plain[1], BIN_VERSION);
+        assert_eq!(decode_header_only(&plain).unwrap().key_hash, None);
+
+        // Keyed output is v2 and the hash reads back header-only.
+        let k = fnv1a64(b"sensor-0001");
+        let keyed = EventBuilder::new()
+            .ts_wall(1.0)
+            .key_hash(k)
+            .str_field("sensor_id", "sensor-0001")
+            .finish();
+        assert!(is_binary(&keyed));
+        assert_eq!(keyed[1], BIN_VERSION_KEYED);
+        let h = decode_header_only(&keyed).unwrap();
+        assert_eq!(h.key_hash, Some(k));
+        // Full decode still works and fields are intact.
+        let (h2, fields) = decode(&keyed).unwrap();
+        assert_eq!(h2.key_hash, Some(k));
+        assert_eq!(fields[0].scalar, Some(Scalar::Str("sensor-0001".into())));
+    }
+
+    /// fnv1a64 is a wire-format stability contract — pin reference vectors.
+    #[test]
+    fn fnv1a64_reference_vectors() {
+        assert_eq!(fnv1a64(b""), 0xcbf29ce484222325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63dc4c8601ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x85944171f73967e8);
+    }
+
     /// Byte-exact reference: this is the exact prefix the format guarantees.
     /// If this test ever changes, the wire version MUST be bumped.
     #[test]
     fn header_byte_layout_is_stable() {
         let mut out = Vec::new();
-        write_header(&mut out, Some(0.0), None, Some(0), &[], None);
+        write_header(&mut out, Some(0.0), None, Some(0), None, &[], None);
         // magic, version, flags=0, bitmap = ts_wall(1)|seq(4) = 0x05
         assert_eq!(out[0], 0xEB);
         assert_eq!(out[1], 0x01);

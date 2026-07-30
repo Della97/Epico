@@ -36,6 +36,10 @@ bench/results/
 # Logs and runtime output
 **/*.jsonl
 **/*.log
+# Run artifacts: profiling dumps and per-run summary JSON
+profile.json.gz
+**/*_summary.json
+examples/*/results_test/
 examples/*/logs/
 examples/*/logs_back/
 logs/

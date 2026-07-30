@@ -128,6 +128,16 @@ impl EventEnvelope {
         }
     }
 
+    /// Routing/shard key hash of the INPUT event, header-only. JSON events
+    /// carry none (interior edges default to binary; the first binary encode
+    /// is where a key would be computed once key-affine routing lands).
+    pub(crate) fn key_hash(&self) -> Option<u64> {
+        match self {
+            Self::Json(_) => None,
+            Self::Binary(b) => b.key_hash,
+        }
+    }
+
     /// Encode the post-call event. `out` selects the wire format of the
     /// OUTGOING bytes independently of the input format, so a JSON-in
     /// stage can emit binary (first stage of a binary-edges pipeline) and
@@ -170,6 +180,7 @@ impl EventEnvelope {
                     ts_wall,
                     ts,
                     seq,
+                    self.key_hash(),
                     &hops,
                     Some((stage_name, enter_ts, exit_ts)),
                     Some((event_val, output_fields)),
@@ -240,6 +251,7 @@ impl EventEnvelope {
                 b.ts_wall,
                 b.ts,
                 b.seq,
+                b.key_hash,
                 &b.hops,
                 Some((stage_name, enter_ts, exit_ts)),
                 &b.fields,
@@ -290,6 +302,7 @@ pub struct BinaryEnvelope {
     ts_wall: Option<f64>,
     ts: Option<f64>,
     seq: Option<u64>,
+    key_hash: Option<u64>,
     hops: Vec<(String, f64, f64)>,
     fields: Vec<BinField>,
 }
@@ -307,7 +320,9 @@ impl BinaryEnvelope {
         let mut c = wire::Reader::new(b);
         let magic = c.u8()?;
         let version = c.u8()?;
-        if magic != BIN_MAGIC || version != BIN_VERSION {
+        if magic != BIN_MAGIC
+            || (version != BIN_VERSION && version != wire::BIN_VERSION_KEYED)
+        {
             bail!("not a binary envelope (magic {magic:#x} ver {version})");
         }
         let flags = c.u8()?;
@@ -315,6 +330,7 @@ impl BinaryEnvelope {
         let ts_wall = if bitmap & 1 != 0 { Some(c.f64()?) } else { None };
         let ts = if bitmap & 2 != 0 { Some(c.f64()?) } else { None };
         let seq = if bitmap & 4 != 0 { Some(c.u64()?) } else { None };
+        let key_hash = if bitmap & 8 != 0 { Some(c.u64()?) } else { None };
 
         let hop_count = c.u16()? as usize;
         let mut hops = Vec::with_capacity(hop_count);
@@ -342,7 +358,7 @@ impl BinaryEnvelope {
             }
         }
 
-        Ok(Self { flags, ts_wall, ts, seq, hops, fields })
+        Ok(Self { flags, ts_wall, ts, seq, key_hash, hops, fields })
     }
 
     fn is_eos(&self) -> bool {
@@ -482,12 +498,13 @@ fn write_binary(
     ts_wall: Option<f64>,
     ts: Option<f64>,
     seq: Option<u64>,
+    key_hash: Option<u64>,
     hops: &[(String, f64, f64)],
     new_hop: Option<(&str, f64, f64)>,
     event: Option<(&Val, &[RecordField])>,
 ) -> Bytes {
     let mut out = Vec::with_capacity(96 + hops.len() * 40);
-    wire::write_header(&mut out, ts_wall, ts, seq, hops, new_hop);
+    wire::write_header(&mut out, ts_wall, ts, seq, key_hash, hops, new_hop);
 
     let count_pos = out.len();
     out.extend_from_slice(&0u16.to_le_bytes());
@@ -512,12 +529,13 @@ fn write_binary_raw_fields(
     ts_wall: Option<f64>,
     ts: Option<f64>,
     seq: Option<u64>,
+    key_hash: Option<u64>,
     hops: &[(String, f64, f64)],
     new_hop: Option<(&str, f64, f64)>,
     fields: &[BinField],
 ) -> Bytes {
     let mut out = Vec::with_capacity(96 + hops.len() * 40);
-    wire::write_header(&mut out, ts_wall, ts, seq, hops, new_hop);
+    wire::write_header(&mut out, ts_wall, ts, seq, key_hash, hops, new_hop);
     out.extend_from_slice(&(fields.len().min(u16::MAX as usize) as u16).to_le_bytes());
     for f in fields.iter().take(u16::MAX as usize) {
         // An absent field still carries its original kind tag so the schema
@@ -586,6 +604,7 @@ mod tests {
             Some(123.4),
             Some(123.4),
             Some(7),
+            Some(epico_wire::fnv1a64(b"sensor-1")),
             &hops,
             Some(("forward#1", 2.0, 2.5)),
             Some((&val, &fields)),
@@ -605,7 +624,7 @@ mod tests {
             panic!("not a record");
         }
         // telemetry adapter
-        let bytes2 = write_binary(Some(9.0), None, None, &[], None, None);
+        let bytes2 = write_binary(Some(9.0), None, None, None, &[], None, None);
         let tj = binary_to_telemetry_json(&bytes2).unwrap();
         assert_eq!(tj["bench_ts_wall"].as_f64(), Some(9.0));
     }
@@ -686,7 +705,7 @@ impl EventEnvelope {
             EnvelopeFormat::Binary => {
                 let (ts_wall, ts, seq, hops) = self.bench_parts();
                 Ok(write_binary_typed(
-                    ts_wall, ts, seq, &hops,
+                    ts_wall, ts, seq, self.key_hash(), &hops,
                     Some((hop_label, enter_ts, exit_ts)),
                     fields,
                 ))
@@ -784,12 +803,13 @@ fn write_binary_typed(
     ts_wall: Option<f64>,
     ts: Option<f64>,
     seq: Option<u64>,
+    key_hash: Option<u64>,
     hops: &[(String, f64, f64)],
     new_hop: Option<(&str, f64, f64)>,
     fields: &[(&'static str, WireValue)],
 ) -> Bytes {
     let mut out = Vec::with_capacity(96 + hops.len() * 40);
-    wire::write_header(&mut out, ts_wall, ts, seq, hops, new_hop);
+    wire::write_header(&mut out, ts_wall, ts, seq, key_hash, hops, new_hop);
     out.extend_from_slice(&(fields.len().min(u16::MAX as usize) as u16).to_le_bytes());
     for (name, v) in fields.iter().take(u16::MAX as usize) {
         let (tag, scalar): (u8, Option<BinScalar>) = match v {

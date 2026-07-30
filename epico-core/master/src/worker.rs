@@ -20,6 +20,7 @@ use epico_logger::Logger;
 use epico_logger::{debug, error, info, warn};
 
 use crate::config::PipelineStage;
+use crate::eos::StageEosBarrier;
 use crate::conversion::{extract_record_fields, extract_result_event_fields};
 use crate::envelope::{EnvelopeFormat, EventEnvelope};
 use crate::host::HostState;
@@ -59,6 +60,7 @@ pub(crate) fn spawn_worker(
     decision_ts:    f64,
     worker_ctx:     zmq::Context,
     event_format:   String,
+    barrier:        Arc<StageEosBarrier>,
     log:            Logger,
 ) -> WorkerHandle {
     let stage_clone       = stage.clone();
@@ -78,7 +80,7 @@ pub(crate) fn spawn_worker(
             stage_clone, replica_idx, in_ep, out_ep, input_edge, output_edge, credit_window,
             engine_clone, instance_pre_clone,
             heartbeat_clone, avg_lat_clone,
-            drain_clone, decision_ts, worker_ctx, event_format, log,
+            drain_clone, decision_ts, worker_ctx, event_format, barrier, log,
         );
         done_clone.store(true, Ordering::Relaxed);
     });
@@ -119,7 +121,32 @@ impl WorkerInput {
         match self {
             WorkerInput::Zmq { dealer, pending } => loop {
                 if drain.load(Ordering::Relaxed) {
-                    return None;
+                    // Flush work this worker has already accepted before
+                    // exiting: buffered batch events first, then whatever sits
+                    // in the socket buffer (non-blocking). Previously a raised
+                    // drain discarded both — the zmq flavor of the 1.6 leak.
+                    if let Some(ev) = pending.pop_front() {
+                        return Some(ev);
+                    }
+                    match dealer.recv_multipart(zmq::DONTWAIT) {
+                        Ok(frames) => {
+                            let start =
+                                if !frames.is_empty() && frames[0].is_empty() { 1 } else { 0 };
+                            let mut iter = frames.into_iter().skip(start);
+                            match iter.next() {
+                                Some(first) => {
+                                    for extra in iter {
+                                        if !extra.is_empty() {
+                                            pending.push_back(Bytes::from(extra));
+                                        }
+                                    }
+                                    return Some(Bytes::from(first));
+                                }
+                                None => continue,
+                            }
+                        }
+                        Err(_) => return None, // EAGAIN: socket empty — done
+                    }
                 }
                 if let Some(ev) = pending.pop_front() {
                     return Some(ev);
@@ -207,6 +234,7 @@ fn run_wasm_worker(
     decision_ts:    f64,
     worker_ctx:     zmq::Context,
     event_format:   String,
+    barrier:        Arc<StageEosBarrier>,
     log:            Logger,
 ) {
     let spawn_ts   = decision_ts;
@@ -223,8 +251,6 @@ fn run_wasm_worker(
     // die with the process, and a blocked mesh push registers in the edge's
     // occupancy signal so the downstream autoscaler respawns a consumer.
     let never_drain = AtomicBool::new(false);
-    // EOS deferred behind in-proc residue (see the is_eos handling below).
-    let mut eos_pending: Option<Bytes> = None;
 
     // Native-bypass experiment mode (`EPICO_NATIVE_STAGE`):
     //   "passthrough" — forward the input bytes untouched: no JSON parse, no
@@ -532,6 +558,10 @@ fn run_wasm_worker(
     // fine, and the dispatcher only substring-scans for n_credits.
     let mut sent_boot_refill = false;
 
+    // Boot succeeded: this replica now counts toward the stage's live set for
+    // the EOS barrier (see eos.rs — the LAST worker out forwards the marker).
+    barrier.worker_started();
+
     // ── Event loop ────────────────────────────────────────────────────────────
     // Events may arrive batched: one ROUTER message carries
     // [<delimiter>, ev1, ev2, ...]. We process one event per iteration and
@@ -573,17 +603,12 @@ fn run_wasm_worker(
             let is_eos = event_bytes.len() >= EOS_PAT.len()
                 && event_bytes.windows(EOS_PAT.len()).any(|w| w == EOS_PAT);
             if is_eos {
-                if !worker_input.wants_credits() {
-                    // Same residue-ordering rule as the main EOS path below.
-                    eos_pending = Some(event_owned.clone());
-                    drain_flag.store(true, Ordering::Relaxed);
-                    continue;
-                }
-                info!(log, "EOS received (passthrough); forwarding and exiting",
-                      stage = stage.name);
-                worker_output.send(event_owned.clone(), &never_drain);
+                // Report to the stage barrier and keep processing; the
+                // autoscaler drains the whole stage and the LAST worker out
+                // forwards the marker (see eos.rs).
+                barrier.report(event_owned.clone());
                 worker_input.send_control(b"");
-                break;
+                continue;
             }
             worker_output.send(event_owned.clone(), &never_drain);
             invocation_count += 1;
@@ -620,23 +645,16 @@ fn run_wasm_worker(
         serde_ns += parse_t0.elapsed().as_nanos() as u64;
 
         if envelope.is_eos() {
-            if !worker_input.wants_credits() {
-                // In-proc input: residue for THIS worker may still sit behind
-                // the EOS (a mesh column holds n_prod rings — EOS is last only
-                // within ONE producer's ring; the shared MPMC ring can hold
-                // events popped-later too). Forwarding EOS now would let it
-                // overtake that residue and shut the collector down early.
-                // Defer: raise our own drain flag — pop hands out the residue
-                // until the input is empty — and send EOS at loop exit.
-                info!(log, "EOS received; draining in-proc residue first", stage = stage.name);
-                eos_pending = Some(event_owned.clone());
-                drain_flag.store(true, Ordering::Relaxed);
-                continue;
-            }
-            info!(log, "EOS received; forwarding and exiting", stage = stage.name);
-            worker_output.send(event_owned.clone(), &never_drain);
+            // Control-plane EOS (M0 barrier): report to the stage barrier and
+            // keep processing. The autoscaler transitions the stage to
+            // finishing (drains every replica); the LAST worker out forwards
+            // the marker, so nothing can be in flight behind it — this
+            // replaces the per-worker deferral AND fixes the sibling-overtake
+            // race (TODO 1.5) structurally.
+            info!(log, "EOS marker received; reported to stage barrier", stage = stage.name);
+            barrier.report(event_owned.clone());
             worker_input.send_control(b"");
-            break;
+            continue;
         }
 
         // ── Native bypass: serde ──────────────────────────────────────────
@@ -870,11 +888,12 @@ fn run_wasm_worker(
         }
     }
 
-    // Deferred EOS: the in-proc residue is fully processed (pop returned
-    // None with drain raised), so EOS is now genuinely last from this worker.
-    if let Some(eos) = eos_pending {
-        info!(log, "residue drained; forwarding EOS", stage = stage.name);
-        worker_output.send(eos, &never_drain);
+    // EOS barrier: if the stage is finishing and this was the last live
+    // replica, forward the marker — every sibling has already drained and
+    // exited, so the marker is genuinely last for the whole stage.
+    if let Some(marker) = barrier.worker_finished() {
+        info!(log, "stage drained; forwarding EOS downstream", stage = stage.name);
+        worker_output.send(marker, &never_drain);
         worker_input.send_control(b"");
     }
 
