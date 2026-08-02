@@ -56,12 +56,19 @@ impl StageEosBarrier {
         }
     }
 
-    /// A worker decoded an EOS marker on this stage's input. Stores the
-    /// payload (first marker wins — forwarded verbatim downstream) and counts
-    /// it toward `expected_in`.
+    /// A worker decoded an EOS marker on this stage's input. Counts it toward
+    /// `expected_in` and folds its payload into the stage's outgoing marker.
+    ///
+    /// With in-degree 1 the payload passes through byte-for-byte. With fan-in
+    /// the branch markers are MERGED (see [`merge_markers`]) — first-wins would
+    /// silently under-report the event count the moment a stage has more than
+    /// one upstream branch.
     pub fn report(&self, marker: Bytes) {
         if let Ok(mut slot) = self.marker.lock() {
-            slot.get_or_insert(marker);
+            *slot = Some(match slot.take() {
+                None           => marker,
+                Some(existing) => merge_markers(&existing, &marker),
+            });
         }
         self.seen.fetch_add(1, Ordering::SeqCst);
     }
@@ -98,6 +105,41 @@ impl StageEosBarrier {
             None
         }
     }
+}
+
+/// Fold two EOS markers from different upstream branches into one.
+///
+/// Counters (`loadgen_sent`, `expected_count`) SUM: each branch reports what
+/// flowed down it, and under broadcast an event legitimately arrives on more
+/// than one branch, so the total is what a fan-in stage forwards. The done
+/// timestamp takes the later of the two. Anything unparseable keeps the first
+/// marker rather than dropping the run's end signal.
+fn merge_markers(a: &[u8], b: &[u8]) -> Bytes {
+    let (Ok(mut va), Ok(vb)) = (
+        serde_json::from_slice::<serde_json::Value>(a),
+        serde_json::from_slice::<serde_json::Value>(b),
+    ) else {
+        return Bytes::copy_from_slice(a);
+    };
+    let Some(obj) = va.as_object_mut() else { return Bytes::copy_from_slice(a) };
+
+    for key in ["loadgen_sent", "expected_count"] {
+        let sum = obj.get(key).and_then(|v| v.as_u64()).unwrap_or(0)
+            + vb.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+        if sum > 0 {
+            obj.insert(key.to_string(), serde_json::json!(sum));
+        }
+    }
+    let ts = f64::max(
+        obj.get("loadgen_done_ts").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        vb.get("loadgen_done_ts").and_then(|v| v.as_f64()).unwrap_or(0.0),
+    );
+    if ts > 0.0 {
+        obj.insert("loadgen_done_ts".to_string(), serde_json::json!(ts));
+    }
+    serde_json::to_vec(&va)
+        .map(Bytes::from)
+        .unwrap_or_else(|_| Bytes::copy_from_slice(a))
 }
 
 #[cfg(test)]
@@ -137,6 +179,39 @@ mod tests {
         // A hypothetical extra exit cannot yield a second marker.
         b.worker_started();
         assert_eq!(b.worker_finished(), None);
+    }
+
+    /// Linear pipelines must be untouched: one marker in, same bytes out.
+    #[test]
+    fn single_marker_passes_through_verbatim() {
+        let b = StageEosBarrier::new(1);
+        b.worker_started();
+        b.report(marker());
+        b.begin_finishing();
+        assert_eq!(b.worker_finished(), Some(marker()));
+    }
+
+    /// Fan-in: branch counts sum, so the forwarded marker describes the whole
+    /// stage rather than whichever branch happened to arrive first.
+    #[test]
+    fn fan_in_markers_merge_counts() {
+        let b = StageEosBarrier::new(2);
+        b.worker_started();
+        b.report(Bytes::from_static(
+            b"{\"__epico_eos\":true,\"loadgen_sent\":100,\"expected_count\":100,\"loadgen_done_ts\":5.0}",
+        ));
+        b.report(Bytes::from_static(
+            b"{\"__epico_eos\":true,\"loadgen_sent\":50,\"expected_count\":50,\"loadgen_done_ts\":7.5}",
+        ));
+        assert!(b.all_markers_seen());
+        b.begin_finishing();
+
+        let merged = b.worker_finished().expect("merged marker");
+        let v: serde_json::Value = serde_json::from_slice(&merged).unwrap();
+        assert_eq!(v["__epico_eos"], serde_json::json!(true));
+        assert_eq!(v["loadgen_sent"].as_u64(), Some(150));
+        assert_eq!(v["expected_count"].as_u64(), Some(150));
+        assert_eq!(v["loadgen_done_ts"].as_f64(), Some(7.5)); // later of the two
     }
 
     #[test]

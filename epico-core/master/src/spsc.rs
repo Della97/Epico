@@ -479,14 +479,24 @@ impl EdgeInSrc {
 pub enum EdgeOutSrc {
     None,
     Ring(Edge),
-    Mesh(Arc<SpscMesh>),
+    /// A producer stage's handle on a consumer stage's mesh. `base` is where
+    /// this stage's producer slots start in the mesh's global producer index
+    /// space, so replica `r` writes to column `base + r`. With one upstream
+    /// stage `base == 0` (identical to pre-fan-in behaviour); with several,
+    /// each upstream owns a disjoint contiguous range, which is what keeps the
+    /// one-writer-per-ring invariant under fan-in.
+    Mesh { mesh: Arc<SpscMesh>, base: usize },
 }
 impl EdgeOutSrc {
     pub fn for_replica(&self, r: usize) -> Option<EdgeOut> {
         match self {
             EdgeOutSrc::None => None,
             EdgeOutSrc::Ring(e) => Some(EdgeOut::Ring(e.clone())),
-            EdgeOutSrc::Mesh(m) => Some(EdgeOut::Mesh(MeshTx::new(m.clone(), r))),
+            // `base + r` is a MESH producer index (`mesh_pi`), a different
+            // space from the stage-local `replica_idx` — never conflate them.
+            EdgeOutSrc::Mesh { mesh, base } => {
+                Some(EdgeOut::Mesh(MeshTx::new(mesh.clone(), base + r)))
+            }
         }
     }
 }
@@ -553,6 +563,65 @@ mod tests {
         }
         prod.join().unwrap();
         assert_eq!(got, N);
+    }
+
+    /// Fan-in: two upstream stages, each with its own base, writing into one
+    /// consumer stage's mesh. Every event must arrive exactly once and no two
+    /// producers may share a ring.
+    #[test]
+    fn mesh_fan_in_from_two_upstream_stages() {
+        const A_REPLICAS: usize = 2;
+        const B_REPLICAS: usize = 3;
+        const NC: usize = 2;
+        const PER: u64 = 50_000;
+
+        let mesh = Arc::new(SpscMesh::new(A_REPLICAS + B_REPLICAS, NC, 64));
+        // Producer-side handles as master.rs builds them: stage A at base 0,
+        // stage B at base A_REPLICAS.
+        let a_src = EdgeOutSrc::Mesh { mesh: mesh.clone(), base: 0 };
+        let b_src = EdgeOutSrc::Mesh { mesh: mesh.clone(), base: A_REPLICAS };
+
+        let received = Arc::new(AtomicU64::new(0));
+        let sum = Arc::new(AtomicU64::new(0));
+        let total = ((A_REPLICAS + B_REPLICAS) as u64) * PER;
+
+        let mut handles = Vec::new();
+        for (src, stage_id) in [(&a_src, 0u64), (&b_src, 1u64)] {
+            let replicas = if stage_id == 0 { A_REPLICAS } else { B_REPLICAS };
+            for r in 0..replicas {
+                let out = src.for_replica(r).unwrap();
+                handles.push(thread::spawn(move || {
+                    let never = AtomicBool::new(false);
+                    for k in 0..PER {
+                        // Globally unique payload per (stage, replica, k).
+                        let payload = (stage_id * 100 + r as u64) * PER + k;
+                        assert!(out.push(ev(payload), &never));
+                    }
+                }));
+            }
+        }
+        let drain = Arc::new(AtomicBool::new(false));
+        for ci in 0..NC {
+            let rx = MeshRx::new(mesh.clone(), ci);
+            let recv = received.clone();
+            let s = sum.clone();
+            let d = drain.clone();
+            handles.push(thread::spawn(move || {
+                while let Some(v) = rx.pop(&d) {
+                    s.fetch_add(num(&v), O::Relaxed);
+                    recv.fetch_add(1, O::Relaxed);
+                }
+            }));
+        }
+        // Producers finish, then let consumers drain to empty.
+        while received.load(O::Relaxed) < total {
+            std::thread::yield_now();
+        }
+        drain.store(true, Ordering::Relaxed);
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(received.load(O::Relaxed), total, "fan-in lost or duplicated events");
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::eos::StageEosBarrier;
 use crate::host::HostState;
 use crate::spsc::{EdgeInSrc, EdgeOutSrc};
 use crate::telemetry::{record_event, stats::round3, RunTelemetry, ScalingEvent};
-use crate::worker::{spawn_worker, WorkerHandle};
+use crate::worker::{spawn_worker, OutputSpec, WorkerHandle};
 
 const TICK_MS: u64 = 1;
 const SPAWN_SETTLE_TICKS: u32 = 3;
@@ -120,7 +120,7 @@ pub(crate) fn run_autoscaler_loop(
     ctrl_port:     u16,
     credit_window: u32,
     input_edge:    EdgeInSrc,
-    output_edge:   EdgeOutSrc,
+    output_edges:  Vec<EdgeOutSrc>,
     engine:        Engine,
     log:           Logger,
     telemetry:     Arc<Mutex<RunTelemetry>>,
@@ -139,7 +139,24 @@ pub(crate) fn run_autoscaler_loop(
         ((stage.slo.cooldown_down_s.unwrap_or(5.0) * 1000.0) as u64 / TICK_MS).max(1) as u32;
 
     let in_endpoint  = make_pull_endpoint(&stage.input);
-    let out_endpoint = make_push_endpoint(&stage.output);
+    // One endpoint per out-edge, index-aligned with `output_edges` and with
+    // the stage's successors. An in-proc handle wins when present; otherwise
+    // the worker connects a PUSH socket to the endpoint.
+    let out_endpoints: Vec<String> = stage.outputs.iter()
+        .map(|o| make_push_endpoint(o))
+        .collect();
+    let n_outputs = out_endpoints.len().max(output_edges.len());
+
+    // Resolve this stage's out-edges for one replica: in-proc queue handle
+    // where we have one, zmq endpoint otherwise.
+    let build_output_specs = |replica_idx: usize| -> Vec<OutputSpec> {
+        (0..n_outputs)
+            .map(|i| match output_edges.get(i).and_then(|src| src.for_replica(replica_idx)) {
+                Some(edge) => OutputSpec::Queue(edge),
+                None => OutputSpec::Zmq(out_endpoints.get(i).cloned().unwrap_or_default()),
+            })
+            .collect()
+    };
 
     let wasm_path = stage.wasm.clone().expect("wasm path resolved in main()");
     info!(log, "loading component",
@@ -445,8 +462,9 @@ pub(crate) fn run_autoscaler_loop(
                 }
             };
             workers.push(spawn_worker(
-                &stage, replica_idx, &in_endpoint, &out_endpoint,
-                input_edge.for_replica(replica_idx), output_edge.for_replica(replica_idx),
+                &stage, replica_idx, &in_endpoint,
+                build_output_specs(replica_idx),
+                input_edge.for_replica(replica_idx),
                 credit_window,
                 &engine, instance_pre,
                 &last_active_ts, &avg_latency_us,
@@ -495,8 +513,9 @@ pub(crate) fn run_autoscaler_loop(
                 }
             };
             workers.push(spawn_worker(
-                &stage, replica_idx, &in_endpoint, &out_endpoint,
-                input_edge.for_replica(replica_idx), output_edge.for_replica(replica_idx),
+                &stage, replica_idx, &in_endpoint,
+                build_output_specs(replica_idx),
+                input_edge.for_replica(replica_idx),
                 credit_window,
                 &engine, instance_pre,
                 &last_active_ts, &avg_latency_us,
@@ -541,8 +560,9 @@ pub(crate) fn run_autoscaler_loop(
                 }
             };
             workers.push(spawn_worker(
-                &stage, replica_idx, &in_endpoint, &out_endpoint,
-                input_edge.for_replica(replica_idx), output_edge.for_replica(replica_idx),
+                &stage, replica_idx, &in_endpoint,
+                build_output_specs(replica_idx),
+                input_edge.for_replica(replica_idx),
                 credit_window,
                 &engine, instance_pre,
                 &last_active_ts, &avg_latency_us,

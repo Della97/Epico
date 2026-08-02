@@ -1,0 +1,232 @@
+# dag-nested — nested fan-out / fan-in stress topology.
+#
+# The diamond (examples/dag-diamond) proves one fan-out and one fan-in work.
+# This one nests them: fan-outs inside fan-out branches, fan-ins whose inputs
+# are themselves fan-ins, branches of unequal depth meeting at one barrier, a
+# stage feeding two different joins, and one stage that is both a fan-in and a
+# fan-out. Every stage is an identity, so the only thing under test is
+# topology bookkeeping.
+#
+#   upper half — the two nested fan-outs converge on two joins:
+#
+#              ┌────────────────► gamma ──────────────────┐
+#              │                                          │
+#              │          ┌──► alphaone ──────────────────┤
+#     ingest ──┼──► alpha ─┤                              ├──► joinleft
+#              │          └──► alphatwo ──────────────────┤
+#              │                                          │
+#              │          ┌──► betatwo ───────────────────┘
+#              └──► beta ─┤          └──────────┐
+#                         └──► betaone ─────────┴─────────────► joinright
+#
+#   lower half — the joins fuse, then broadcast into one terminal sink:
+#
+#     joinleft ──┐                    ┌──► tailup ───┐
+#                ├──► fuse ───────────┤              ├──► terminal ──► collector
+#     joinright ─┘                    └──► taildown ─┘
+#
+# What each shape is here to break:
+#   * ingest      out-degree 3 — wider broadcast than the diamond's 2.
+#   * alpha/beta  fan-out NESTED inside a fan-out branch.
+#   * gamma       depth-1 branch landing on a barrier whose other inputs are
+#                 at depth 2 — joinleft's EOS markers arrive from paths of
+#                 UNEQUAL length, so the barrier cannot assume lockstep.
+#   * betatwo     feeds BOTH joins: two barriers share one upstream, and its
+#                 events are counted down two different path sets.
+#   * joinleft    4-way fan-in, over upstreams with DIFFERENT max_replicas —
+#                 exercises the spsc mesh's global producer index space
+#                 (base += pred.max_replicas), not just a symmetric mesh.
+#   * fuse        in-degree 2 AND out-degree 2 on the same stage: a fan-in of
+#                 fan-ins that immediately re-broadcasts.
+#   * terminal    the ONLY out-degree-0 stage, so exactly one merged EOS
+#                 marker reaches the collector and ends the run.
+#
+# Event conservation (broadcast copies on every out-edge, so counts are exact,
+# not approximate). P(v) = paths ingest→v, D(v) = paths v→collector:
+#
+#     stage        P    D    per_stage_count = P·D
+#     ingest       1   12         12
+#     alpha        1    4          4
+#     beta         1    6          6
+#     gamma        1    2          2
+#     alphaone     1    2          2
+#     alphatwo     1    2          2
+#     betaone      1    2          2
+#     betatwo      1    4          4
+#     joinleft     4    2          8
+#     joinright    2    2          4
+#     fuse         6    2         12
+#     tailup       6    1          6
+#     taildown     6    1          6
+#     terminal    12    1         12
+#
+# The collector must receive EXACTLY 12 × sent. The test script recomputes
+# this table from `edges:` below rather than trusting these numbers, so the
+# topology can be edited without the assertions going stale.
+#
+# Run:  tests/no_leak_dag_nested.sh   (from repo root; iterates edge transports)
+
+package: epico:dagnested@1.0.0
+
+nodes:
+  - name: local
+    host: 127.0.0.1
+    force_tcp: false
+
+# One record type everywhere so every edge type-checks.
+types:
+  msg:
+    sensor_id: string
+    value:     f64
+
+source:
+  kind: loadgen
+  profile: pulse
+  count: 20000
+  pulse_events: 5000
+  pulse_idle_s: 2.0
+  sensors: 100
+
+# max_replicas is deliberately NOT uniform: a fan-in's producer index space is
+# laid out as disjoint per-upstream ranges sized by each upstream's max, so
+# equal maxima everywhere would hide an off-by-one in that arithmetic.
+stages:
+  - name: ingest
+    placement: local
+    in:  msg
+    out: msg
+    src: ./stages/ingest.rs
+    scaling: { min: 0, max: 2, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 1.0 }
+
+  - name: alpha
+    placement: local
+    in:  msg
+    out: msg
+    src: ./stages/alpha.rs
+    scaling: { min: 0, max: 2, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 1.0 }
+
+  - name: beta
+    placement: local
+    in:  msg
+    out: msg
+    src: ./stages/beta.rs
+    scaling: { min: 0, max: 3, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 1.0 }
+
+  - name: gamma
+    placement: local
+    in:  msg
+    out: msg
+    src: ./stages/gamma.rs
+    scaling: { min: 0, max: 1, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 1.0 }
+
+  - name: alphaone
+    placement: local
+    in:  msg
+    out: msg
+    src: ./stages/alphaone.rs
+    scaling: { min: 0, max: 2, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 1.0 }
+
+  - name: alphatwo
+    placement: local
+    in:  msg
+    out: msg
+    src: ./stages/alphatwo.rs
+    scaling: { min: 0, max: 3, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 1.0 }
+
+  - name: betaone
+    placement: local
+    in:  msg
+    out: msg
+    src: ./stages/betaone.rs
+    scaling: { min: 0, max: 1, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 1.0 }
+
+  - name: betatwo
+    placement: local
+    in:  msg
+    out: msg
+    src: ./stages/betatwo.rs
+    scaling: { min: 0, max: 2, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 1.0 }
+
+  - name: joinleft
+    placement: local
+    in:  msg
+    out: msg
+    src: ./stages/joinleft.rs
+    scaling: { min: 0, max: 3, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 1.0 }
+
+  - name: joinright
+    placement: local
+    in:  msg
+    out: msg
+    src: ./stages/joinright.rs
+    scaling: { min: 0, max: 2, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 1.0 }
+
+  - name: fuse
+    placement: local
+    in:  msg
+    out: msg
+    src: ./stages/fuse.rs
+    scaling: { min: 0, max: 3, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 1.0 }
+
+  - name: tailup
+    placement: local
+    in:  msg
+    out: msg
+    src: ./stages/tailup.rs
+    scaling: { min: 0, max: 2, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 1.0 }
+
+  - name: taildown
+    placement: local
+    in:  msg
+    out: msg
+    src: ./stages/taildown.rs
+    scaling: { min: 0, max: 2, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 1.0 }
+
+  - name: terminal
+    placement: local
+    in:  msg
+    out: msg
+    src: ./stages/terminal.rs
+    scaling: { min: 0, max: 3, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 1.0 }
+
+edges:
+  # level 1 — root broadcast, out-degree 3
+  - ingest    -> alpha
+  - ingest    -> beta
+  - ingest    -> gamma
+  # level 2 — fan-outs nested inside two of those branches
+  - alpha     -> alphaone
+  - alpha     -> alphatwo
+  - beta      -> betaone
+  - beta      -> betatwo
+  # level 3 — 4-way fan-in, one input (gamma) arriving a level early
+  - gamma     -> joinleft
+  - alphaone  -> joinleft
+  - alphatwo  -> joinleft
+  - betatwo   -> joinleft      # cross edge: betatwo feeds BOTH joins
+  # level 3 — 2-way fan-in sharing betatwo with joinleft
+  - betaone   -> joinright
+  - betatwo   -> joinright
+  # level 4 — fan-in of fan-ins, then immediate re-broadcast
+  - joinleft  -> fuse
+  - joinright -> fuse
+  - fuse      -> tailup
+  - fuse      -> taildown
+  # level 5 — collapse to a single sink
+  - tailup    -> terminal
+  - taildown  -> terminal
+
+deploy:
+  host: localhost
+  this_host: local
+  ingress: ipc:///tmp/epico-dagnested-push
+  source_format: json
+  event_format:  json
+
+  ingress_mode: inprocess
+  edge_impl: spsc
+  spsc_ring_cap: 512
+
+  credit_window: 16
+  batch_events:  1
+  resource_sample_interval_ms: 0

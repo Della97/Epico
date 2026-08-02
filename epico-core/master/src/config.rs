@@ -41,7 +41,16 @@ pub(crate) struct StageSlo {
 pub(crate) struct PipelineStage {
     pub name: String,
     pub input: String,
-    pub output: String,
+    /// Legacy single-output field. Kept for hand-written and pre-DAG
+    /// runtime.yaml files; `normalize_topology` folds it into `outputs`,
+    /// which is what the runtime actually reads.
+    #[serde(default)]
+    pub output: Option<String>,
+    /// Downstream endpoints, one per out-edge, index-aligned with this
+    /// stage's out-edges in `Config::edges` declaration order. A sink stage
+    /// carries exactly one entry: the collector URI.
+    #[serde(default)]
+    pub outputs: Vec<String>,
     #[serde(default)]
     pub wasm: Option<String>,
     #[serde(default)]
@@ -130,10 +139,28 @@ pub(crate) struct NodeConfig {
 // Top-level config (what the agent parses from runtime.yaml)
 // ---------------------------------------------------------------------------
 
+/// One directed edge of the pipeline DAG, by stage name.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub(crate) struct EdgeSpec {
+    pub from: String,
+    pub to: String,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct Config {
     pub pipeline: Vec<PipelineStage>,
     pub dispatchers: Vec<DispatcherConfig>,
+    /// Pipeline topology. Emitted by the CLI from the YAML's `edges:`.
+    /// When absent (hand-written or pre-DAG runtime.yaml) it is synthesized
+    /// as the linear chain implied by `pipeline` order — see
+    /// [`Config::normalize_topology`], the single place that fallback lives.
+    #[serde(default)]
+    pub edges: Vec<EdgeSpec>,
+    /// Terminal sink URI. Sink stages (out-degree 0) push here and the
+    /// collector binds it. Falls back to the last stage's legacy `output`
+    /// when absent, which is how every pre-DAG runtime.yaml behaves.
+    #[serde(default)]
+    pub collector: Option<String>,
     /// The node this agent instance represents. Every stage whose
     /// placement matches this value is owned by this agent; stages
     /// placed elsewhere are ignored (they're owned by another agent
@@ -234,6 +261,188 @@ pub(crate) fn default_compile_mode() -> String {
 
 pub(crate) fn default_event_format() -> String {
     "binary".to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Topology (M1)
+// ---------------------------------------------------------------------------
+//
+// The runtime is topology-driven: nothing reads `pipeline` array ORDER to
+// decide who feeds whom. `edges` is the single source of truth, and the
+// linear-chain fallback below is the only place that array order is still
+// consulted (for pre-DAG configs).
+
+impl Config {
+    /// Fill in derived topology so the rest of the runtime can assume
+    /// `edges` and `outputs` are always populated:
+    ///   * empty `edges` → the linear chain implied by `pipeline` order;
+    ///   * empty `outputs` → the legacy single `output` field;
+    ///   * missing `collector` → the last stage's legacy `output`.
+    ///
+    /// Idempotent. Called once, right after deserialization.
+    pub(crate) fn normalize_topology(&mut self) {
+        if self.edges.is_empty() {
+            for pair in self.pipeline.windows(2) {
+                self.edges.push(EdgeSpec {
+                    from: pair[0].name.clone(),
+                    to:   pair[1].name.clone(),
+                });
+            }
+        }
+        if self.collector.is_none() {
+            self.collector = self.pipeline.last().and_then(|s| s.output.clone());
+        }
+        for stage in self.pipeline.iter_mut() {
+            if stage.outputs.is_empty() {
+                if let Some(o) = stage.output.clone() {
+                    stage.outputs.push(o);
+                }
+            }
+        }
+    }
+
+    /// Upstream stage names feeding `stage`.
+    pub(crate) fn preds(&self, stage: &str) -> Vec<&str> {
+        self.edges.iter()
+            .filter(|e| e.to == stage)
+            .map(|e| e.from.as_str())
+            .collect()
+    }
+
+    /// Downstream stage names fed by `stage`, in edge-declaration order —
+    /// the same order as that stage's `outputs` entries.
+    pub(crate) fn succs(&self, stage: &str) -> Vec<&str> {
+        self.edges.iter()
+            .filter(|e| e.from == stage)
+            .map(|e| e.to.as_str())
+            .collect()
+    }
+
+    /// Number of upstream branches. This is the EOS barrier's `expected_in`:
+    /// a stage is finished only after every in-edge has delivered a marker.
+    pub(crate) fn in_degree(&self, stage: &str) -> usize {
+        self.edges.iter().filter(|e| e.to == stage).count()
+    }
+
+    pub(crate) fn out_degree(&self, stage: &str) -> usize {
+        self.edges.iter().filter(|e| e.from == stage).count()
+    }
+
+    /// Entry stages (in-degree 0). M1 expects exactly one.
+    pub(crate) fn sources(&self) -> Vec<&PipelineStage> {
+        self.pipeline.iter()
+            .filter(|s| self.in_degree(&s.name) == 0)
+            .collect()
+    }
+
+    /// Terminal stages (out-degree 0). All of them push to `collector`.
+    pub(crate) fn sinks(&self) -> Vec<&PipelineStage> {
+        self.pipeline.iter()
+            .filter(|s| self.out_degree(&s.name) == 0)
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod topology_tests {
+    use super::*;
+
+    fn stage(name: &str, output: Option<&str>) -> PipelineStage {
+        PipelineStage {
+            name:      name.to_string(),
+            input:     format!("ipc:///tmp/in-{name}"),
+            output:    output.map(str::to_string),
+            outputs:   Vec::new(),
+            wasm:      None,
+            binary:    None,
+            slo:       StageSlo {
+                p99_ms: None, max_replicas: 1, min_replicas: 0,
+                queue_up: None, queue_down: None, replica_capacity_eps: None,
+                cooldown_up_s: None, cooldown_down_s: None, calm_window: None,
+            },
+            placement: "local".to_string(),
+        }
+    }
+
+    fn cfg(stages: Vec<PipelineStage>, edges: Vec<(&str, &str)>) -> Config {
+        let mut c: Config = serde_yaml::from_str(
+            "pipeline: []\ndispatchers: []\n"
+        ).unwrap();
+        c.pipeline = stages;
+        c.edges = edges.into_iter()
+            .map(|(f, t)| EdgeSpec { from: f.into(), to: t.into() })
+            .collect();
+        c
+    }
+
+    /// Pre-DAG runtime.yaml: no `edges:`, no `outputs:`, just `output:`.
+    /// Must normalize into exactly the linear chain it always behaved as.
+    #[test]
+    fn legacy_config_normalizes_to_linear_chain() {
+        let mut c = cfg(
+            vec![
+                stage("a", Some("ipc:///tmp/b-push")),
+                stage("b", Some("tcp://localhost:9999")),
+            ],
+            vec![],
+        );
+        c.normalize_topology();
+
+        assert_eq!(c.edges, vec![EdgeSpec { from: "a".into(), to: "b".into() }]);
+        assert_eq!(c.pipeline[0].outputs, vec!["ipc:///tmp/b-push"]);
+        assert_eq!(c.pipeline[1].outputs, vec!["tcp://localhost:9999"]);
+        // Collector backfills from the last stage's legacy output.
+        assert_eq!(c.collector.as_deref(), Some("tcp://localhost:9999"));
+        assert_eq!(c.in_degree("a"), 0);
+        assert_eq!(c.in_degree("b"), 1);
+        assert_eq!(c.sources().len(), 1);
+        assert_eq!(c.sinks()[0].name, "b");
+    }
+
+    /// Explicit topology wins; array order is irrelevant.
+    #[test]
+    fn declared_edges_are_authoritative() {
+        let mut c = cfg(
+            vec![stage("b", None), stage("a", None), stage("c", None)],
+            vec![("a", "b"), ("a", "c")],
+        );
+        c.normalize_topology();
+
+        assert_eq!(c.sources().len(), 1);
+        assert_eq!(c.sources()[0].name, "a");           // NOT pipeline[0]
+        let mut sinks: Vec<&str> = c.sinks().iter().map(|s| s.name.as_str()).collect();
+        sinks.sort();
+        assert_eq!(sinks, vec!["b", "c"]);              // two terminal stages
+        assert_eq!(c.out_degree("a"), 2);               // fan-out
+        assert_eq!(c.succs("a"), vec!["b", "c"]);       // declaration order
+    }
+
+    /// Fan-in: in_degree drives the EOS barrier's expected marker count.
+    #[test]
+    fn fan_in_degree_counts_every_branch() {
+        let mut c = cfg(
+            vec![stage("src", None), stage("l", None), stage("r", None), stage("merge", None)],
+            vec![("src", "l"), ("src", "r"), ("l", "merge"), ("r", "merge")],
+        );
+        c.normalize_topology();
+
+        assert_eq!(c.in_degree("merge"), 2);
+        let mut preds = c.preds("merge");
+        preds.sort();
+        assert_eq!(preds, vec!["l", "r"]);
+        assert_eq!(c.sinks().len(), 1);
+        assert_eq!(c.sinks()[0].name, "merge");
+    }
+
+    /// Normalization must not clobber explicit values on a second call.
+    #[test]
+    fn normalize_is_idempotent() {
+        let mut c = cfg(vec![stage("a", Some("x")), stage("b", Some("y"))], vec![]);
+        c.normalize_topology();
+        let snapshot = (c.edges.clone(), c.pipeline[0].outputs.clone(), c.collector.clone());
+        c.normalize_topology();
+        assert_eq!((c.edges.clone(), c.pipeline[0].outputs.clone(), c.collector.clone()), snapshot);
+    }
 }
 
 // ---------------------------------------------------------------------------

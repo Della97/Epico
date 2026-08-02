@@ -895,28 +895,11 @@ fn write_runtime_yaml(
     wasm_by_stage: &[(String, PathBuf)],
     compile_mode: Option<&str>,
 ) -> Result<()> {
-    // We only support linear topology in the generated runtime.yaml
-    // because the existing master.rs expects it. Non-linear DAGs can be
-    // expressed in the new yaml but require master.rs fan-out support,
-    // which is out of scope for this change.
-    let mut is_linear = true;
-    if spec.edges.len() != spec.stages.len().saturating_sub(1) {
-        is_linear = false;
-    } else {
-        for (i, (from, to)) in spec.edges.iter().enumerate() {
-            if from != &spec.stages[i].name || to != &spec.stages[i + 1].name {
-                is_linear = false;
-                break;
-            }
-        }
-    }
-    if !is_linear {
-        anyhow::bail!(
-            "non-linear DAGs are not yet supported by the runtime \
-             (edges must be stage[i] -> stage[i+1] in declaration order). \
-             Fan-out/fan-in support is the next milestone."
-        );
-    }
+    // Topology validation (M1). Arbitrary DAGs are supported; what is
+    // rejected here is what the runtime genuinely cannot express yet.
+    // (Edge endpoints and per-edge type compatibility were already checked
+    // at parse time in config.rs.)
+    validate_dag(spec)?;
 
     // Build a node lookup. Every stage's placement is guaranteed valid
     // by the parser, so unwrap_or here is impossible to hit in practice.
@@ -1015,24 +998,50 @@ fn write_runtime_yaml(
             ipc_endpoint(&dispatch_name, "pull")
         };
 
-        // Output endpoint: this stage's worker writes to either the
-        // next stage's dispatcher, or the collector if this is the last
-        // stage. Same-node vs cross-node depends on placement.
-        let output = if i + 1 == spec.stages.len() {
-            spec.collector.clone()
+        // Output endpoints: one per out-edge of this stage, in `edges:`
+        // declaration order (the runtime relies on that alignment). A stage
+        // with no out-edge is a sink and writes to the collector.
+        //
+        // Pre-M1 this was derived from the ARRAY INDEX (`i+1 == len` →
+        // collector, else stage[i+1]'s dispatcher), which ignored the
+        // `edges:` block entirely — arbitrary DAGs parsed fine and then ran
+        // as a straight line. For a linear pipeline both derivations produce
+        // identical URIs, so generated YAML is unchanged for existing runs.
+        let succ_indices: Vec<usize> = spec
+            .edges
+            .iter()
+            .filter(|(from, _)| *from == stage.name)
+            .filter_map(|(_, to)| spec.stages.iter().position(|s| s.name == *to))
+            .collect();
+
+        let outputs: Vec<String> = if succ_indices.is_empty() {
+            vec![spec.collector.clone()]
         } else {
-            let next = node_for(i + 1);
-            let next_push = spec.port_base + ((i + 1) as u16) * 3;
-            let next_dispatch_name = format!(
-                "dispatch-{}",
-                spec.stages[i + 1].name.trim_start_matches("fn-")
-            );
-            if my_node.name == next.name && !my_node.force_tcp && !next.force_tcp {
-                ipc_endpoint(&next_dispatch_name, "push")
-            } else {
-                tcp_endpoint(&next.host, next_push)
-            }
+            succ_indices
+                .iter()
+                .map(|&j| {
+                    let next = node_for(j);
+                    let next_push = spec.port_base + (j as u16) * 3;
+                    let next_dispatch_name = format!(
+                        "dispatch-{}",
+                        spec.stages[j].name.trim_start_matches("fn-")
+                    );
+                    if my_node.name == next.name && !my_node.force_tcp && !next.force_tcp {
+                        ipc_endpoint(&next_dispatch_name, "push")
+                    } else {
+                        tcp_endpoint(&next.host, next_push)
+                    }
+                })
+                .collect()
         };
+        // `output:` (singular) stays for backward compatibility with any
+        // consumer of the generated file; `outputs:` is what the runtime reads.
+        let output = outputs[0].clone();
+        // Four-space indent to match the sibling keys in the stage block.
+        let outputs_line = format!(
+            "    outputs: [{}]\n",
+            outputs.join(", ")
+        );
 
         let wasm_path = &wasm_by_stage[i].1;
         let scaling = &stage.scaling;
@@ -1042,6 +1051,7 @@ fn write_runtime_yaml(
              \x20   placement: {placement}\n\
              \x20   input: {input}\n\
              \x20   output: {output}\n\
+             {outputs_line}\
              \x20   slo:\n\
              \x20     p99_ms: {p99}\n\
              \x20     min_replicas: {min}\n\
@@ -1055,6 +1065,7 @@ fn write_runtime_yaml(
             placement = stage.placement,
             input = input,
             output = output,
+            outputs_line = outputs_line,
             p99 = scaling.p99_ms,
             min = scaling.min_replicas,
             max = scaling.max_replicas,
@@ -1076,6 +1087,15 @@ fn write_runtime_yaml(
         .map(|n| format!("source_threads: {}\n", n))
         .unwrap_or_default();
 
+    // Logical topology. The runtime needs to know WHICH STAGE each output
+    // feeds (endpoint URIs alone don't say), so the edge list ships alongside
+    // the endpoints. Absent `edges:` makes the agent fall back to the linear
+    // chain implied by `pipeline` order.
+    let mut edges_block = String::from("edges:\n");
+    for (from, to) in &spec.edges {
+        edges_block.push_str(&format!("  - from: {from}\n    to:   {to}\n"));
+    }
+
     let combined = format!(
         "# GENERATED by epico-cli from pipeline.yaml. Do not edit directly.\n\
          # Source package: {pkg}\n\n\
@@ -1091,6 +1111,7 @@ fn write_runtime_yaml(
          {st}\
          {cm}\n\
          {nodes}\n\
+         {e}\n\
          {d}\n\
          {p}",
         pkg = spec.package,
@@ -1106,6 +1127,7 @@ fn write_runtime_yaml(
         st = source_threads_line,
         cm = compile_mode_line,
         nodes = nodes_block,
+        e = edges_block,
         d = dispatchers,
         p = pipeline,
     );
@@ -1192,4 +1214,90 @@ fn relative_path(from_dir: &Path, to: &Path) -> PathBuf {
             None => return to_abs,
         }
     }
+}
+
+/// Reject topologies the M1 runtime cannot run, with actionable messages.
+///
+/// Allowed: any acyclic graph with exactly one entry stage. Fan-out is
+/// broadcast (every successor gets a copy) and fan-in merges into one input
+/// queue per consumer stage.
+fn validate_dag(spec: &PipelineSpec) -> Result<()> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let names: Vec<&str> = spec.stages.iter().map(|s| s.name.as_str()).collect();
+
+    // ── Cycles: Kahn's algorithm. A DAG is the whole premise — a cycle would
+    // deadlock the EOS barrier (every stage waiting on an upstream marker).
+    let mut in_deg: HashMap<&str, usize> = names.iter().map(|n| (*n, 0)).collect();
+    let mut succ: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (from, to) in &spec.edges {
+        *in_deg.get_mut(to.as_str()).expect("edge target validated at parse time") += 1;
+        succ.entry(from.as_str()).or_default().push(to.as_str());
+    }
+    let mut queue: VecDeque<&str> = in_deg.iter()
+        .filter(|(_, d)| **d == 0)
+        .map(|(n, _)| *n)
+        .collect();
+    let mut visited = 0usize;
+    let mut in_deg_work = in_deg.clone();
+    while let Some(n) = queue.pop_front() {
+        visited += 1;
+        for m in succ.get(n).into_iter().flatten() {
+            let d = in_deg_work.get_mut(*m).unwrap();
+            *d -= 1;
+            if *d == 0 {
+                queue.push_back(m);
+            }
+        }
+    }
+    if visited != names.len() {
+        let stuck: Vec<&str> = in_deg_work.iter()
+            .filter(|(_, d)| **d > 0)
+            .map(|(n, _)| *n)
+            .collect();
+        anyhow::bail!(
+            "pipeline topology has a cycle (stages involved: {}). \
+             `edges:` must form a DAG.",
+            stuck.join(", ")
+        );
+    }
+
+    // ── Exactly one entry stage. Multi-source needs ingress fan-in plumbing
+    // (the loadgen/source feeds one URI), which is a later milestone.
+    let sources: Vec<&str> = names.iter()
+        .copied()
+        .filter(|n| in_deg.get(n).copied().unwrap_or(0) == 0)
+        .collect();
+    match sources.len() {
+        1 => {}
+        0 => anyhow::bail!("pipeline has no entry stage (every stage has an inbound edge)"),
+        _ => anyhow::bail!(
+            "pipeline has {} entry stages ({}); exactly one is supported — \
+             the source feeds a single ingress. Chain them, or wait for \
+             multi-source support.",
+            sources.len(),
+            sources.join(", ")
+        ),
+    }
+
+    // ── Weak connectivity: a stage unreachable from the entry never runs.
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut stack = vec![sources[0]];
+    while let Some(n) = stack.pop() {
+        if !seen.insert(n) {
+            continue;
+        }
+        for m in succ.get(n).into_iter().flatten() {
+            stack.push(m);
+        }
+    }
+    let orphans: Vec<&str> = names.iter().copied().filter(|n| !seen.contains(n)).collect();
+    if !orphans.is_empty() {
+        anyhow::bail!(
+            "stage(s) unreachable from the entry stage {:?}: {}",
+            sources[0],
+            orphans.join(", ")
+        );
+    }
+    Ok(())
 }

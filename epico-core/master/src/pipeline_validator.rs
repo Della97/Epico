@@ -33,6 +33,7 @@ pub struct StageSignature {
 /// Validate the pipeline. Returns a human-readable report on success.
 pub fn validate_pipeline_components(
     stages: &[(String, String)],
+    edges:  &[(String, String)],
 ) -> Result<Vec<String>> {
     if stages.is_empty() {
         bail!("pipeline is empty");
@@ -58,10 +59,20 @@ pub fn validate_pipeline_components(
         signatures.push(sig);
     }
 
-    // Pairwise structural compatibility check.
-    for window in signatures.windows(2) {
-        let prev = &window[0];
-        let next = &window[1];
+    // Per-EDGE structural compatibility check (M1). Previously this walked
+    // consecutive positions in the stage array, which silently validated the
+    // wrong pairs on any non-linear topology; now every declared edge is
+    // checked and array order is irrelevant.
+    let by_name: HashMap<&str, &StageSignature> = signatures
+        .iter()
+        .map(|s| (s.stage_name.as_str(), s))
+        .collect();
+
+    for (from, to) in edges {
+        let (Some(prev), Some(next)) = (by_name.get(from.as_str()), by_name.get(to.as_str()))
+        else {
+            bail!("edge {from:?} -> {to:?} references a stage that is not in the pipeline");
+        };
 
         if let (Some(prev_out), Some(next_in)) = (&prev.output, &next.input) {
             let output_fields: HashMap<&str, (&str, bool)> = prev_out

@@ -49,9 +49,8 @@ pub(crate) fn spawn_worker(
     stage:          &PipelineStage,
     replica_idx:    usize,
     in_endpoint:    &str,
-    out_endpoint:   &str,
+    output_specs:   Vec<OutputSpec>,
     input_edge:     Option<EdgeIn>,
-    output_edge:    Option<EdgeOut>,
     credit_window:  u32,
     engine:         &Engine,
     instance_pre:   &Arc<InstancePre<HostState>>,
@@ -65,7 +64,6 @@ pub(crate) fn spawn_worker(
 ) -> WorkerHandle {
     let stage_clone       = stage.clone();
     let in_ep             = in_endpoint.to_string();
-    let out_ep            = out_endpoint.to_string();
     let engine_clone      = engine.clone();
     let instance_pre_clone = instance_pre.clone();
     let heartbeat_clone   = heartbeat.clone();
@@ -77,7 +75,7 @@ pub(crate) fn spawn_worker(
 
     let handle = std::thread::spawn(move || {
         run_wasm_worker(
-            stage_clone, replica_idx, in_ep, out_ep, input_edge, output_edge, credit_window,
+            stage_clone, replica_idx, in_ep, output_specs, input_edge, credit_window,
             engine_clone, instance_pre_clone,
             heartbeat_clone, avg_lat_clone,
             drain_clone, decision_ts, worker_ctx, event_format, barrier, log,
@@ -86,6 +84,14 @@ pub(crate) fn spawn_worker(
     });
 
     WorkerHandle { _handle: handle, drain_flag, done, replica_idx }
+}
+
+/// One of a stage's out-edges, resolved for a specific replica: either an
+/// in-process queue handle or a zmq endpoint to connect a PUSH socket to.
+/// The autoscaler builds one per successor, in `succs()` order.
+pub(crate) enum OutputSpec {
+    Queue(EdgeOut),
+    Zmq(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +220,24 @@ impl WorkerOutput {
     }
 }
 
+/// Forward one event to EVERY out-edge (broadcast fan-out).
+///
+/// `Bytes::clone` is an atomic refcount bump on a shared buffer — the payload
+/// is never copied, so a K-way fan-out costs K sends, not K serializations.
+/// The last output takes the original handle so a linear stage (K = 1) does
+/// exactly one send with no clone at all.
+fn send_all(outs: &[WorkerOutput], bytes: Bytes, drain: &AtomicBool) {
+    match outs.split_last() {
+        None => {}
+        Some((last, rest)) => {
+            for o in rest {
+                o.send(bytes.clone(), drain);
+            }
+            last.send(bytes, drain);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Event loop
 // ---------------------------------------------------------------------------
@@ -222,9 +246,8 @@ fn run_wasm_worker(
     stage:          PipelineStage,
     replica_idx:    usize,
     in_endpoint:    String,
-    out_endpoint:   String,
+    output_specs:   Vec<OutputSpec>,
     input_edge:     Option<EdgeIn>,
-    output_edge:    Option<EdgeOut>,
     credit_window:  u32,
     engine:         Engine,
     instance_pre:   Arc<InstancePre<HostState>>,
@@ -306,24 +329,30 @@ fn run_wasm_worker(
     let ctx = worker_ctx;
     let t_ctx_ready_ms = start_time.elapsed().as_secs_f64() * 1000.0;
 
-    let pusher = ctx.socket(zmq::PUSH).expect("push socket");
-    let t_push_socket_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-    pusher.set_sndhwm(1000).ok();
-    let t_push_setopt_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+    // Outputs: one handle per out-edge (broadcast fan-out sends to all).
+    // In-proc edges need no socket; each zmq edge gets its own PUSH.
+    let mut worker_outputs: Vec<WorkerOutput> = Vec::with_capacity(output_specs.len());
+    for spec in output_specs {
+        match spec {
+            OutputSpec::Queue(edge) => worker_outputs.push(WorkerOutput::Queue(edge)),
+            OutputSpec::Zmq(addr) => {
+                let pusher = ctx.socket(zmq::PUSH).expect("push socket");
+                pusher.set_sndhwm(1000).ok();
+                if let Err(e) = pusher.connect(&addr) {
+                    error!(log, "PUSH connect failed", addr = addr, err = e);
+                    return;
+                }
+                worker_outputs.push(WorkerOutput::Zmq { pusher });
+            }
+        }
+    }
+    let t_outputs_ready_ms = start_time.elapsed().as_secs_f64() * 1000.0;
 
     let dealer = ctx.socket(zmq::DEALER).expect("dealer socket");
     let t_dealer_socket_ms = start_time.elapsed().as_secs_f64() * 1000.0;
     dealer.set_identity(rid_str.as_bytes()).ok();
     dealer.set_rcvtimeo(50).ok();
     let t_sockets_created_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-
-    if output_edge.is_none() {
-        if let Err(e) = pusher.connect(&out_endpoint) {
-            error!(log, "PUSH connect failed", addr = out_endpoint, err = e);
-            return;
-        }
-    }
-    let t_pusher_connect_ms = start_time.elapsed().as_secs_f64() * 1000.0;
 
     if input_edge.is_none() {
         if let Err(e) = dealer.connect(&in_endpoint) {
@@ -474,12 +503,12 @@ fn run_wasm_worker(
     // Per-phase deltas. Each is the time spent IN that phase, not the
     // cumulative checkpoint.
     let phase_ctx_ms             = t_ctx_ready_ms          - t_before_ctx_ms;
-    let phase_push_socket_ms     = t_push_socket_ms        - t_ctx_ready_ms;
-    let phase_push_setopt_ms     = t_push_setopt_ms        - t_push_socket_ms;
-    let phase_dealer_socket_ms   = t_dealer_socket_ms      - t_push_setopt_ms;
+    // All output handles (sockets created + set + connected) in one phase now
+    // that a stage can have several out-edges.
+    let phase_outputs_ms         = t_outputs_ready_ms      - t_ctx_ready_ms;
+    let phase_dealer_socket_ms   = t_dealer_socket_ms      - t_outputs_ready_ms;
     let phase_dealer_setopt_ms   = t_sockets_created_ms    - t_dealer_socket_ms;
-    let phase_pusher_connect_ms  = t_pusher_connect_ms     - t_sockets_created_ms;
-    let phase_dealer_connect_ms  = t_dealer_connect_ms     - t_pusher_connect_ms;
+    let phase_dealer_connect_ms  = t_dealer_connect_ms     - t_sockets_created_ms;
     let phase_pre_inst_ms        = t_before_instantiate_ms - t_dealer_connect_ms;
     let phase_instantiate_ms     = t_instantiate_ms        - t_before_instantiate_ms;
     let phase_export_ms          = t_export_lookup_ms      - t_instantiate_ms;
@@ -495,9 +524,9 @@ fn run_wasm_worker(
           cold_start_ms = format!("{:.3}", cold_start_ms),
           spawn_ms = format!("{:.3}", spawn_to_thread_ms),
           sockets_ms = format!("{:.3}",
-              phase_ctx_ms + phase_push_socket_ms + phase_push_setopt_ms
+              phase_ctx_ms + phase_outputs_ms
               + phase_dealer_socket_ms + phase_dealer_setopt_ms
-              + phase_pusher_connect_ms + phase_dealer_connect_ms),
+              + phase_dealer_connect_ms),
           instantiate_ms = format!("{:.3}", phase_pre_inst_ms + phase_instantiate_ms),
           export_ms = format!("{:.3}", phase_export_ms + phase_tail_ms),
           credit_window = credit_window);
@@ -507,11 +536,9 @@ fn run_wasm_worker(
           cold_start_ms = format!("{:.3}", cold_start_ms),
           spawn_to_thread_ms = format!("{:.3}", spawn_to_thread_ms),
           ph_ctx_ms = format!("{:.3}", phase_ctx_ms),
-          ph_push_socket_ms = format!("{:.3}", phase_push_socket_ms),
-          ph_push_setopt_ms = format!("{:.3}", phase_push_setopt_ms),
+          ph_outputs_ms = format!("{:.3}", phase_outputs_ms),
           ph_dealer_socket_ms = format!("{:.3}", phase_dealer_socket_ms),
           ph_dealer_setopt_ms = format!("{:.3}", phase_dealer_setopt_ms),
-          ph_pusher_connect_ms = format!("{:.3}", phase_pusher_connect_ms),
           ph_dealer_connect_ms = format!("{:.3}", phase_dealer_connect_ms),
           ph_pre_inst_ms = format!("{:.3}", phase_pre_inst_ms),
           ph_instantiate_ms = format!("{:.3}", phase_instantiate_ms),
@@ -528,10 +555,6 @@ fn run_wasm_worker(
     // on that side; the socket created above was never connected, so it's just
     // dropped here. The credit-window hello is sent only on a zmq input — the
     // queue path has no credit protocol.
-    let worker_output = match output_edge {
-        Some(edge) => WorkerOutput::Queue(edge),
-        None       => WorkerOutput::Zmq { pusher },
-    };
     let mut worker_input = match input_edge {
         Some(edge) => WorkerInput::Queue(edge),
         None       => {
@@ -610,7 +633,7 @@ fn run_wasm_worker(
                 worker_input.send_control(b"");
                 continue;
             }
-            worker_output.send(event_owned.clone(), &never_drain);
+            send_all(&worker_outputs, event_owned.clone(), &never_drain);
             invocation_count += 1;
             processed_since_refill += 1;
             if worker_input.wants_credits() && processed_since_refill >= refill_threshold {
@@ -675,7 +698,7 @@ fn run_wasm_worker(
                 }
             };
             serde_ns += ser_t0.elapsed().as_nanos() as u64;
-            worker_output.send(out, &never_drain);
+            send_all(&worker_outputs, out, &never_drain);
             invocation_count += 1;
             processed_since_refill += 1;
             if worker_input.wants_credits() && processed_since_refill >= refill_threshold {
@@ -701,7 +724,7 @@ fn run_wasm_worker(
                     let latency_us = ((exit_ts - enter_ts) * 1e6).max(0.0) as u64;
                     let prev_us = avg_latency_us.load(Ordering::Relaxed);
                     avg_latency_us.store((prev_us * 3 + latency_us) / 4, Ordering::Relaxed);
-                    worker_output.send(out_bytes, &never_drain);
+                    send_all(&worker_outputs, out_bytes, &never_drain);
                     invocation_count += 1;
                     processed_since_refill += 1;
                     if worker_input.wants_credits()
@@ -831,7 +854,7 @@ fn run_wasm_worker(
         let _ = process_fn.post_return(&mut store);
 
         if !final_bytes.is_empty() {
-            worker_output.send(final_bytes, &never_drain);
+            send_all(&worker_outputs, final_bytes, &never_drain);
         }
 
         let total_ns = total_t0.elapsed().as_nanos() as u64;
@@ -851,9 +874,9 @@ fn run_wasm_worker(
                      \"cold_start_ms\":{:.5},\"spawn_ts\":{:.6},\
                      \"spawn_to_thread_ms\":{:.5},\
                      \"ph_ctx_ms\":{:.5},\
-                     \"ph_push_socket_ms\":{:.5},\"ph_push_setopt_ms\":{:.5},\
+                     \"ph_outputs_ms\":{:.5},\
                      \"ph_dealer_socket_ms\":{:.5},\"ph_dealer_setopt_ms\":{:.5},\
-                     \"ph_pusher_connect_ms\":{:.5},\"ph_dealer_connect_ms\":{:.5},\
+                     \"ph_dealer_connect_ms\":{:.5},\
                      \"ph_pre_inst_ms\":{:.5},\
                      \"ph_instantiate_ms\":{:.5},\"ph_export_ms\":{:.5},\
                      \"ph_tail_ms\":{:.5},\
@@ -862,9 +885,9 @@ fn run_wasm_worker(
                     rid_str, stage.name, cold_start_ms, spawn_ts,
                     spawn_to_thread_ms,
                     phase_ctx_ms,
-                    phase_push_socket_ms, phase_push_setopt_ms,
+                    phase_outputs_ms,
                     phase_dealer_socket_ms, phase_dealer_setopt_ms,
-                    phase_pusher_connect_ms, phase_dealer_connect_ms,
+                    phase_dealer_connect_ms,
                     phase_pre_inst_ms,
                     phase_instantiate_ms, phase_export_ms,
                     phase_tail_ms,
@@ -893,7 +916,7 @@ fn run_wasm_worker(
     // exited, so the marker is genuinely last for the whole stage.
     if let Some(marker) = barrier.worker_finished() {
         info!(log, "stage drained; forwarding EOS downstream", stage = stage.name);
-        worker_output.send(marker, &never_drain);
+        send_all(&worker_outputs, marker, &never_drain);
         worker_input.send_control(b"");
     }
 

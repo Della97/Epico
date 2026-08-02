@@ -100,8 +100,7 @@ pub fn run_agent(
     // Enable with: cargo build --release -p master --features profile
     // On shutdown, writes flamegraph.svg into the log directory. pprof samples
     // from inside the process via SIGPROF, so no kernel perf_event privileges
-    // are needed. Overhead is ~1-3% at 99 Hz — fine for diagnosis runs, not
-    // for paper-quality benchmark numbers.
+    // are needed.
     #[cfg(feature = "profile")]
     let profiler_guard = {
         info!(log, "profiler enabled at 99 Hz");
@@ -145,7 +144,9 @@ pub fn run_agent(
             .unwrap_or(false)
         || matches!(config.edge_impl.as_str(), "mpmc" | "spsc");
     let mut input_edges:  HashMap<String, EdgeInSrc>  = HashMap::new();
-    let mut output_edges: HashMap<String, EdgeOutSrc> = HashMap::new();
+    // Per stage: one handle per out-edge, index-aligned with `config.succs()`
+    // (and therefore with the stage's `outputs:` endpoints).
+    let mut output_edges: HashMap<String, Vec<EdgeOutSrc>> = HashMap::new();
     let mut skip_dispatchers: HashSet<String> = HashSet::new();
     let mut ingress_source_edge: Option<Edge> = None;
     let mut egress_sink_edge:    Option<Edge> = None;
@@ -162,41 +163,78 @@ pub fn run_agent(
         .ok().and_then(|v| v.parse::<usize>().ok()).filter(|&c| c > 0)
         .unwrap_or(config.spsc_ring_cap);
     if inproc_edges {
-        for pair in config.pipeline.windows(2) {
-            let (prod, cons) = (&pair[0], &pair[1]);
+        // One input queue per CONSUMER stage, shared by every upstream stage
+        // that feeds it (M1 design D1) — that is what makes fan-in native:
+        // the mpmc ring is already multi-producer, and the spsc mesh gives
+        // each upstream stage a disjoint range of producer columns.
+        //
+        // Producers append their handle to `output_edges[producer]`, so a stage
+        // feeding K consumers ends up with K handles in `succs()` order —
+        // that is fan-out.
+        for stage in config.pipeline.iter() {
+            let preds = config.preds(&stage.name);
+            if preds.is_empty() { continue; }
+            let pred_stages: Vec<&crate::config::PipelineStage> = preds.iter()
+                .filter_map(|n| config.pipeline.iter().find(|s| &s.name == n))
+                .collect();
+            if pred_stages.is_empty() { continue; }
+
             if edge_impl == "spsc" {
+                // Global producer index space: upstream u owns
+                // [base(u), base(u) + u.max_replicas).
+                let n_prod: usize = pred_stages.iter().map(|p| p.slo.max_replicas).sum();
                 let mesh = Arc::new(SpscMesh::new(
-                    prod.slo.max_replicas, cons.slo.max_replicas, spsc_ring_cap));
-                output_edges.insert(prod.name.clone(), EdgeOutSrc::Mesh(mesh.clone()));
-                input_edges.insert(cons.name.clone(),  EdgeInSrc::Mesh(mesh));
+                    n_prod.max(1), stage.slo.max_replicas, spsc_ring_cap));
+                let mut base = 0usize;
+                for p in &pred_stages {
+                    output_edges.entry(p.name.clone()).or_default()
+                        .push(EdgeOutSrc::Mesh { mesh: mesh.clone(), base });
+                    info!(log, "in-process edge (spsc)",
+                          from = p.name, to = stage.name, base = base,
+                          producers = n_prod, cap = spsc_ring_cap);
+                    base += p.slo.max_replicas;
+                }
+                input_edges.insert(stage.name.clone(), EdgeInSrc::Mesh(mesh));
             } else {
                 let edge = Edge::new(edge_cap);
-                output_edges.insert(prod.name.clone(), EdgeOutSrc::Ring(edge.clone()));
-                input_edges.insert(cons.name.clone(),  EdgeInSrc::Ring(edge));
+                for p in &pred_stages {
+                    output_edges.entry(p.name.clone()).or_default()
+                        .push(EdgeOutSrc::Ring(edge.clone()));
+                    info!(log, "in-process edge (mpmc)",
+                          from = p.name, to = stage.name, cap = edge_cap);
+                }
+                input_edges.insert(stage.name.clone(), EdgeInSrc::Ring(edge));
             }
-            let bare = cons.name.strip_prefix("fn-").unwrap_or(&cons.name);
+            let bare = stage.name.strip_prefix("fn-").unwrap_or(&stage.name);
             skip_dispatchers.insert(format!("dispatch-{}", bare));
-            info!(log, "in-process edge", from = prod.name, to = cons.name, cap = edge_cap);
         }
     }
     if inproc_ingress {
-        // Source → first stage: replace the ingress dispatcher with a single
-        // PULL pump feeding the first stage's Edge. Skip that dispatcher.
-        if let Some(first) = config.pipeline.first() {
+        // Source → entry stage: replace the ingress dispatcher with a single
+        // PULL pump feeding the entry stage's Edge. Skip that dispatcher.
+        // M1 supports exactly one source stage (in-degree 0).
+        let source_name = config.sources().first().map(|s| s.name.clone());
+        if let Some(first) = source_name {
             let edge = Edge::new(edge_cap);
-            input_edges.insert(first.name.clone(), EdgeInSrc::Ring(edge.clone()));
+            input_edges.insert(first.clone(), EdgeInSrc::Ring(edge.clone()));
             ingress_source_edge = Some(edge);
-            let bare = first.name.strip_prefix("fn-").unwrap_or(&first.name);
+            let bare = first.strip_prefix("fn-").unwrap_or(&first);
             skip_dispatchers.insert(format!("dispatch-{}", bare));
-            info!(log, "in-process ingress (source pump)", to = first.name, cap = edge_cap);
+            info!(log, "in-process ingress (source pump)", to = first, cap = edge_cap);
         }
-        // Last stage → sink: the collector drains the last stage's Edge in
-        // process instead of binding a PULL socket. No egress socket on a host.
-        if let Some(last) = config.pipeline.last() {
+        // Sink stages → collector: the collector drains their Edge in process
+        // instead of binding a PULL socket. No egress socket on a host. Every
+        // sink shares ONE egress edge (the mpmc ring is multi-producer), which
+        // is what lets a DAG have several terminal stages.
+        let sink_names: Vec<String> = config.sinks().iter().map(|s| s.name.clone()).collect();
+        if !sink_names.is_empty() {
             let edge = Edge::new(edge_cap);
-            output_edges.insert(last.name.clone(), EdgeOutSrc::Ring(edge.clone()));
+            for sink in &sink_names {
+                output_edges.entry(sink.clone()).or_default()
+                    .push(EdgeOutSrc::Ring(edge.clone()));
+                info!(log, "in-process egress (sink drain)", from = sink, cap = edge_cap);
+            }
             egress_sink_edge = Some(edge);
-            info!(log, "in-process egress (sink drain)", from = last.name, cap = edge_cap);
         }
     }
 
@@ -238,7 +276,7 @@ pub fn run_agent(
     // Skipped silently if the first stage's wasm path can't be resolved
     // or the compile fails — non-fatal, the autoscaler will surface any
     // real error when it tries the same compile.
-    if let Some(first_stage) = config.pipeline.first() {
+    if let Some(first_stage) = config.sources().first().copied().or_else(|| config.pipeline.first()) {
         if let Some(wasm_path) = first_stage.wasm.as_ref() {
             let t_warm = std::time::Instant::now();
             match wasmtime::component::Component::from_file(&engine, wasm_path) {
@@ -274,8 +312,10 @@ pub fn run_agent(
     // used for everything that's only meaningful within this run.
     let test_start_instant = std::time::Instant::now();
 
-    let last_stage_output = config.pipeline.last()
-        .map(|s| s.output.clone())
+    // Terminal sink URI. `normalize_topology` already backfilled this from the
+    // last stage's legacy `output` for pre-DAG configs, so this is the same
+    // address as before for linear pipelines.
+    let collector_uri = config.collector.clone()
         .unwrap_or_else(|| "tcp://0.0.0.0:9999".to_string());
 
     let col_telemetry = telemetry.clone();
@@ -285,7 +325,7 @@ pub fn run_agent(
     let col_egress    = egress_sink_edge;
 
     let collector_handle = std::thread::spawn(move || {
-        run_collector(&last_stage_output, col_telemetry, col_running2, col_log, test_start, col_egress, custom_sink);
+        run_collector(&collector_uri, col_telemetry, col_running2, col_log, test_start, col_egress, custom_sink);
     });
 
     // ── Source (in-process ingress) ───────────────────────────────────────────
@@ -396,11 +436,15 @@ pub fn run_agent(
     let stage_names: Vec<String> = config.pipeline.iter().map(|s| s.name.clone()).collect();
     let mut handles = Vec::new();
 
-    // One EOS barrier per stage (see eos.rs). expected_in = the stage's
-    // in-degree: 1 on today's linear topologies; the DAG milestone (M1) sets
-    // it from the edge list and adds the marker merge rule at fan-in.
+    // One EOS barrier per stage (see eos.rs). `expected_in` is the stage's
+    // in-degree, so a fan-in stage only finishes once EVERY upstream branch
+    // has delivered its marker. The entry stage has in-degree 0 in the DAG but
+    // receives one marker from the source, hence the max(1).
     let barriers: HashMap<String, Arc<eos::StageEosBarrier>> = config.pipeline.iter()
-        .map(|s| (s.name.clone(), Arc::new(eos::StageEosBarrier::new(1))))
+        .map(|s| {
+            let expected = config.in_degree(&s.name).max(1);
+            (s.name.clone(), Arc::new(eos::StageEosBarrier::new(expected)))
+        })
         .collect();
 
     for stage in config.pipeline.iter() {
@@ -422,12 +466,12 @@ pub fn run_agent(
         let compile_mode_c = config.compile_mode.clone();
         let event_format_c = config.event_format.clone();
         let in_edge_c   = input_edges.get(&stage.name).cloned().unwrap_or(EdgeInSrc::None);
-        let out_edge_c  = output_edges.get(&stage.name).cloned().unwrap_or(EdgeOutSrc::None);
+        let out_edges_c = output_edges.get(&stage.name).cloned().unwrap_or_default();
         let barrier_c   = barriers.get(&stage.name).cloned().expect("barrier per stage");
 
         handles.push(std::thread::spawn(move || {
             autoscaler::run_autoscaler_loop(
-                stage_c, ctrl_port, cw, in_edge_c, out_edge_c, engine_c, stage_log, tel_c,
+                stage_c, ctrl_port, cw, in_edge_c, out_edges_c, engine_c, stage_log, tel_c,
                 test_start_instant, compile_mode_c, event_format_c, barrier_c,
             );
         }));
@@ -1032,6 +1076,10 @@ fn load_config(path: &std::path::Path, log: &Logger) -> Config {
         }
         if stage.wasm.is_none() { stage.wasm = Some(default_wasm_path(&stage.name)); }
     }
+    // Backfill derived topology (edges / outputs / collector) so everything
+    // downstream can read `config.edges` unconditionally — including
+    // hand-written and pre-DAG runtime.yaml files.
+    config.normalize_topology();
     config
 }
 
@@ -1039,7 +1087,10 @@ fn validate_pipeline(config: &Config, log: &Logger) {
     let stages: Vec<(String, String)> = config.pipeline.iter()
         .map(|s| (s.name.clone(), s.wasm.clone().unwrap()))
         .collect();
-    match pipeline_validator::validate_pipeline_components(&stages) {
+    let edges: Vec<(String, String)> = config.edges.iter()
+        .map(|e| (e.from.clone(), e.to.clone()))
+        .collect();
+    match pipeline_validator::validate_pipeline_components(&stages, &edges) {
         Ok(report) => {
             info!(log, "pipeline validated", stages = config.pipeline.len());
             for line in &report { info!(log, "validator", detail = line); }
@@ -1055,6 +1106,11 @@ fn apply_placement_filter(config: &mut Config, log: &Logger) {
     let total = config.pipeline.len();
     config.pipeline.retain(|s| stage_owned_by(s, &config.this_host));
     config.dispatchers.retain(|d| d.placement == config.this_host);
+    // Drop edges whose endpoints aren't both owned here, so the topology
+    // helpers describe the subgraph this agent actually runs. Single-host
+    // today (nothing is dropped); cross-host edges arrive with M5.
+    let owned: HashSet<String> = config.pipeline.iter().map(|s| s.name.clone()).collect();
+    config.edges.retain(|e| owned.contains(&e.from) && owned.contains(&e.to));
     let kept = config.pipeline.len();
     info!(log, "placement filter",
           this_host = config.this_host,
