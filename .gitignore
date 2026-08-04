@@ -60,5 +60,5 @@ Thumbs.db
 .env
 .env.*
 
-# Local visualisation tool (generated pages + scratch output)
-/epico-viz/
+# Local visualisation tool: track the source, not the generated pages
+/epico-viz/out/
