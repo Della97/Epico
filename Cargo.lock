@@ -755,6 +755,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
+ "epico-logger",
  "libc",
  "serde",
  "serde_json",

@@ -41,7 +41,7 @@ epico run
 
 First run takes ~1–2 min (cold build of the host + stage components). Subsequent runs are near-instant via Cargo incremental.
 
-When a `source:` block is present in `pipeline.yaml`, `epico run` also launches the load generator and waits for it to finish before exiting cleanly. On `Ctrl+C` or natural completion, dispatchers are torn down and `master_<ts>_summary.json` is written with per-event e2e latency percentiles, per-stage breakdowns, scaling events, queue-depth history, and resource samples.
+When a `source:` block is present in `pipeline.yaml`, `epico run` also launches the load generator and waits for it to finish before exiting cleanly. On `Ctrl+C` or natural completion, dispatchers are torn down and `master_summary.json` is written with per-event e2e latency percentiles, per-stage breakdowns, scaling events, queue-depth history, and resource samples.
 
 ---
 
@@ -276,7 +276,7 @@ Per-node: `force_tcp: false` forces TCP even for same-host edges (same-host defa
 |---|---|
 | `-c / --config <path>` | Pipeline YAML (default: `./pipeline.yaml`) |
 | `--project-root <path>` | Override auto-detected project root |
-| `--log-dir <path>` | Log directory (default: `./logs`) |
+| `--log-dir <path>` | Parent of the per-run log directories (default: `./logs`) |
 | `--aot` | AOT-precompile `.wasm` → `.cwasm` at build time |
 | `--jit` | Defer compilation to cold-start time |
 | `--no-build` | Skip the stage rebuild; still regenerates `runtime.yaml`, so launch-time knobs (`credit_window`, `batch_events`, ports, scaling caps, sampling) take effect without a wasm recompile. Only safe when stage sources are unchanged. |
@@ -296,7 +296,8 @@ For ad-hoc experiments without editing the YAML (the config remains the source o
 | `EPICO_SOURCE_GEN` | Drive the agent from the in-process generator (no rate pacing; throughput only) |
 | `EPICO_SOURCE_THREADS` / `_COUNT` / `_SECONDS` / `_SENSORS` / `_FORMAT` | In-process source knobs |
 | `EPICO_EOS_DRAIN_SECS` | Drain grace period after EOS |
-| `EPICO_LOG` | Log verbosity |
+| `EPICO_RUN_DIR` | The run's log directory. Set it to make a process join an existing run instead of minting its own folder |
+| `EPICO_LOG` | Log verbosity (`debug` \| `info` \| `warn` \| `error`) |
 
 ---
 
@@ -390,7 +391,19 @@ epico/
 
 ## Telemetry
 
-On shutdown the master writes `master_<ts>_summary.json` containing:
+Each run gets its own directory — `logs/run_<YYYYMMDD_HHMMSS>/` — holding every component's log, so one run's files sit together instead of interleaving with every other run's in a flat `logs/`:
+
+```
+logs/run_20260802_174113/
+├── master.jsonl                        # agent: autoscaler, workers, EOS, collector
+├── master_summary.json                 # the run summary (below)
+├── loadgen.jsonl                       # producer: burst completions, sent/dropped
+└── dispatcher-dispatch-relay.jsonl     # one per dispatcher, ZMQ spine only
+```
+
+The CLI mints the directory and exports it as `EPICO_RUN_DIR`; child processes inherit it, which is how the dispatchers the agent spawns join the same folder without any argument plumbing. A component launched directly with the variable unset mints its own run directory under `--log-dir` and publishes it to its children.
+
+On shutdown the master writes `master_summary.json` containing:
 
 - **e2e latency** — full distribution (p50, p99, p999, max), CDF, and per-second time series
 - **ingress wait** — time each event spent queued at the ingress before processing began

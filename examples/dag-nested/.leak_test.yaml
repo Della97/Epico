@@ -1,4 +1,15 @@
-# dag-nested — nested fan-out / fan-in stress topology.
+# dag-nested (.leak_test) — the conservation harness's copy of the topology.
+#
+# Same DAG as pipeline.yaml, but sourced by `pulse` rather than `wave`: the
+# assertions need an EXACTLY known offered count, and only the `pulse` and `tp`
+# profiles send a fixed number of events and then emit EOS. The rate-paced
+# profiles (steady/ramp/burst/wave) run for a duration and never emit an EOS
+# marker, so there is no point at which "everything has flowed through" is
+# knowable — which is precisely what a leak test has to know.
+#
+# Edit the topology here and in pipeline.yaml together.
+#
+# Run:  tests/no_leak_dag_nested.sh   (from repo root; iterates edge transports)
 #
 # The diamond (examples/dag-diamond) proves one fan-out and one fan-in work.
 # This one nests them: fan-outs inside fan-out branches, fan-ins whose inputs
@@ -60,15 +71,9 @@
 #     taildown     6    1          6
 #     terminal    12    1         12
 #
-# The collector receives EXACTLY 12 × sent. The test script recomputes this
-# table from `edges:` below rather than trusting these numbers, so the topology
-# can be edited without the assertions going stale.
-#
-# Run:  epico run                     # sinusoidal load, see `source:` below
-#       tests/no_leak_dag_nested.sh   # conservation; uses .leak_test.yaml
-#
-# Keep the topology here and in .leak_test.yaml in step — they differ only in
-# how load is offered.
+# The collector must receive EXACTLY 12 × sent. The test script recomputes
+# this table from `edges:` below rather than trusting these numbers, so the
+# topology can be edited without the assertions going stale.
 
 package: epico:dagnested@1.0.0
 
@@ -83,28 +88,12 @@ types:
     sensor_id: string
     value:     f64
 
-# Sinusoidal offered load: the rate sweeps wave_min → rate → wave_min every
-# wave_period seconds, so the autoscalers ride the sine up and back down three
-# times over the run rather than reacting to a square burst.
-#
-# The peak is deliberately near capacity, not past it. Every offered event costs
-# 44 stage invocations on this DAG and lands 12 events on the collector, so
-# 2 500 ev/s offered is ~110k invocations/s and ~30k ev/s delivered. Pushing the
-# peak higher just pins every stage at max_replicas and clips the top of the
-# wave, which shows less than the sweep does.
-#
-# NOTE: rate-paced profiles never emit EOS — that is `pulse`/`tp` only. This run
-# therefore ends when the loadgen finishes its `duration` and the CLI's drain
-# grace expires (EPICO_EOS_DRAIN_SECS, default 30 s), not on a clean
-# end-of-stream. For an exactly-counted, EOS-terminated run use .leak_test.yaml,
-# which keeps the same topology with a `pulse` source.
 source:
   kind: loadgen
-  profile: wave
-  rate: 2500
-  wave_min: 100
-  wave_period: 20
-  duration: 60
+  profile: pulse
+  count: 20000
+  pulse_events: 5000
+  pulse_idle_s: 2.0
   sensors: 100
 
 # max_replicas is deliberately NOT uniform: a fan-in's producer index space is

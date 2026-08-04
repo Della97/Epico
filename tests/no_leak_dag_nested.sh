@@ -19,13 +19,20 @@
 # leaked, long means something was duplicated on a path that should not have
 # carried it.
 #
+# Runs examples/dag-nested/.leak_test.yaml — the same topology as that
+# example's pipeline.yaml, but sourced by `pulse` instead of `wave`. Only the
+# `pulse` and `tp` profiles send an exactly known number of events and then emit
+# EOS; a rate-paced profile never emits one, so there would be no moment at
+# which every event is known to have flowed through, which is exactly what this
+# test has to know.
+#
 # Usage:  tests/no_leak_dag_nested.sh              # spsc + mpmc
 #         TRANSPORTS=mpmc tests/no_leak_dag_nested.sh
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 EXAMPLE="$ROOT/examples/dag-nested"
-YAML="$EXAMPLE/pipeline.yaml"
+YAML="$EXAMPLE/.leak_test.yaml"      # pulse-sourced twin of pipeline.yaml
 TRANSPORTS="${TRANSPORTS:-spsc mpmc}"
 TIMEOUT_S="${TIMEOUT_S:-480}"
 
@@ -57,12 +64,12 @@ for impl in $TRANSPORTS; do
     (
         cd "$EXAMPLE" || exit 1
         export EPICO_EDGE_IMPL="$impl"
-        run_with_timeout "$TIMEOUT_S" "$EPICO" run
+        run_with_timeout "$TIMEOUT_S" "$EPICO" run -c .leak_test.yaml
     )
     rc=$?
     [ "$rc" -ne 0 ] && echo "    (epico run exited rc=$rc; checking summary anyway)"
 
-    summary="$(find "$EXAMPLE/logs" -name 'master_*_summary.json' -newer "$stamp" 2>/dev/null | sort | tail -1)"
+    summary="$(find "$EXAMPLE/logs" -name 'master*summary.json' -newer "$stamp" 2>/dev/null | sort | tail -1)"
     rm -f "$stamp"
     if [ -z "$summary" ]; then
         echo "    FAIL: no summary produced by this run"

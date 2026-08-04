@@ -23,6 +23,7 @@ bench/results/
 
 # Pub folder
 /publications/
+/logs/
 
 # Prog folder
 /prog/
@@ -58,3 +59,6 @@ Thumbs.db
 # Environment files
 .env
 .env.*
+
+# Local visualisation tool (generated pages + scratch output)
+/epico-viz/

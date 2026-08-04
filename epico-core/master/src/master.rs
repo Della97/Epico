@@ -96,6 +96,18 @@ pub fn run_agent(
     let log = Logger::new("master", &args.log_dir)
         .unwrap_or_else(|e| { eprintln!("[master] log open failed: {e}"); std::process::exit(1); });
 
+    // Compile-time features, into the record. `cold-start-opt` changes the
+    // wasmtime config (pooling allocator, CoW init) and so changes what the
+    // cold-start numbers in this run mean — but it is baked in at bootstrap
+    // and was previously only announced on stderr, which no log file keeps.
+    info!(log, "build features", cold_start_opt = cfg!(feature = "cold-start-opt"));
+
+    // Publish the run directory so the dispatcher children spawned later join
+    // this run's folder rather than each minting their own. A no-op when the
+    // CLI launched us (it already set this); it is the directly-launched agent
+    // that needs it. Safe here: still single-threaded, before any spawn.
+    std::env::set_var(epico_logger::RUN_DIR_ENV, &log.run_dir);
+
     // ── CPU sampling profiler (feature-gated) ─────────────────────────────────
     // Enable with: cargo build --release -p master --features profile
     // On shutdown, writes flamegraph.svg into the log directory. pprof samples
@@ -573,7 +585,7 @@ pub fn run_agent(
     if let Some(guard) = profiler_guard {
         match guard.report().build() {
             Ok(report) => {
-                let path = args.log_dir.join("flamegraph.svg");
+                let path = log.run_dir.join("flamegraph.svg");
                 match std::fs::File::create(&path) {
                     Ok(file) => {
                         if let Err(e) = report.flamegraph(file) {

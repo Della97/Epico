@@ -9,7 +9,23 @@
 //!   Format: `HH:MM:SS  [level]  component   message   key=val  key=val`
 //!
 //! - **JSONL file** — one JSON object per line, line-buffered.
-//!   Path: `<log_dir>/<component>_<YYYYMMDD_HHMMSS>.jsonl`
+//!   Path: `<run_dir>/<component>.jsonl`
+//!
+//! # Run directories
+//!
+//! Every process taking part in one pipeline run writes into the SAME
+//! directory: `<log_dir>/run_<YYYYMMDD_HHMMSS>/`. The timestamp is on the
+//! folder, not on each file, so one run's master, loadgen, and dispatcher
+//! logs sit together instead of interleaving with every other run's in a
+//! flat `logs/`.
+//!
+//! Which directory that is comes from [`RUN_DIR_ENV`] (`EPICO_RUN_DIR`).
+//! The launcher — normally the CLI — mints the path once and exports it, so
+//! every child process it spawns joins the same run. A process started with
+//! the variable unset is its own coordinator: it mints a run directory under
+//! `log_dir` and should publish it to its own children (the agent does this
+//! for the dispatchers it spawns), which is what keeps a directly-launched
+//! agent from scattering its dispatchers across sibling folders.
 //!
 //! # Logging
 //!
@@ -141,6 +157,38 @@ impl Level {
     }
 }
 
+// ── Run directory ────────────────────────────────────────────────────────────
+
+/// Environment variable naming the directory every component of one run logs
+/// into. Set by whoever launches the run; inherited by child processes.
+pub const RUN_DIR_ENV: &str = "EPICO_RUN_DIR";
+
+/// Directory this process should log into.
+///
+/// `EPICO_RUN_DIR` wins when set — that is the launcher saying "you are part
+/// of this run, write here" — and is used verbatim, so it must already be the
+/// run directory rather than the parent `logs/`. Otherwise this process is the
+/// first one up and mints `<log_dir>/run_<YYYYMMDD_HHMMSS>/` itself.
+///
+/// The name is uniquified if it is already taken: two runs starting inside the
+/// same second would otherwise share a folder and truncate each other's files.
+pub fn resolve_run_dir(log_dir: &Path) -> PathBuf {
+    if let Some(dir) = std::env::var_os(RUN_DIR_ENV) {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+
+    let base = format!("run_{}", format_ts_slug(wall_now()));
+    let mut candidate = log_dir.join(&base);
+    let mut n = 2;
+    while candidate.exists() {
+        candidate = log_dir.join(format!("{}_{}", base, n));
+        n += 1;
+    }
+    candidate
+}
+
 // ── Inner shared state ───────────────────────────────────────────────────────
 
 struct Inner {
@@ -156,6 +204,9 @@ struct Inner {
 pub struct Logger {
     component:        String,
     inner:            Arc<Mutex<Inner>>,
+    /// Directory holding every log file of this run. Pass it to child
+    /// processes via [`RUN_DIR_ENV`] so they write here too.
+    pub run_dir:      PathBuf,
     pub jsonl_path:   PathBuf,
     pub summary_path: PathBuf,
     /// Minimum level rendered to STDERR. From `EPICO_LOG` (default: info).
@@ -172,17 +223,15 @@ pub struct Logger {
 }
 
 impl Logger {
-    /// Open a new logger for `component`, writing into `log_dir`.
-    /// File name: `<component>_<YYYYMMDD_HHMMSS>.jsonl`
+    /// Open a new logger for `component`, writing into this run's directory
+    /// (see [`resolve_run_dir`]). File name: `<component>.jsonl`.
     pub fn new(component: &str, log_dir: impl AsRef<Path>) -> std::io::Result<Self> {
-        let dir = log_dir.as_ref();
-        std::fs::create_dir_all(dir)?;
+        let dir = resolve_run_dir(log_dir.as_ref());
+        std::fs::create_dir_all(&dir)?;
 
-        let ts   = wall_now();
-        let slug = format_ts_slug(ts);
         let safe = component.replace('/', "-").replace(' ', "_");
-        let jsonl_path   = dir.join(format!("{}_{}.jsonl",        safe, slug));
-        let summary_path = dir.join(format!("{}_{}_summary.json", safe, slug));
+        let jsonl_path   = dir.join(format!("{}.jsonl",         safe));
+        let summary_path = dir.join(format!("{}_summary.json",  safe));
 
         let file = OpenOptions::new()
             .create(true).write(true).truncate(true)
@@ -191,6 +240,7 @@ impl Logger {
         let logger = Logger {
             component:    component.to_owned(),
             inner:        Arc::new(Mutex::new(Inner { writer: BufWriter::new(file) })),
+            run_dir:      dir.clone(),
             jsonl_path:   jsonl_path.clone(),
             summary_path: summary_path.clone(),
             stderr_level: level_from_env(),
@@ -210,6 +260,7 @@ impl Logger {
         Logger {
             component:    component.to_owned(),
             inner:        self.inner.clone(),
+            run_dir:      self.run_dir.clone(),
             jsonl_path:   self.jsonl_path.clone(),
             summary_path: self.summary_path.clone(),
             stderr_level: self.stderr_level,
@@ -426,4 +477,52 @@ fn format_ts_slug(ts: f64) -> String {
     let y   = if m <= 2 { y + 1 } else { y };
 
     format!("{:04}{:02}{:02}_{:02}{:02}{:02}", y, m, d, hh, mm, ss)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run-directory resolution end to end. Deliberately ONE test: the env
+    /// var is process-global, so splitting it up lets cargo's threaded
+    /// harness race `set_var` against another case's `remove_var`.
+    #[test]
+    fn run_dir_comes_from_env_or_is_minted() {
+        let tmp = std::env::temp_dir().join(format!("epico-logger-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Launcher set it: used verbatim, no nesting under it.
+        let coordinated = tmp.join("some-run");
+        std::env::set_var(RUN_DIR_ENV, &coordinated);
+        assert_eq!(resolve_run_dir(&tmp), coordinated);
+
+        // Unset: mint a stamped folder under log_dir...
+        std::env::remove_var(RUN_DIR_ENV);
+        let minted = resolve_run_dir(&tmp);
+        assert_eq!(minted.parent(), Some(tmp.as_path()));
+        let name = minted.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("run_"), "unexpected run dir name {name:?}");
+
+        // ...and never hand back one that already exists, or a second run
+        // starting in the same second would truncate the first one's files.
+        std::fs::create_dir_all(&minted).unwrap();
+        let second = resolve_run_dir(&tmp);
+        assert_ne!(second, minted);
+
+        // Every component of one run lands in that one folder, under its own
+        // name — which is the whole point of the layout.
+        let run = tmp.join("run_x");
+        std::env::set_var(RUN_DIR_ENV, &run);
+        let master = Logger::new("master", &tmp).unwrap();
+        let disp   = Logger::new("dispatcher/dispatch-a", &tmp).unwrap();
+
+        assert_eq!(master.run_dir, run);
+        assert_eq!(disp.run_dir, run);
+        assert_eq!(master.jsonl_path,   run.join("master.jsonl"));
+        assert_eq!(disp.jsonl_path,     run.join("dispatcher-dispatch-a.jsonl"));
+        assert_eq!(master.summary_path, run.join("master_summary.json"));
+
+        std::env::remove_var(RUN_DIR_ENV);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

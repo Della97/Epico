@@ -238,6 +238,19 @@ fn cmd_run(config_path: &Path, project_root: Option<&Path>, log_dir: &Path, aot:
         .unwrap_or_else(|_| root.clone())
         .join(log_dir);
 
+    // One directory per run, holding every component's log. The CLI is the
+    // only party that knows all the processes belong to the same run — the
+    // agent, its dispatchers, and the loadgen start seconds apart and would
+    // each mint their own folder otherwise — so it mints the path here and
+    // exports it. Children inherit the environment, which is what carries it
+    // to the dispatchers the agent spawns without threading an argument
+    // through the agent.
+    let run_dir = epico_logger::resolve_run_dir(&log_dir_abs);
+    std::fs::create_dir_all(&run_dir)
+        .with_context(|| format!("creating run directory {}", run_dir.display()))?;
+    std::env::set_var(epico_logger::RUN_DIR_ENV, &run_dir);
+    let log_dir_abs = run_dir;
+
     // Native source/sink (option A): build the per-pipeline agent with the
     // user's source/sink compiled in, and launch it instead of stock `master`.
     // The bootstrap above still ensured the dispatcher binary exists (the agent

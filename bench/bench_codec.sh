@@ -177,7 +177,7 @@ run_one() {
     # shellcheck disable=SC2086
     env $tenv EPICO_EOS_DRAIN_SECS="$EOS_DRAIN" $PIN \
         epico run --no-build --config "$cfg" --log-dir "$logdir" >"$logdir/run.out" 2>&1 || true
-    ls -t "$logdir"/master_*_summary.json 2>/dev/null | head -1
+    find "$logdir" -name 'master*summary.json' -exec ls -t {} + 2>/dev/null | head -1
 }
 
 # -- build the wasm ONCE (codec- and transport-agnostic) ----------------------

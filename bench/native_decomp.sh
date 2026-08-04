@@ -115,7 +115,7 @@ run_one() {  # arm mode rep outdir
         "$EPICO" run --config "$BENCH_YAML" --project-root "$PROJECT_ROOT" \
         --aot --log-dir "$outdir" >"$outdir/run.log" 2>&1; then
     local sum
-    sum="$(ls -t "$outdir"/master_*_summary.json 2>/dev/null | head -1 || true)"
+    sum="$(find "$outdir" -name 'master*summary.json' -exec ls -t {} + 2>/dev/null | head -1 || true)"
     if [ -n "$sum" ]; then cp "$sum" "$outdir/summary.json"
     else echo "   !! no summary (see $outdir/run.log)"; fi
   else

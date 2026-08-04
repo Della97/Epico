@@ -16,7 +16,8 @@ Usage:
                                [--summary path] [--loadgen path]
                                [--label spsc] [--out leak_spsc.png]
 
-Defaults: newest master_*_summary.json and newest loadgen_*.jsonl in logs-dir.
+Defaults: the newest run folder's master_summary.json and loadgen.jsonl under
+logs-dir (the older flat `<component>_<ts>` layout is still picked up).
 """
 
 import argparse
@@ -30,9 +31,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-def newest(pattern):
-    files = sorted(glob.glob(pattern), key=os.path.getmtime)
-    return files[-1] if files else None
+def newest_log(logs_dir, name, legacy_glob):
+    """Newest `name` under logs-dir, looking inside per-run folders.
+
+    A run writes `logs/run_<ts>/<component>.jsonl`; `legacy_glob` matches the
+    flat `logs/<component>_<ts>.jsonl` layout that predates it, so older log
+    trees keep plotting.
+    """
+    candidates = glob.glob(os.path.join(logs_dir, "*", name))
+    candidates += glob.glob(os.path.join(logs_dir, legacy_glob))
+    return max(candidates, key=os.path.getmtime) if candidates else None
 
 
 def load_loadgen_sent_series(path, t0_wall):
@@ -83,8 +91,10 @@ def main():
     ap.add_argument("--out", default="leak_plot.png")
     args = ap.parse_args()
 
-    summary_path = args.summary or newest(os.path.join(args.logs_dir, "master_*_summary.json"))
-    loadgen_path = args.loadgen or newest(os.path.join(args.logs_dir, "loadgen_*.jsonl"))
+    summary_path = args.summary or newest_log(
+        args.logs_dir, "master_summary.json", "master_*_summary.json")
+    loadgen_path = args.loadgen or newest_log(
+        args.logs_dir, "loadgen.jsonl", "loadgen_*.jsonl")
     if not summary_path or not loadgen_path:
         sys.exit(f"missing inputs (summary={summary_path}, loadgen={loadgen_path})")
 

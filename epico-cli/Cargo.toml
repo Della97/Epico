@@ -26,6 +26,10 @@ ctrlc = "3"
 # Temp paths for the readiness-file handshake between CLI and agent.
 tempfile = "3"
 
+# Run-directory convention. Shared with the agent/dispatcher/loadgen so the
+# folder layout is defined in exactly one place.
+epico-logger = { path = "../epico-core/logger" }
+
 # AOT precompilation — must use the same version as epico-core/master
 # so that Engine::precompile_component produces artifacts that
 # Component::deserialize_file in the agent will accept.

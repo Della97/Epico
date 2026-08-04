@@ -63,7 +63,10 @@ def load_jsonl(path: str) -> list[dict]:
 
 
 def find_summary(run_dir: str) -> str | None:
+    # Logs live in a per-run subfolder (`logs/run_<ts>/master_summary.json`);
+    # the flat layout is still matched so older result trees keep plotting.
     hits = sorted(glob.glob(os.path.join(run_dir, "*_summary.json")))
+    hits += sorted(glob.glob(os.path.join(run_dir, "*", "*_summary.json")))
     return hits[0] if hits else None
 
 

@@ -57,7 +57,7 @@ for impl in $TRANSPORTS; do
     rc=$?
     [ "$rc" -ne 0 ] && echo "    (epico run exited rc=$rc; checking summary anyway)"
 
-    summary="$(find "$EXAMPLE/logs" -name 'master_*_summary.json' -newer "$stamp" 2>/dev/null | sort | tail -1)"
+    summary="$(find "$EXAMPLE/logs" -name 'master*summary.json' -newer "$stamp" 2>/dev/null | sort | tail -1)"
     rm -f "$stamp"
     if [ -z "$summary" ]; then
         echo "    FAIL: no summary produced by this run"
