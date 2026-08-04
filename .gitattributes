@@ -1,0 +1,5 @@
+# Plot/analysis scripts and result dumps for publications
+publications/** linguist-vendored
+
+# Python bytecode: binary, never a language
+*.pyc binary linguist-generated

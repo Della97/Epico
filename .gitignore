@@ -48,6 +48,7 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+Epico.code-workspace
 
 # Environment files
 .env
