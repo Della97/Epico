@@ -48,6 +48,7 @@ pub fn generate(
     project_root: &Path,
     output_dir: &Path,
     compile_mode: Option<&str>,
+    cold_start_opt: bool,
 ) -> Result<CodegenOutput> {
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("creating codegen dir {:?}", output_dir))?;
@@ -141,6 +142,7 @@ pub fn generate(
             project_root,
             &spec.stages,
             &spec.types,
+            cold_start_opt,
         )
         .context("scaffolding per-pipeline agent crate")?;
         Some(agent_dir.join("Cargo.toml"))
@@ -165,6 +167,7 @@ fn scaffold_agent_crate(
     project_root: &Path,
     stages: &[StageSpec],
     types: &std::collections::BTreeMap<String, crate::config::TypeDef>,
+    cold_start_opt: bool,
 ) -> Result<()> {
     let src_dir = agent_dir.join("src");
     std::fs::create_dir_all(&src_dir)?;
@@ -175,6 +178,17 @@ fn scaffold_agent_crate(
     // Cargo.toml — depends on the agent library by path, plus serde for the
     // user's source/sink event (de)serialization. No clap: the binary uses
     // epico_master::parse_args().
+    //
+    // THIS manifest is what decides whether the running agent gets
+    // `cold-start-opt`, because this crate — not `target/release/master` — is
+    // the binary `epico run` launches. `master` enables the feature by default,
+    // so the opt-out has to be spelled here as `default-features = false`.
+    // Flipping it rewrites this file, which is itself the rebuild trigger.
+    let master_dep_extra = if cold_start_opt {
+        ""
+    } else {
+        ", default-features = false"
+    };
     let cargo = format!(
         r#"[package]
 name = "epico-agent"
@@ -186,7 +200,8 @@ name = "epico-agent"
 path = "src/main.rs"
 
 [dependencies]
-epico_master = {{ path = "{master}", package = "master" }}
+# cold-start-opt: {cso}
+epico_master = {{ path = "{master}", package = "master"{extra} }}
 serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
 # Typed dispatch: the generated structs derive wasmtime component traits.
@@ -200,6 +215,8 @@ wasmtime = {{ version = "26", features = ["component-model"] }}
 [workspace]
 "#,
         master = master_dir.display().to_string().replace('\\', "/"),
+        extra = master_dep_extra,
+        cso = if cold_start_opt { "enabled (default)" } else { "DISABLED (baseline arm)" },
     );
     std::fs::write(agent_dir.join("Cargo.toml"), cargo).context("writing agent Cargo.toml")?;
 

@@ -145,9 +145,9 @@ pub fn bootstrap_runtime(workspace_root: &Path, cold_start_opt: bool) -> Result<
     println!("==> Building runtime (agent + dispatcher)");
     println!("    workspace: {}", workspace_root.display());
     if cold_start_opt {
-        println!("    cold-start-opt: enabled");
+        println!("    cold-start-opt: enabled (default)");
     } else {
-        println!("    cold-start-opt: disabled (baseline)");
+        println!("    cold-start-opt: DISABLED (baseline arm)");
     }
 
     let manifest = workspace_root.join("Cargo.toml");
@@ -169,8 +169,17 @@ pub fn bootstrap_runtime(workspace_root: &Path, cold_start_opt: bool) -> Result<
         .arg("-p")
         .arg("dispatcher");
 
-    if cold_start_opt {
-        cmd.arg("--features").arg("master/cold-start-opt");
+    // `master` enables cold-start-opt by DEFAULT, so the flag to pass is the
+    // opt-out. `dispatcher` declares no features, so turning defaults off for
+    // the whole selection affects only `master`.
+    //
+    // Note this shapes `target/release/master`, which `epico run` does not
+    // execute — it launches the generated per-pipeline agent, whose own
+    // manifest carries the same choice (see codegen's `scaffold_agent_crate`).
+    // Both are built the same way so a stray `master` binary can never disagree
+    // with the agent about what was measured.
+    if !cold_start_opt {
+        cmd.arg("--no-default-features");
     }
 
     let status = cmd

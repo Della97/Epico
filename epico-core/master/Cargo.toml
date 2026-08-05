@@ -1,7 +1,7 @@
 [package]
 name = "master"
-version = "0.2.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 
 [lib]
 name = "epico_master"
@@ -12,6 +12,20 @@ name = "master"
 path = "src/main.rs"
 
 [features]
+# ON BY DEFAULT. `cold-start-opt` selects the pooling allocator, CoW memory
+# init, Cranelift Speed opt level and parallel compilation — the configuration
+# a real deployment wants.
+#
+# It used to be opt-in, which meant the generated per-pipeline agent could never
+# get it: the agent's manifest never requested the feature, so the
+# `--cold-start-opt` flag only ever affected `target/release/master` — a binary
+# `epico run` does not execute. The flag was silently a no-op.
+#
+# To build the BASELINE arm instead (every optimization off, for the cold-start
+# decomposition figures) use `epico build --no-cold-start-opt` / `epico run
+# --no-cold-start-opt`, which makes codegen emit `default-features = false` on
+# the agent's dependency on this crate.
+default = ["cold-start-opt"]
 cold-start-opt = []
 profile = ["dep:pprof"]
 

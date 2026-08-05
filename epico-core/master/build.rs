@@ -7,6 +7,13 @@
 //!                             changes, else "0".
 //! - EPICO_WASMTIME_VERSION — resolved wasmtime version, read from the
 //!                             workspace `Cargo.lock`.
+//! - EPICO_VERSION          — the release version, inherited from
+//!                             `[workspace.package] version` (one source of
+//!                             truth for the whole workspace).
+//! - EPICO_GIT_TAG          — `git describe --tags`, i.e. what the GitHub
+//!                             release page will show. Recorded alongside
+//!                             EPICO_VERSION so a mismatch between the two is
+//!                             visible in the run record rather than silent.
 //!
 //! All are best-effort: if `git` or `rustc` aren't available, the
 //! variables are unset and the agent defaults to "unknown".
@@ -18,6 +25,19 @@ fn main() {
     // The captured values are static within a build; we don't need them
     // re-evaluated on every touch of an unrelated source file.
     println!("cargo:rerun-if-changed=build.rs");
+
+    // The release version, straight from the manifest chain. Cargo sets this
+    // for us, so it cannot drift from `[workspace.package] version`.
+    println!(
+        "cargo:rustc-env=EPICO_VERSION={}",
+        std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".into())
+    );
+    // What `git describe` says — the tag a GitHub release is cut from. Falls
+    // back to a bare commit when no tag is reachable, which is the normal
+    // state between releases.
+    if let Some(v) = run_cmd("git", &["describe", "--tags", "--always", "--dirty"]) {
+        println!("cargo:rustc-env=EPICO_GIT_TAG={}", v);
+    }
 
     if let Some(v) = run_cmd("rustc", &["--version"]) {
         println!("cargo:rustc-env=EPICO_RUSTC_VERSION={}", v);

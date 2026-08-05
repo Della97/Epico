@@ -530,6 +530,11 @@ fn build_environment_block() -> serde_json::Value {
 
     // Tool versions. `rustc_version` and `git_commit` are baked at build
     // time by build.rs; they're static strings here.
+    // The release version this binary was built at, plus what `git describe`
+    // said. Recorded on EVERY run so a results table can always be traced back
+    // to the exact build that produced it.
+    let version = option_env!("EPICO_VERSION").unwrap_or("unknown");
+    let git_tag = option_env!("EPICO_GIT_TAG").unwrap_or("unknown");
     let rustc   = option_env!("EPICO_RUSTC_VERSION").unwrap_or("unknown");
     let commit  = option_env!("EPICO_GIT_COMMIT").unwrap_or("unknown");
     let dirty   = option_env!("EPICO_GIT_DIRTY").unwrap_or("0") == "1";
@@ -539,6 +544,8 @@ fn build_environment_block() -> serde_json::Value {
     let wasmtime_version = option_env!("EPICO_WASMTIME_VERSION").unwrap_or("unknown");
 
     json!({
+        "epico_version":       version,
+        "git_tag":             git_tag,
         "host":                host,
         "os_name":             os_name,
         "os_version":          os_version,

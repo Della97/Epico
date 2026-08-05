@@ -10,6 +10,32 @@ members = [
 ]
 resolver = "2"
 
+# ── Release version — THE single source of truth ─────────────────────────────
+#
+# Every crate inherits this via `version.workspace = true`, so there is exactly
+# one place to bump. From here it flows to:
+#
+#   epico --version          clap reads CARGO_PKG_VERSION
+#   the agent's startup log   EPICO_VERSION, baked by epico-core/master/build.rs
+#   master_*_summary.json     environment.epico_version — so every recorded
+#                             result says which version produced it
+#   setup.sh's banner
+#
+# GitHub Releases are driven by GIT TAGS, not by this file, so the two are kept
+# in step by convention: tag `v<version>` at release. build.rs also bakes
+# `git describe --tags`, and setup.sh warns when the tag and this version
+# disagree — that drift is how a binary ends up claiming to be a release it
+# is not.
+#
+# To cut a release:
+#   1. bump `version` below
+#   2. cargo build --release --workspace      (refreshes Cargo.lock)
+#   3. commit, then: git tag -a v1.0.0 -m "v1.0.0" && git push --tags
+#   4. GitHub -> Releases -> the tag appears; publish notes against it
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+
 # Generated stage crates (produced by `epico build` under target/epico/)
 # are a separate workspace because they target wasm32-wasip2.
 

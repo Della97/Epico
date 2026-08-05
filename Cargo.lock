@@ -697,7 +697,7 @@ dependencies = [
 
 [[package]]
 name = "dispatcher"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "ctrlc",
@@ -750,7 +750,7 @@ dependencies = [
 
 [[package]]
 name = "epico-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -766,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "epico-loadgen"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -781,7 +781,7 @@ dependencies = [
 
 [[package]]
 name = "epico-logger"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -789,11 +789,11 @@ dependencies = [
 
 [[package]]
 name = "epico-sdk"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "epico-wire"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "equivalent"
@@ -1554,7 +1554,7 @@ dependencies = [
 
 [[package]]
 name = "master"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "bytes",

@@ -1,0 +1,122 @@
+# .morph_skew.yaml — scission under INDUCED SKEW (roadmap M2, phase 4, pair 3).
+#
+# The third ordered DAG pair. The first two (identity, fusion) were measured on
+# a uniform workload where both halves cost the same; scission correctly never
+# paid off there, because splitting only wins when INDEPENDENT SCALING wins, and
+# with equal halves there is nothing to scale independently.
+#
+# This config creates the regime the design note names for scission:
+#
+#   "Split AB when independent scaling would win: AB's queue grows while only
+#    one half's wasm_us grew — the per-stage hops still attribute time to A and
+#    B separately, so we know WHICH half is hot."
+#
+# `detect` runs the heavy variant (~20x `normalize`), so the pair is strongly
+# skewed. Two questions this is built to answer, and they are separable:
+#
+#   Q1  Does the runtime still know WHICH half is hot while the two are fused?
+#       This is the prerequisite for INFORMED scission — a controller cannot
+#       propose a split it cannot aim. `per_stage_latency_ms` must keep
+#       attributing time to `normalize` and `detect` separately even when one
+#       worker is running both.
+#
+#   Q2  Does scission ever WIN on throughput under skew?
+#       Note the fused stage is given R_ab = Ra + Rb replicas, so it brings the
+#       SUM of both halves' budgets to bear on whichever half is the bottleneck.
+#       Under skew that is exactly the wrong thing for scission: the hot half
+#       effectively gets more workers fused than split. If the answer is "no",
+#       that is a structural result about this replica policy, not a workload
+#       artifact — and it belongs in the paper as such.
+#
+# Everything else mirrors .morph_bench.yaml so the two are comparable: sustained
+# blocking-send source, fixed replica counts, same morph cadence.
+#
+# Run:  RUNS=3 SKEW=1 bench/morph_bench.sh
+
+package: epico:morphskew@1.0.0
+
+nodes:
+  - name: local
+    host: 127.0.0.1
+    force_tcp: false
+
+types:
+  reading:
+    sensor_id: string
+    value:     f64
+
+# Far fewer events than the uniform bench: the heavy half drops throughput from
+# ~420 k to ~60 k ev/s, so the same wall clock needs ~7x fewer events. Sized to
+# outlast the 48 s schedule with steady state after the last transition — a run
+# that ends inside a post-morph window reports its own drain as a collapse.
+# Measured skew at SPIN = 20 000: detect 34.1 us vs normalize 0.9 us = 35.9x.
+source:
+  kind: loadgen
+  profile: tp
+  count: 4000000
+  sensors: 100
+
+stages:
+  - name: ingest
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/ingest.rs
+    scaling: { min: 2, max: 2, queue_up: 50, cooldown_up_s: 60, cooldown_down_s: 60 }
+
+  # The CHEAP half.
+  - name: normalize
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/normalize.rs
+    scaling: { min: 2, max: 2, queue_up: 50, cooldown_up_s: 60, cooldown_down_s: 60 }
+
+  # The HOT half — same stage name and same record type as the uniform config,
+  # so the topology, the fusible declaration and the analysis are all unchanged.
+  # Only the component behind it is heavier.
+  - name: detect
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/detect_heavy.rs
+    scaling: { min: 2, max: 2, queue_up: 50, cooldown_up_s: 60, cooldown_down_s: 60 }
+
+  - name: finalize
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/finalize.rs
+    scaling: { min: 2, max: 2, queue_up: 50, cooldown_up_s: 60, cooldown_down_s: 60 }
+
+edges:
+  - ingest -> normalize
+  - normalize -> detect
+  - detect -> finalize
+
+fusible:
+  - normalize -> detect
+
+morphs:
+  - { at_s:  8.0, identity: normalize }
+  - { at_s: 16.0, fuse: normalize -> detect }
+  - { at_s: 24.0, split: normalize_detect }
+  - { at_s: 32.0, identity: normalize }
+  - { at_s: 40.0, fuse: normalize -> detect }
+  - { at_s: 48.0, split: normalize_detect }
+
+deploy:
+  host: localhost
+  this_host: local
+  ingress: ipc:///tmp/epico-morphskew-push
+
+  source_format: binary
+  event_format:  binary
+
+  ingress_mode: inprocess
+  edge_impl: spsc
+  spsc_ring_cap: 512
+
+  credit_window: 16
+  batch_events:  1
+  resource_sample_interval_ms: 0

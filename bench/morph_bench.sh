@@ -38,11 +38,14 @@
 # Usage:  bench/morph_bench.sh              # 10 runs, spsc
 #         RUNS=3 bench/morph_bench.sh       # quick check
 #         TRANSPORTS="spsc mpmc" bench/morph_bench.sh
+#         YAML=.morph_skew.yaml LABEL=skew bench/morph_bench.sh   # pair 3
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 EXAMPLE="$ROOT/examples/fusion-chain"
-YAML=".morph_bench.yaml"
+YAML="${YAML:-.morph_bench.yaml}"
+# Label for the results file, so a skew run does not overwrite the uniform one.
+LABEL="${LABEL:-uniform}"
 RUNS="${RUNS:-10}"
 TRANSPORTS="${TRANSPORTS:-spsc}"
 TIMEOUT_S="${TIMEOUT_S:-300}"
@@ -98,7 +101,7 @@ for impl in $TRANSPORTS; do
         continue
     fi
 
-    json="$OUT_DIR/morph_${impl}.json"
+    json="$OUT_DIR/morph_${LABEL}_${impl}.json"
     echo
     echo "=== analysis: $impl ==="
     python3 "$ROOT/bench/analyze_morph.py" \

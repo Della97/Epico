@@ -29,10 +29,23 @@ if [[ -t 2 ]] && [[ -z "${NO_COLOR:-}" ]]; then
     DIM=$'\033[38;5;244m'
     YEL=$'\033[33m'
     RED=$'\033[31m'
+    GRN=$'\033[32m'
+    CYN=$'\033[36m'
+    BLD=$'\033[1m'
     RST=$'\033[0m'
+    # Brand colour: sRGB(0.953, 0.882, 0.769) = #F3E1C4, a warm cream.
+    # 24-bit where the terminal advertises truecolor, otherwise xterm-256
+    # colour 223 (#FFD7AF) — the nearest entry that keeps the R>G>B falloff
+    # the brand tone depends on. (Colour 224 is marginally closer by raw
+    # distance but flattens G==B, reading pink rather than cream.)
+    case "${COLORTERM:-}" in
+        truecolor|24bit) BRAND=$'\033[38;2;243;225;196m' ;;
+        *)               BRAND=$'\033[38;5;223m'         ;;
+    esac
 else
-    DIM='' ; YEL='' ; RED='' ; RST=''
+    DIM='' ; YEL='' ; RED='' ; GRN='' ; CYN='' ; BLD='' ; RST='' ; BRAND=''
 fi
+
 
 ts()    { date +%H:%M:%S ; }
 info()  { printf '%s%s%s  [info ]  %s\n' "$DIM" "$(ts)" "$RST" "$*" >&2 ; }
@@ -53,6 +66,14 @@ cd "$SCRIPT_DIR"
 [[ -f epico-loadgen/Cargo.toml ]] || fail "epico-loadgen/Cargo.toml missing — is this a epico checkout?"
 
 info "repo root: $SCRIPT_DIR"
+
+# Release version — read from the ONE place that defines it. Everything else
+# (`epico --version`, the agent's startup log, every summary JSON) derives from
+# the same field via cargo, so this parse cannot disagree with the binaries.
+# Read after the cd above, so it resolves no matter where the script is invoked.
+EPICO_VERSION_STR="$(awk '/^\[workspace\.package\]/{f=1;next} f&&/^version[[:space:]]*=/{gsub(/[",]/,"");print $3;exit}' Cargo.toml 2>/dev/null)"
+EPICO_VERSION_STR="${EPICO_VERSION_STR:-unknown}"
+info "version: v$EPICO_VERSION_STR" 
 
 # ── 1. toolchain check ───────────────────────────────────────────────────────
 
@@ -157,8 +178,119 @@ else
     info "path ok"
 fi
 
+# ── 7. active configuration ──────────────────────────────────────────────────
+# Everything below is REPORTING, not configuration: it prints what this build
+# and this shell will actually do, so a run's behaviour is never a surprise.
+#
+# Two independent layers, and they are easy to confuse:
+#   * BUILD FEATURES are compiled in. Changing one needs a rebuild.
+#   * ENV OVERRIDES are read at process start and BEAT the pipeline YAML.
+#     An env var left over from an earlier experiment silently changes what a
+#     run measures, which is exactly why they are listed here.
+
+printf '\n'
+printf '%s  ── build features ──────────────────────────────────────────────%s\n' "$DIM" "$RST"
+
+# Source of truth for what a plain `cargo build` produces: master's default
+# feature set. `epico build` propagates the same choice into the generated
+# per-pipeline agent, which is the binary that actually runs.
+if grep -qE '^default[[:space:]]*=[[:space:]]*\[[^]]*"cold-start-opt"' epico-core/master/Cargo.toml 2>/dev/null; then
+    printf '    %-22s %sON%s   %spooling allocator, CoW memory init, Cranelift Speed, parallel compilation%s\n' \
+        "cold-start-opt" "$GRN" "$RST" "$DIM" "$RST"
+    printf '    %-22s      %sbaseline arm: epico build --no-cold-start-opt%s\n' "" "$DIM" "$RST"
+else
+    printf '    %-22s %sOFF%s  %sbaseline arm — cold-start numbers are not deployment numbers%s\n' \
+        "cold-start-opt" "$YEL" "$RST" "$DIM" "$RST"
+fi
+printf '    %-22s %sOFF%s  %sCPU sampling profiler; build with --features master/profile%s\n' \
+    "profile" "$DIM" "$RST" "$DIM" "$RST"
+
+printf '\n'
+printf '%s  ── environment overrides ───────────────────────────────────────%s\n' "$DIM" "$RST"
+printf '%s     set values WIN over pipeline.yaml. Unset = the default shown.%s\n' "$DIM" "$RST"
+printf '\n'
+
+n_set=0
+# env_row NAME DEFAULT DESCRIPTION
+env_row() {
+    local name="$1" def="$2" desc="$3"
+    if [[ -n "${!name+x}" ]]; then
+        n_set=$((n_set + 1))
+        printf '    %s%s%-24s%s %s%-14s%s %s%s%s\n' \
+            "$BLD" "$YEL" "$name" "$RST" "$GRN" "${!name}" "$RST" "$DIM" "$desc" "$RST"
+    else
+        printf '    %-24s %s%-14s%s %s%s%s\n' \
+            "$name" "$DIM" "$def" "$RST" "$DIM" "$desc" "$RST"
+    fi
+}
+
+printf '%s    transport%s\n' "$CYN" "$RST"
+env_row EPICO_EDGE_IMPL        "(yaml)"  "zmq | mpmc | spsc — stage-to-stage transport"
+env_row EPICO_EDGE_CAP         "1024"    "mpmc ring slots (flow-control window)"
+env_row EPICO_SPSC_RING_CAP    "256"     "slots per SPSC ring in the mesh"
+env_row EPICO_INPROC_EDGES     "(yaml)"  "1 = collapse stage->stage hops to in-proc queues"
+env_row EPICO_INPROC_INGRESS   "(yaml)"  "1 = also collapse ingress/egress (implies EDGES)"
+env_row EPICO_BINARY_EDGES     "(yaml)"  "1 = stage OUTPUT uses the binary envelope"
+
+printf '%s    execution%s\n' "$CYN" "$RST"
+env_row EPICO_DYNAMIC_DISPATCH "0"       "1 = force the dynamic Val path, bypassing typed dispatch"
+env_row EPICO_NATIVE_STAGE     "(off)"   "passthrough | serde — BYPASS: wasm is NOT called"
+
+printf '%s    source%s\n' "$CYN" "$RST"
+env_row EPICO_SOURCE_GEN       "0"       "1 = in-process generating source (no socket, no loadgen)"
+env_row EPICO_SOURCE_FORMAT    "(yaml)"  "json | binary at the ingress"
+env_row EPICO_SOURCE_THREADS   "1"       "source pump fan-out"
+env_row EPICO_SOURCE_COUNT     "5000000" "events for the generating source"
+env_row EPICO_SOURCE_SENSORS   "100"     "distinct sensor ids"
+env_row EPICO_SOURCE_SECONDS   "(none)"  "wall-clock cap; source emits EOS and stops"
+
+printf '%s    orchestration%s\n' "$CYN" "$RST"
+env_row EPICO_EOS_DRAIN_SECS   "30"      "CLI grace period for the pipeline to drain after EOS"
+env_row EPICO_DISPATCHER       "(auto)"  "explicit dispatcher binary path"
+env_row EPICO_LOG              "info"    "debug | info | warn | error (JSONL keeps everything)"
+env_row EPICO_RUN_DIR          "(auto)"  "run directory for JSONL logs"
+
+printf '\n'
+if [[ "$n_set" -gt 0 ]]; then
+    warn "$n_set environment override(s) are ACTIVE in this shell (highlighted above)"
+    warn "they take precedence over pipeline.yaml — unset them for a clean baseline run"
+else
+    info "no environment overrides set — runs will follow pipeline.yaml exactly"
+fi
+
 # ── done ─────────────────────────────────────────────────────────────────────
+
+printf '\n%s' "$BRAND"
+cat <<'BANNER'
+      ███████╗██████╗ ██╗ ██████╗ ██████╗
+      ██╔════╝██╔══██╗██║██╔════╝██╔═══██╗
+      █████╗  ██████╔╝██║██║     ██║   ██║
+      ██╔══╝  ██╔═══╝ ██║██║     ██║   ██║
+      ███████╗██║     ██║╚██████╗╚██████╔╝
+      ╚══════╝╚═╝     ╚═╝ ╚═════╝ ╚═════╝
+BANNER
+printf '%s' "$RST"
+printf '%s        a serverless runtime that rewrites its own topology%s\n' "$DIM" "$RST"
+printf '%s        v%s%s' "$BRAND" "$EPICO_VERSION_STR" "$RST"
+
+# GitHub Releases are cut from git TAGS, so the tag is what the release page
+# shows — while `epico --version` reports the Cargo version. They are two
+# different sources and drift silently, which is how a binary ends up claiming
+# to be a release it is not. Surface the disagreement here instead.
+GIT_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+if [[ -z "$GIT_TAG" ]]; then
+    printf '  %s(no git tag yet — tag v%s to cut the GitHub release)%s\n\n' \
+        "$DIM" "$EPICO_VERSION_STR" "$RST"
+elif [[ "$GIT_TAG" == "v$EPICO_VERSION_STR" ]]; then
+    printf '  %s(git tag %s — in sync)%s\n\n' "$DIM" "$GIT_TAG" "$RST"
+else
+    printf '\n\n'
+    warn "version drift: Cargo.toml says v$EPICO_VERSION_STR but the latest git tag is $GIT_TAG"
+    warn "GitHub Releases follow the TAG. To release v$EPICO_VERSION_STR:"
+    warn "    git tag -a v$EPICO_VERSION_STR -m \"v$EPICO_VERSION_STR\" && git push --tags"
+fi
 
 info "setup complete"
 info "try:  cd examples/two-stage-min && epico run     # binary ingest via loadgen"
 info " or:  cd examples/three-stage-test && epico run  # binary ingest via native source"
+info " or:  cd examples/fusion-chain && epico run      # runtime stage fusion (M2)"

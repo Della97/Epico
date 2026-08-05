@@ -10,6 +10,9 @@ mod config;
 
 #[derive(Parser)]
 #[command(name = "epico")]
+// Reads CARGO_PKG_VERSION, which the workspace supplies — so `epico --version`
+// and the git tag a release is cut from share one source of truth.
+#[command(version)]
 #[command(about = "Build and run epico stream-processing pipelines", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -35,6 +38,13 @@ enum Commands {
         /// spawns are fast. Mutually exclusive with --aot.
         #[arg(long)]
         jit: bool,
+        /// Build the BASELINE arm: disable cold-start optimizations (pooling
+        /// allocator, CoW memory init, Cranelift Speed, parallel compilation).
+        /// They are ON by default, which is what a real deployment wants; turn
+        /// them off only to reproduce cold-start decomposition figures, and say
+        /// so alongside any number produced this way.
+        #[arg(long)]
+        no_cold_start_opt: bool,
     },
     /// Build and launch the full pipeline (dispatchers + agent).
     Run {
@@ -62,6 +72,13 @@ enum Commands {
         /// when the stage .rs sources are unchanged since the last build.
         #[arg(long)]
         no_build: bool,
+        /// Build the BASELINE arm: disable cold-start optimizations (pooling
+        /// allocator, CoW memory init, Cranelift Speed, parallel compilation).
+        /// They are ON by default, which is what a real deployment wants; turn
+        /// them off only to reproduce cold-start decomposition figures, and say
+        /// so alongside any number produced this way.
+        #[arg(long)]
+        no_cold_start_opt: bool,
     },
     /// Generate stage crates + validate components.
     Validate {
@@ -81,9 +98,14 @@ enum Commands {
     Bootstrap {
         #[arg(long)]
         project_root: Option<PathBuf>,
-        /// Enable cold-start optimizations in the agent: pooling allocator,
-        /// CoW memory init, Cranelift Speed opt level, parallel compilation.
+        /// Build the BASELINE arm: disable cold-start optimizations. They are
+        /// ON by default.
         #[arg(long)]
+        no_cold_start_opt: bool,
+        /// Deprecated no-op: cold-start optimizations are on by default now.
+        /// Accepted so existing scripts keep working; use --no-cold-start-opt
+        /// to get the baseline arm instead.
+        #[arg(long, hide = true)]
         cold_start_opt: bool,
     },
 }
@@ -91,20 +113,28 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Build { config, project_root, aot, jit } =>
-            cmd_build(&config, project_root.as_deref(), aot, jit),
-        Commands::Run { config, project_root, log_dir, aot, jit, no_build } =>
-            cmd_run(&config, project_root.as_deref(), &log_dir, aot, jit, no_build),
+        Commands::Build { config, project_root, aot, jit, no_cold_start_opt } =>
+            cmd_build(&config, project_root.as_deref(), aot, jit, !no_cold_start_opt),
+        Commands::Run { config, project_root, log_dir, aot, jit, no_build, no_cold_start_opt } =>
+            cmd_run(&config, project_root.as_deref(), &log_dir, aot, jit, no_build,
+                    !no_cold_start_opt),
         Commands::Validate { config, project_root } =>
             cmd_validate(&config, project_root.as_deref()),
         Commands::Clean { config, project_root } =>
             cmd_clean(&config, project_root.as_deref()),
-        Commands::Bootstrap { project_root, cold_start_opt } =>
-            cmd_bootstrap(project_root.as_deref(), cold_start_opt),
+        Commands::Bootstrap { project_root, no_cold_start_opt, cold_start_opt } => {
+            if cold_start_opt {
+                eprintln!("warning: --cold-start-opt is a no-op; cold-start \
+                           optimizations are enabled by default. Use \
+                           --no-cold-start-opt for the baseline arm.");
+            }
+            cmd_bootstrap(project_root.as_deref(), !no_cold_start_opt)
+        }
     }
 }
 
-fn cmd_build(config_path: &Path, project_root: Option<&Path>, aot: bool, jit: bool) -> Result<()> {
+fn cmd_build(config_path: &Path, project_root: Option<&Path>, aot: bool, jit: bool,
+             cold_start_opt: bool) -> Result<()> {
     if aot && jit {
         anyhow::bail!("--aot and --jit are mutually exclusive");
     }
@@ -112,7 +142,7 @@ fn cmd_build(config_path: &Path, project_root: Option<&Path>, aot: bool, jit: bo
     let (spec, root) = load_and_resolve(config_path, project_root)?;
     let output_dir = root.join("target").join("epico");
 
-    let out = codegen::generate(&spec, &root, &output_dir, compile_mode)?;
+    let out = codegen::generate(&spec, &root, &output_dir, compile_mode, cold_start_opt)?;
 
     if out.needs_build {
         build::build_stages(&out.workspace_manifest)?;
@@ -152,7 +182,9 @@ fn cmd_build(config_path: &Path, project_root: Option<&Path>, aot: bool, jit: bo
 fn cmd_validate(config_path: &Path, project_root: Option<&Path>) -> Result<()> {
     let (spec, root) = load_and_resolve(config_path, project_root)?;
     let output_dir = root.join("target").join("epico");
-    let out = codegen::generate(&spec, &root, &output_dir, None)?;
+    // Validation only type-checks components; the agent it scaffolds is never
+    // launched, so the cold-start feature choice is irrelevant here.
+    let out = codegen::generate(&spec, &root, &output_dir, None, true)?;
 
     let mut any_missing = false;
     for (name, path) in &out.wasm_by_stage {
@@ -172,7 +204,8 @@ fn cmd_validate(config_path: &Path, project_root: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_run(config_path: &Path, project_root: Option<&Path>, log_dir: &Path, aot: bool, jit: bool, no_build: bool) -> Result<()> {
+fn cmd_run(config_path: &Path, project_root: Option<&Path>, log_dir: &Path, aot: bool, jit: bool,
+           no_build: bool, cold_start_opt: bool) -> Result<()> {
     if aot && jit {
         anyhow::bail!("--aot and --jit are mutually exclusive");
     }
@@ -180,7 +213,7 @@ fn cmd_run(config_path: &Path, project_root: Option<&Path>, log_dir: &Path, aot:
     let (spec, root) = load_and_resolve(config_path, project_root)?;
     let output_dir = root.join("target").join("epico");
 
-    let out = codegen::generate(&spec, &root, &output_dir, compile_mode)?;
+    let out = codegen::generate(&spec, &root, &output_dir, compile_mode, cold_start_opt)?;
 
     if out.needs_build && !no_build {
         build::build_stages(&out.workspace_manifest)?;
@@ -222,8 +255,9 @@ fn cmd_run(config_path: &Path, project_root: Option<&Path>, log_dir: &Path, aot:
             agent.display(),
             dispatcher.display()
         );
-        println!("    Running bootstrap first (no cold-start-opt)...");
-        build::bootstrap_runtime(&root, false)?;
+        println!("    Running bootstrap first (cold-start-opt: {})...",
+                 if cold_start_opt { "on" } else { "off" });
+        build::bootstrap_runtime(&root, cold_start_opt)?;
 
         if !agent.exists() || !dispatcher.exists() {
             bail!(

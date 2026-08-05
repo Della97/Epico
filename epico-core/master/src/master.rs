@@ -101,7 +101,10 @@ pub fn run_agent(
     // wasmtime config (pooling allocator, CoW init) and so changes what the
     // cold-start numbers in this run mean — but it is baked in at bootstrap
     // and was previously only announced on stderr, which no log file keeps.
-    info!(log, "build features", cold_start_opt = cfg!(feature = "cold-start-opt"));
+    info!(log, "epico",
+          version = option_env!("EPICO_VERSION").unwrap_or("unknown"),
+          git_tag = option_env!("EPICO_GIT_TAG").unwrap_or("unknown"),
+          cold_start_opt = cfg!(feature = "cold-start-opt"));
 
     // Publish the run directory so the dispatcher children spawned later join
     // this run's folder rather than each minting their own. A no-op when the

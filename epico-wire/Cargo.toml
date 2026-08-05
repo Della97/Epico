@@ -1,7 +1,7 @@
 [package]
 name = "epico-wire"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "Epico binary event-envelope wire format — single source of truth, shared by master and loadgen"
 
 [lib]

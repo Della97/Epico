@@ -1,7 +1,7 @@
 [package]
 name = "epico-sdk"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "Developer SDK for writing epico stages as typed components"
 
 [lib]

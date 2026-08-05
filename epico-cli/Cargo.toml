@@ -1,7 +1,7 @@
 [package]
 name = "epico-cli"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "CLI for building and running Epico pipelines from a single YAML spec"
 
 [[bin]]
