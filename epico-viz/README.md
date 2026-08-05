@@ -19,37 +19,60 @@ Useful flags: `--port` (default 8777), `--no-open` (don't launch a browser),
 
 ## What's on the page
 
-- **Run at a glance** — events at the collector, offered count, duration,
-  e2e p50/p99, cold starts, scale ups/downs.
-- **Configuration & flags** — compile mode (AOT / startup-JIT / cold-start JIT,
-  *and* what actually ran if an AOT artifact fell back), cold-start-opt, edge
+- **The run tape** — the hero, and the scrubber. One row per stage for the whole
+  run: fill intensity is replica occupancy, the hairline over it is cumulative
+  offered load, and dashed rules mark loadgen bursts, EOS and SLO breaches.
+  Click or drag anywhere on it to move the run clock. Scroll past it and it
+  reappears as a **sticky transport rail** at the top of the window, so the
+  clock is reachable from any section. Space plays, `←`/`→` step, `Home`
+  rewinds.
+- **Run** — four primary readouts (events at the collector, duration, e2e
+  p50/p99) over a spec plate with the totals and the machine, toolchain and git
+  commit the run came from.
+- **Configuration** — compile mode (AOT / startup-JIT / cold-start JIT, *and*
+  what actually ran if an AOT artifact fell back), cold-start-opt, edge
   transport and ring capacity, ingress/egress mode, dispatchers, credit window,
-  batch size, typed dispatch, resource sampling; plus the source profile and the
-  machine, toolchain and git commit the run came from.
-- **Execution** — the DAG with a **time slider**. Node fill tracks live replicas
-  at the scrubbed instant, the second line reads `replicas/max · queue depth`,
-  and edges carry their transport and ring geometry on hover. Play/pause with a
-  speed control. Under it, **offered load** from the loadgen and **replica
-  bands** per stage, both carrying the playhead and both clickable to scrub.
-  Every chart on the run clock shares one plot area, so a burst lines up by eye
-  with the scale-up it triggered. Dashed lines mark loadgen bursts, EOS and SLO
-  breaches.
+  batch size, typed dispatch, resource sampling, and the source profile.
+- **Execution** — the DAG at the scrubbed instant. Each node is a stage module:
+  a segment meter counting live replicas against its ceiling, and a bar for
+  queue depth against this run's peak. Edges carry their transport and ring
+  geometry on hover. Under it, **offered load** and, separately, **offered
+  rate**. Every chart on the run clock shares one plot area and one playhead, so
+  a burst lines up by eye with the scale-up it triggered.
 
   The offered-load curve is cumulative, because that is what the loadgen
   actually records — a counter, logged once per burst on `pulse`/`tp` and every
-  2 s on the rate-paced profiles. Its slope is the offered rate. A rate curve is
-  overlaid **only when those samples are evenly spaced**: on `pulse` the first
+  2 s on the rate-paced profiles. Its slope is the offered rate. The rate panel
+  appears **only when those samples are evenly spaced**: on `pulse` the first
   interval is a burst with no idle after it (~71k ev/s) while the rest span
   burst+idle (~2.5k ev/s), so an average between samples would describe where
   the sample boundaries fell rather than how fast the burst ran.
-- **Queue depth**, **latency** (CDF, histogram, per-event scatter over time,
-  per-stage residency, inter-stage edges, per-replica, ingress wait),
-  **cold start** (scatter over time plus every worker boot with its
-  spawn/instantiate/export/sockets phases), **throughput & resources**,
-  **scaling events**, **event conservation**, and **worker timing**.
+- **Backpressure** — queue depth as small multiples, one panel per stage on a
+  shared scale, all sharing the run clock and the playhead.
+- **Latency** (CDF, histogram, per-event scatter over time, per-stage p50→p99
+  residency, inter-stage edges, per-replica, ingress wait), **cold start**
+  (every worker boot over time plus its spawn/instantiate/export/sockets
+  phases), **throughput** (collector rate, agent CPU and resident memory as
+  three separate panels), **scaling events**, **event conservation**, and
+  **worker timing**.
 
 Append `#t=2.5` to the URL to open at a specific instant; scrubbing keeps the
-hash in sync, so a particular moment can be linked.
+hash in sync, so a particular moment can be linked. Without a hash the page
+opens at the first instant the pipeline is carrying as many replicas as it ever
+will — at `t=0` the autoscaler has not acted yet and every stage would read 0.
+
+## How it's drawn
+
+A bench-instrument readout rather than a dashboard: a warm graphite housing, one
+cool readout hue for data, and reserved status lamps that always ship with a
+word next to them. Stage identity is carried by position and label — the gutter
+every time chart shares — which frees colour to encode magnitude instead of
+naming things. Series that genuinely overlap are faceted into small multiples
+rather than given a hue each, and no chart carries two y-scales.
+
+The palette lives in one place, `TOKENS` in `page.py`, and generates both the
+CSS custom properties and the JS the SVG draws with, so a colour cannot drift
+between the page chrome and the charts.
 
 ## Where the data comes from
 

@@ -62,4 +62,4 @@ Epico.code-workspace
 .env.*
 
 # Local visualisation tool: track the source, not the generated pages
-/epico-viz/out/
+/epico-viz/
