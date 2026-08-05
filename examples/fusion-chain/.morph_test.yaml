@@ -1,0 +1,102 @@
+# .morph_test.yaml — event conservation ACROSS A MORPH BOUNDARY (roadmap M2).
+#
+# The existing conservation tests prove the runtime does not eat events within a
+# FIXED topology. This one proves it does not eat them while the topology
+# CHANGES underneath the traffic: a fuse and a split both land mid-run, with the
+# source pushing throughout, and the collector must still see exactly what was
+# sent.
+#
+# Design notes that make the assertion meaningful:
+#
+#   * `pulse` uses BLOCKING sends, so the sent count is exact and the loadgen
+#     cannot silently drop events during the morph's stall. A dropping source
+#     would turn a conservation failure into a conservation "pass".
+#   * The idle gaps out-wait cooldown_down_s, so replicas drain between bursts
+#     and the morph has to cope with a stage set that is also scaling.
+#   * The morphs are scheduled INSIDE bursts, not in the gaps: a morph over an
+#     idle pipeline exercises nothing.
+#   * min_replicas: 0 means the fused stage must cold-start from nothing, which
+#     is the path that reopens the mesh columns a retired stage closed.
+#
+# Run:  tests/no_leak_morph.sh   (from repo root; iterates edge transports)
+
+package: epico:morphtest@1.0.0
+
+nodes:
+  - name: local
+    host: 127.0.0.1
+    force_tcp: false
+
+types:
+  reading:
+    sensor_id: string
+    value:     f64
+
+# 6 bursts of 40k, 3 s apart. ~24 s of wall clock, which comfortably contains
+# the morph schedule below with bursts on either side of every transition.
+source:
+  kind: loadgen
+  profile: pulse
+  count: 240000
+  pulse_events: 40000
+  pulse_idle_s: 3.0
+  sensors: 100
+
+stages:
+  - name: ingest
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/ingest.rs
+    scaling: { min: 0, max: 4, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 1.0 }
+
+  - name: normalize
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/normalize.rs
+    scaling: { min: 0, max: 4, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 1.0 }
+
+  - name: detect
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/detect.rs
+    scaling: { min: 0, max: 4, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 1.0 }
+
+  - name: finalize
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/finalize.rs
+    scaling: { min: 0, max: 4, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 1.0 }
+
+edges:
+  - ingest -> normalize
+  - normalize -> detect
+  - detect -> finalize
+
+fusible:
+  - normalize -> detect
+
+# identity → fuse → split, each landing inside a burst, with traffic still
+# flowing after the last one so the split's restored halves are exercised.
+morphs:
+  - { at_s:  3.0, identity: normalize }
+  - { at_s:  7.0, fuse: normalize -> detect }
+  - { at_s: 11.0, split: normalize_detect }
+
+deploy:
+  host: localhost
+  this_host: local
+  ingress: ipc:///tmp/epico-morphtest-push
+  source_format: json
+  event_format:  json
+
+  ingress_mode: inprocess
+  edge_impl: spsc
+  spsc_ring_cap: 512
+
+  credit_window: 16
+  batch_events:  1
+  resource_sample_interval_ms: 0

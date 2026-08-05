@@ -22,6 +22,7 @@ pub mod envelope;
 mod eos;
 mod host;
 mod inproc;
+mod morph;
 mod pipeline_validator;
 mod spsc;
 mod supervisor;
@@ -193,18 +194,34 @@ pub fn run_agent(
 
             if edge_impl == "spsc" {
                 // Global producer index space: upstream u owns
-                // [base(u), base(u) + u.max_replicas).
-                let n_prod: usize = pred_stages.iter().map(|p| p.slo.max_replicas).sum();
+                // [base(u), base(u) + width(u)).
+                //
+                // M2 (D1): `width` is NOT simply `u.max_replicas`. A declared
+                // fusible pair `(x, u)` means a fused stage may one day produce
+                // on this very edge with up to `max_x + max_u` replicas, and
+                // the mesh is dimension-fixed once built. Reserving the wider
+                // range here — a startup sizing decision — is what lets fusion
+                // avoid a runtime mesh swap entirely. Symmetrically,
+                // `max_consumers` widens the consumer dimension for a pair
+                // `(stage, y)`, whose fused stage would consume on this edge.
+                //
+                // Cost is `(max_ab - max) × n_prod × ring_cap` extra slots on
+                // the affected edges, bounded and paid once.
+                let n_prod: usize = pred_stages.iter()
+                    .map(|p| config.max_producers(&p.name)).sum();
+                let n_cons = config.max_consumers(&stage.name);
                 let mesh = Arc::new(SpscMesh::new(
-                    n_prod.max(1), stage.slo.max_replicas, spsc_ring_cap));
+                    n_prod.max(1), n_cons.max(1), spsc_ring_cap));
                 let mut base = 0usize;
                 for p in &pred_stages {
+                    let width = config.max_producers(&p.name);
                     output_edges.entry(p.name.clone()).or_default()
                         .push(EdgeOutSrc::Mesh { mesh: mesh.clone(), base });
                     info!(log, "in-process edge (spsc)",
                           from = p.name, to = stage.name, base = base,
-                          producers = n_prod, cap = spsc_ring_cap);
-                    base += p.slo.max_replicas;
+                          producer_width = width, producers = n_prod,
+                          consumers = n_cons, cap = spsc_ring_cap);
+                    base += width;
                 }
                 input_edges.insert(stage.name.clone(), EdgeInSrc::Mesh(mesh));
             } else {
@@ -265,9 +282,39 @@ pub fn run_agent(
         supervisor::spawn_dispatchers(&dispatchers_to_spawn, &bin, &log);
     }
 
-    let total_max: usize = config.pipeline.iter().map(|s| s.slo.max_replicas).sum();
+    // ── Instance-pool sizing, with fusion headroom ────────────────────────────
+    // A FUSED replica instantiates BOTH halves' components, so a pool sized for
+    // the unfused pipeline would fail fused spawns at exactly the moment the
+    // system is under pressure. Reserve `2 × max_ab` slots per declared fusible
+    // pair up front. The reservation is generous (protocol #1 fully retires
+    // both halves before the fused pool starts, so the two never coexist), but
+    // it is bounded, paid once at boot, and turns a runtime failure into a
+    // startup number the operator can see.
+    let fusible = config.fusible_pairs();
+    for entry in config.fusible.iter().filter(|p| p.len() != 2) {
+        warn!(log, "ignoring malformed `fusible:` entry (expected [a, b])",
+              entry = format!("{entry:?}"));
+    }
+    for (a, b) in &fusible {
+        match config.fusion_illegal_reason(a, b) {
+            None => info!(log, "fusible pair declared", a = a, b = b,
+                          max_ab = config.fused_max_replicas(a, b).unwrap_or(0)),
+            // Refused by NAME at validation time, not discovered during a run.
+            Some(reason) => warn!(log, "declared fusible pair can never be fused",
+                                  a = a, b = b, reason = reason.as_str()),
+        }
+    }
+    let base_max: usize = config.pipeline.iter().map(|s| s.slo.max_replicas).sum();
+    let fusion_headroom: usize = fusible.iter()
+        .filter_map(|(a, b)| config.fused_max_replicas(a, b))
+        .map(|max_ab| 2 * max_ab)
+        .sum();
+    let total_max = base_max + fusion_headroom;
     let engine = host::build_engine(total_max);
-    info!(log, "engine ready", max_replicas_total = total_max);
+    info!(log, "engine ready",
+          max_replicas_total = total_max,
+          stage_replicas = base_max,
+          fusion_headroom = fusion_headroom);
 
     // ── Stage-shaped Cranelift warmup ────────────────────────────────────────
     // The microscopic WAT compile inside `build_engine` warms most of
@@ -444,21 +491,12 @@ pub fn run_agent(
         // one-shot init they triggered persists.
     }
 
-    // ── Autoscaler threads ────────────────────────────────────────────────────
-    let stage_names: Vec<String> = config.pipeline.iter().map(|s| s.name.clone()).collect();
-    let mut handles = Vec::new();
-
-    // One EOS barrier per stage (see eos.rs). `expected_in` is the stage's
-    // in-degree, so a fan-in stage only finishes once EVERY upstream branch
-    // has delivered its marker. The entry stage has in-degree 0 in the DAG but
-    // receives one marker from the source, hence the max(1).
-    let barriers: HashMap<String, Arc<eos::StageEosBarrier>> = config.pipeline.iter()
-        .map(|s| {
-            let expected = config.in_degree(&s.name).max(1);
-            (s.name.clone(), Arc::new(eos::StageEosBarrier::new(expected)))
-        })
-        .collect();
-
+    // ── Stage registry (M2: the stage set is mutable at runtime) ──────────────
+    // Every stage's wiring is captured as a reusable deployment template rather
+    // than being consumed by a one-shot spawn, so a stage can be retired and
+    // brought back — which is what a split does when it restores the halves a
+    // fusion contracted.
+    let mut templates: HashMap<String, morph::StageDeployment> = HashMap::new();
     for stage in config.pipeline.iter() {
         let bare = stage.name.strip_prefix("fn-").unwrap_or(&stage.name);
         let dispatch_name = format!("dispatch-{}", bare);
@@ -469,27 +507,65 @@ pub fn run_agent(
                 std::process::exit(1);
             });
 
-        let ctrl_port   = dispatcher.ctrl_port;
-        let cw          = dispatcher.credit_window;
-        let engine_c    = engine.clone();
-        let stage_c     = stage.clone();
-        let stage_log   = log.with_component(&format!("autoscaler/{}", stage.name));
-        let tel_c       = telemetry.clone();
-        let compile_mode_c = config.compile_mode.clone();
-        let event_format_c = config.event_format.clone();
-        let in_edge_c   = input_edges.get(&stage.name).cloned().unwrap_or(EdgeInSrc::None);
-        let out_edges_c = output_edges.get(&stage.name).cloned().unwrap_or_default();
-        let barrier_c   = barriers.get(&stage.name).cloned().expect("barrier per stage");
-
-        handles.push(std::thread::spawn(move || {
-            autoscaler::run_autoscaler_loop(
-                stage_c, ctrl_port, cw, in_edge_c, out_edges_c, engine_c, stage_log, tel_c,
-                test_start_instant, compile_mode_c, event_format_c, barrier_c,
-            );
-        }));
+        templates.insert(stage.name.clone(), morph::StageDeployment {
+            stage:         stage.clone(),
+            in_edge:       input_edges.get(&stage.name).cloned().unwrap_or(EdgeInSrc::None),
+            out_edges:     output_edges.get(&stage.name).cloned().unwrap_or_default(),
+            ctrl_port:     dispatcher.ctrl_port,
+            credit_window: dispatcher.credit_window,
+            // The EOS barrier's `expected_in`: a fan-in stage only finishes
+            // once EVERY upstream branch has delivered its marker. The entry
+            // stage has in-degree 0 in the DAG but receives one marker from the
+            // source, hence the max(1) applied when the barrier is built.
+            expected_in:   config.in_degree(&stage.name).max(1),
+        });
     }
 
-    info!(log, "running", stages = stage_names.join(","));
+    // Summary stage list. It must ALSO name the stages a scheduled morph can
+    // bring into existence, or their scaling blocks would be missing from the
+    // very summary the break-even analysis reads.
+    let mut stage_names: Vec<String> = config.pipeline.iter().map(|s| s.name.clone()).collect();
+    for (a, b) in &fusible {
+        stage_names.push(crate::config::fused_stage_name(a, b));
+    }
+
+    let deployer = Arc::new(morph::Deployer::new(
+        engine.clone(),
+        telemetry.clone(),
+        test_start_instant,
+        config.compile_mode.clone(),
+        config.event_format.clone(),
+        log.clone(),
+        config.clone(),
+        templates.clone(),
+    ));
+
+    for stage in config.pipeline.iter() {
+        let dep = templates.get(&stage.name).cloned().expect("template per stage");
+        // 0: no warm-up floor at boot — `min_replicas` and the queue-depth
+        // signal drive the initial ramp exactly as they always have.
+        deployer.spawn_stage(dep, 0);
+    }
+
+    // ── Morph channel ─────────────────────────────────────────────────────────
+    // Mechanism and policy are separated here: everything downstream of this
+    // channel is the actuator, everything upstream is a policy that decides
+    // WHEN. Today the only producer is the deterministic YAML schedule.
+    let (morph_tx, morph_rx) = std::sync::mpsc::channel::<morph::MorphRequest>();
+    let morph_in_flight = deployer.morph_in_flight();
+    {
+        let dep_c = deployer.clone();
+        std::thread::spawn(move || morph::run_actuator(morph_rx, dep_c));
+    }
+    if !config.morphs.is_empty() {
+        let specs = config.morphs.clone();
+        let sched_log = log.with_component("morph/schedule");
+        std::thread::spawn(move || {
+            morph::run_schedule(specs, morph_tx, test_start_instant, sched_log);
+        });
+    }
+
+    info!(log, "running", stages = deployer.live_stage_names().join(","));
 
     // Signal readiness to any orchestrator (e.g. the `epico` CLI when it
     // is also launching loadgen). Written *after* autoscalers are live and
@@ -503,8 +579,12 @@ pub fn run_agent(
     }
 
     // ── Supervisor loop ───────────────────────────────────────────────────────
+    // "Every stage's thread has exited" used to mean the agent had crashed. It
+    // still does — EXCEPT in the middle of a morph, where a stage is legitimately
+    // retired before its replacement is deployed. Consulting `morph_in_flight`
+    // is what keeps a transition from being mistaken for a crash.
     while !supervisor::SHUTDOWN.load(Ordering::Relaxed) {
-        if handles.iter().all(|h| h.is_finished()) {
+        if !morph_in_flight.load(Ordering::Relaxed) && deployer.all_stages_finished() {
             error!(log, "all autoscaler threads exited unexpectedly");
             break;
         }
@@ -1081,12 +1161,26 @@ fn load_config(path: &std::path::Path, log: &Logger) -> Config {
         });
     let yaml_dir = std::path::Path::new(&yaml_path)
         .parent().unwrap_or_else(|| std::path::Path::new("."));
+    let resolve = |wasm: &str| -> Option<String> {
+        let resolved = yaml_dir.join(wasm);
+        resolved.exists().then(|| resolved.to_string_lossy().to_string())
+    };
     for stage in config.pipeline.iter_mut() {
         if let Some(ref wasm) = stage.wasm {
-            let resolved = yaml_dir.join(wasm);
-            if resolved.exists() { stage.wasm = Some(resolved.to_string_lossy().to_string()); }
+            if let Some(r) = resolve(wasm) { stage.wasm = Some(r); }
         }
         if stage.wasm.is_none() { stage.wasm = Some(default_wasm_path(&stage.name)); }
+        // A fused stage's halves carry their own components; resolve them the
+        // same way so a YAML-declared fusion works from a relative path too.
+        for half in stage.fused_from.iter_mut() {
+            match half.wasm.as_deref() {
+                Some(w) => { if let Some(r) = resolve(w) { half.wasm = Some(r); } }
+                None    => {
+                    let d = default_wasm_path(&half.name);
+                    half.wasm = Some(resolve(&d).unwrap_or(d));
+                }
+            }
+        }
     }
     // Backfill derived topology (edges / outputs / collector) so everything
     // downstream can read `config.edges` unconditionally — including
@@ -1096,9 +1190,19 @@ fn load_config(path: &std::path::Path, log: &Logger) -> Config {
 }
 
 fn validate_pipeline(config: &Config, log: &Logger) {
-    let stages: Vec<(String, String)> = config.pipeline.iter()
-        .map(|s| (s.name.clone(), s.wasm.clone().unwrap()))
-        .collect();
+    // Every component a worker will instantiate has to be checked, which for a
+    // fused stage is one per half. The stage itself is registered under its own
+    // name (so the edge checks below resolve); the remaining halves are
+    // registered under a qualified name so they are validated without being
+    // mistaken for edge endpoints.
+    let mut stages: Vec<(String, String)> = Vec::new();
+    for s in config.pipeline.iter() {
+        let halves = s.halves();
+        for (i, (logical, wasm)) in halves.iter().enumerate() {
+            let key = if i == 0 { s.name.clone() } else { format!("{}::{}", s.name, logical) };
+            stages.push((key, wasm.clone()));
+        }
+    }
     let edges: Vec<(String, String)> = config.edges.iter()
         .map(|e| (e.from.clone(), e.to.clone()))
         .collect();

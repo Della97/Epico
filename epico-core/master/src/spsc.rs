@@ -155,12 +155,21 @@ pub struct SpscMesh {
     rings: Box<[Swsr]>,
     prod_cursor: Box<[CachePad<UnsafeCell<usize>>]>, // per producer: next consumer to try
     cons_cursor: Box<[CachePad<UnsafeCell<usize>>]>, // per consumer: next producer to poll
-    /// Per-consumer close flag. A closed column is skipped by `push`, so a
-    /// draining consumer can empty its residue and be sure nothing new lands
-    /// behind it. Without this, a drained consumer stranded up to
-    /// n_prod × ring_cap events forever (producers kept round-robining into
-    /// its rings until full) — measured as exactly 2048 = 4 × 512 leaked
-    /// events in the scale-down conservation test.
+    /// Per-consumer close flag. A closed column is skipped by `push`.
+    ///
+    /// The invariant is: **a column with no live consumer never accepts an
+    /// event.** Producers round-robin into every open column until it is full,
+    /// so a column nobody is reading strands up to `n_prod × ring_cap` events
+    /// forever. That is what this flag prevents, on both of its edges:
+    ///
+    /// * A consumer that DRAINS closes its column, so it can empty its residue
+    ///   knowing nothing new will land behind it (without this, scale-down
+    ///   stranded exactly 2048 = 4 × 512 events in the conservation test).
+    /// * A column that has NEVER been occupied starts closed and is opened only
+    ///   when a consumer binds it ([`MeshRx::new`]). Columns exist for every
+    ///   index a consumer *may* one day take — `max_replicas`, widened further
+    ///   for a declared fusible pair whose fused stage would consume here — and
+    ///   the ones no replica has reached yet must not swallow traffic.
     closed: Box<[AtomicBool]>,
     /// Producers currently blocked in `MeshTx::push` backoff. Counted into
     /// `len()` so the consumer stage's autoscaler still sees demand when every
@@ -188,8 +197,14 @@ impl SpscMesh {
             .map(|_| CachePad(UnsafeCell::new(0)))
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        // Every column starts CLOSED and opens when a consumer binds it. See
+        // the `closed` field docs: an unoccupied open column silently absorbs
+        // events that no one will ever pop. A producer that finds every column
+        // closed blocks and registers in `waiting`, which keeps `len()` above
+        // zero so the consumer stage's autoscaler cold-starts a replica and
+        // reopens one — the same path that recovers from an all-drained stage.
         let closed = (0..n_cons)
-            .map(|_| AtomicBool::new(false))
+            .map(|_| AtomicBool::new(true))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         SpscMesh {
@@ -374,7 +389,12 @@ pub struct MeshRx {
     ci: usize,
 }
 impl MeshRx {
+    /// Bind a consumer to column `ci`, opening it. Constructing the handle IS
+    /// the moment a consumer occupies the column, so this is the one place the
+    /// column becomes eligible to receive — whether the previous occupant
+    /// drained and closed it, or nothing has ever occupied it.
     pub fn new(mesh: Arc<SpscMesh>, ci: usize) -> Self {
+        mesh.reopen_consumer(ci);
         MeshRx { mesh, ci }
     }
     /// Blocking dequeue. `None` only after drain is raised AND this consumer's
@@ -413,10 +433,32 @@ pub enum EdgeIn {
     Mesh(MeshRx),
 }
 impl EdgeIn {
+    /// Next event, or `None` when this worker should exit.
+    ///
+    /// `drain` is the cooperative shutdown used by scale-down and by the EOS
+    /// finishing gate: work already accepted is flushed, and on the mesh the
+    /// consumer's column is closed and its residue handed out before `None`.
+    ///
+    /// `stop` is the HARD retirement raised when a morph retires the whole
+    /// stage. It differs only on the shared MPMC ring, and it has to:
+    ///
+    /// * On the mesh, a cooperative drain terminates by construction — closing
+    ///   the column makes producers reroute, so the residue is finite. `stop`
+    ///   needs no special case.
+    /// * On the ring there is no per-consumer partition, so a cooperative drain
+    ///   keeps handing out events for as long as upstream keeps producing and
+    ///   would never terminate under sustained load. It also never needs to:
+    ///   an event this worker does not pop simply stays in the shared ring for
+    ///   a sibling replica or for the stage's next generation — a fused stage
+    ///   inherits the very same handle — so returning immediately strands
+    ///   nothing.
     #[inline]
-    pub fn pop(&self, drain: &AtomicBool) -> Option<Bytes> {
+    pub fn pop(&self, drain: &AtomicBool, stop: &AtomicBool) -> Option<Bytes> {
         match self {
-            EdgeIn::Ring(e) => e.pop(drain),
+            EdgeIn::Ring(e) => {
+                if stop.load(Ordering::Relaxed) { return None; }
+                e.pop(drain)
+            }
             EdgeIn::Mesh(m) => m.pop(drain),
         }
     }
@@ -452,13 +494,10 @@ impl EdgeInSrc {
         match self {
             EdgeInSrc::None => None,
             EdgeInSrc::Ring(e) => Some(EdgeIn::Ring(e.clone())),
-            EdgeInSrc::Mesh(m) => {
-                // A drained predecessor on this index closed the column;
-                // reopen it before the new replica starts popping so
-                // producers select it again.
-                m.reopen_consumer(r);
-                Some(EdgeIn::Mesh(MeshRx::new(m.clone(), r)))
-            }
+            // `MeshRx::new` opens the column: whether a drained predecessor on
+            // this index closed it or no replica has ever held it, producers
+            // start selecting it only now that a consumer exists.
+            EdgeInSrc::Mesh(m) => Some(EdgeIn::Mesh(MeshRx::new(m.clone(), r))),
         }
     }
     /// Queue-depth signal for the autoscaler (ring occupancy / total mesh occupancy).
@@ -697,6 +736,58 @@ mod tests {
         assert_eq!(sum.load(O::Relaxed), expect_sum, "payload corruption");
     }
 
+    /// Regression: a mesh sized wider than the consumers that actually bind it
+    /// must not swallow events into the spare columns.
+    ///
+    /// M2 widens a fusible pair's consumer dimension at boot to `max_a + max_b`
+    /// so a fused replica has a valid index by construction. If those extra
+    /// columns were open, producers would round-robin into them and every event
+    /// that landed there would be stranded forever — which is exactly the leak
+    /// this reproduces: 2 producers × 6 unbound columns × 8 slots.
+    #[test]
+    fn widened_mesh_does_not_strand_events_in_unbound_columns() {
+        const NP: usize = 2;
+        const N_COLS: usize = 8;   // widened for a fusible pair
+        const N_BOUND: usize = 2;  // replicas that actually exist
+        const PER: u64 = 20_000;
+
+        let mesh = Arc::new(SpscMesh::new(NP, N_COLS, 8));
+        let received = Arc::new(AtomicU64::new(0));
+        let drain = Arc::new(AtomicBool::new(false));
+
+        let mut handles = Vec::new();
+        for ci in 0..N_BOUND {
+            let rx = MeshRx::new(mesh.clone(), ci);
+            let recv = received.clone();
+            let d = drain.clone();
+            handles.push(thread::spawn(move || {
+                while rx.pop(&d).is_some() {
+                    recv.fetch_add(1, O::Relaxed);
+                }
+            }));
+        }
+        for pi in 0..NP {
+            let tx = MeshTx::new(mesh.clone(), pi);
+            handles.push(thread::spawn(move || {
+                let never = AtomicBool::new(false);
+                for k in 0..PER {
+                    assert!(tx.push(ev((pi as u64) * PER + k), &never));
+                }
+            }));
+        }
+
+        let total = (NP as u64) * PER;
+        while received.load(O::Relaxed) < total {
+            std::thread::yield_now();
+        }
+        drain.store(true, Ordering::Relaxed);
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(received.load(O::Relaxed), total,
+                   "events stranded in columns no consumer ever bound");
+    }
+
     #[test]
     fn mesh_no_loss_under_concurrency() {
         const NP: usize = 3;
@@ -705,6 +796,12 @@ mod tests {
         let mesh = Arc::new(SpscMesh::new(NP, NC, 256));
         let received = Arc::new(AtomicU64::new(0));
         let sum = Arc::new(AtomicU64::new(0));
+
+        // This test drives the mesh rawly (no `MeshRx`), so it must open the
+        // columns itself — a column with no bound consumer is closed.
+        for ci in 0..NC {
+            mesh.reopen_consumer(ci);
+        }
 
         let mut handles = Vec::new();
         // producers

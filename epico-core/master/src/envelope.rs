@@ -152,13 +152,36 @@ impl EventEnvelope {
         exit_ts: f64,
         out: EnvelopeFormat,
     ) -> Result<Bytes> {
+        self.encode_output_hops(
+            event_val,
+            output_fields,
+            bench_val,
+            &[(stage_name, enter_ts, exit_ts)],
+            out,
+        )
+    }
+
+    /// Multi-hop encode: append N hops in one shot instead of one.
+    ///
+    /// A fused physical stage runs several logical stages back to back in one
+    /// worker (M2 host-level fusion), so it emits ONE encoded event carrying one
+    /// hop per half. Each half stays individually attributable in
+    /// `per_stage_latency_ms` — which is what makes informed scission possible —
+    /// while the contracted edge's `inter_stage` gap collapses to ~0 because the
+    /// two hops are adjacent with no transport between them.
+    pub(crate) fn encode_output_hops(
+        &self,
+        event_val: &Val,
+        output_fields: &[RecordField],
+        bench_val: &Val,
+        new_hops: &[wire::Hop<'_>],
+        out: EnvelopeFormat,
+    ) -> Result<Bytes> {
         match out {
             EnvelopeFormat::Json => {
                 let bench_json = match self {
-                    Self::Json(j) => bench_val_to_json(
-                        bench_val, &j.value, stage_name, enter_ts, exit_ts,
-                    ),
-                    Self::Binary(b) => b.bench_json_with_hop(stage_name, enter_ts, exit_ts),
+                    Self::Json(j) => bench_val_to_json(bench_val, &j.value, new_hops),
+                    Self::Binary(b) => b.bench_json_with_hops(new_hops),
                 };
                 let out_json = record_val_to_json(event_val, output_fields);
                 let mut final_obj = match out_json {
@@ -182,7 +205,7 @@ impl EventEnvelope {
                     seq,
                     self.key_hash(),
                     &hops,
-                    Some((stage_name, enter_ts, exit_ts)),
+                    new_hops,
                     Some((event_val, output_fields)),
                 ))
             }
@@ -253,7 +276,7 @@ impl EventEnvelope {
                 b.seq,
                 b.key_hash,
                 &b.hops,
-                Some((stage_name, enter_ts, exit_ts)),
+                &[(stage_name, enter_ts, exit_ts)],
                 &b.fields,
             )),
         }
@@ -416,14 +439,9 @@ impl BinaryEnvelope {
         }
     }
 
-    /// Bench JSON (for binary-in -> json-out), with the new hop appended —
+    /// Bench JSON (for binary-in -> json-out), with the new hops appended —
     /// mirrors `bench_val_to_json` semantics.
-    fn bench_json_with_hop(
-        &self,
-        stage_name: &str,
-        enter_ts: f64,
-        exit_ts: f64,
-    ) -> serde_json::Value {
+    fn bench_json_with_hops(&self, new_hops: &[wire::Hop<'_>]) -> serde_json::Value {
         let mut map = serde_json::Map::new();
         if let Some(v) = self.ts_wall {
             map.insert("bench_ts_wall".into(), serde_json::json!(v));
@@ -439,7 +457,9 @@ impl BinaryEnvelope {
             .iter()
             .map(|(n, e, x)| serde_json::json!([n, e, x]))
             .collect();
-        hops.push(serde_json::json!([stage_name, enter_ts, exit_ts]));
+        for (n, e, x) in new_hops {
+            hops.push(serde_json::json!([n, e, x]));
+        }
         map.insert("bench_hops".into(), serde_json::Value::Array(hops));
         serde_json::Value::Object(map)
     }
@@ -500,11 +520,11 @@ fn write_binary(
     seq: Option<u64>,
     key_hash: Option<u64>,
     hops: &[(String, f64, f64)],
-    new_hop: Option<(&str, f64, f64)>,
+    new_hops: &[wire::Hop<'_>],
     event: Option<(&Val, &[RecordField])>,
 ) -> Bytes {
-    let mut out = Vec::with_capacity(96 + hops.len() * 40);
-    wire::write_header(&mut out, ts_wall, ts, seq, key_hash, hops, new_hop);
+    let mut out = Vec::with_capacity(96 + (hops.len() + new_hops.len()) * 40);
+    wire::write_header_hops(&mut out, ts_wall, ts, seq, key_hash, hops, new_hops);
 
     let count_pos = out.len();
     out.extend_from_slice(&0u16.to_le_bytes());
@@ -531,11 +551,11 @@ fn write_binary_raw_fields(
     seq: Option<u64>,
     key_hash: Option<u64>,
     hops: &[(String, f64, f64)],
-    new_hop: Option<(&str, f64, f64)>,
+    new_hops: &[wire::Hop<'_>],
     fields: &[BinField],
 ) -> Bytes {
-    let mut out = Vec::with_capacity(96 + hops.len() * 40);
-    wire::write_header(&mut out, ts_wall, ts, seq, key_hash, hops, new_hop);
+    let mut out = Vec::with_capacity(96 + (hops.len() + new_hops.len()) * 40);
+    wire::write_header_hops(&mut out, ts_wall, ts, seq, key_hash, hops, new_hops);
     out.extend_from_slice(&(fields.len().min(u16::MAX as usize) as u16).to_le_bytes());
     for f in fields.iter().take(u16::MAX as usize) {
         // An absent field still carries its original kind tag so the schema
@@ -606,7 +626,7 @@ mod tests {
             Some(7),
             Some(epico_wire::fnv1a64(b"sensor-1")),
             &hops,
-            Some(("forward#1", 2.0, 2.5)),
+            &[("forward#1", 2.0, 2.5)],
             Some((&val, &fields)),
         );
         assert!(is_binary(&bytes));
@@ -624,9 +644,52 @@ mod tests {
             panic!("not a record");
         }
         // telemetry adapter
-        let bytes2 = write_binary(Some(9.0), None, None, None, &[], None, None);
+        let bytes2 = write_binary(Some(9.0), None, None, None, &[], &[], None);
         let tj = binary_to_telemetry_json(&bytes2).unwrap();
         assert_eq!(tj["bench_ts_wall"].as_f64(), Some(9.0));
+    }
+
+    /// A fused worker appends one hop per half in a single encode. Both halves
+    /// must survive, in order, after the hops the event already carried — that
+    /// is what makes the contracted edge's `inter_stage` gap collapse to ~0
+    /// while `per_stage_latency_ms` still attributes time to each half.
+    #[test]
+    fn binary_multi_hop_append_preserves_order() {
+        let carried = vec![("ingest#0".to_string(), 1.0, 1.1)];
+        let bytes = write_binary(
+            Some(1.0), None, Some(3), None,
+            &carried,
+            &[("normalize#2", 2.0, 2.25), ("detect#2", 2.25, 2.5)],
+            None,
+        );
+        let env = BinaryEnvelope::decode(bytes).unwrap();
+        let names: Vec<&str> = env.hops.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["ingest#0", "normalize#2", "detect#2"]);
+        // Zero-width gap between the fused halves: B enters exactly when A exits.
+        assert_eq!(env.hops[1].2, env.hops[2].1);
+    }
+
+    /// The JSON arm must append the same hop sequence as the binary arm.
+    #[test]
+    fn json_multi_hop_append_preserves_order() {
+        let input = serde_json::json!({
+            "bench_ts_wall": 1.0,
+            "bench_hops": [["ingest#0", 1.0, 1.1]],
+        });
+        let env = EventEnvelope::Json(JsonEnvelope { value: input });
+        let bytes = env
+            .encode_output_hops(
+                &Val::Record(vec![]),
+                &[],
+                &Val::Bool(false),
+                &[("normalize#2", 2.0, 2.25), ("detect#2", 2.25, 2.5)],
+                EnvelopeFormat::Json,
+            )
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let hops = v["bench_hops"].as_array().unwrap();
+        let names: Vec<&str> = hops.iter().map(|h| h[0].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["ingest#0", "normalize#2", "detect#2"]);
     }
 }
 
@@ -693,7 +756,7 @@ impl EventEnvelope {
                         bm.insert("bench_hops".to_string(), serde_json::Value::Array(hops));
                         serde_json::Value::Object(bm)
                     }
-                    Self::Binary(b) => b.bench_json_with_hop(hop_label, enter_ts, exit_ts),
+                    Self::Binary(b) => b.bench_json_with_hops(&[(hop_label, enter_ts, exit_ts)]),
                 };
                 if let serde_json::Value::Object(bm) = bench_json {
                     for (k, v) in bm {

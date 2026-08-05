@@ -1,7 +1,7 @@
 //! Per-stage autoscaler — one thread per stage, ticks every `TICK_MS` (1 ms).
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,7 +18,7 @@ use crate::eos::StageEosBarrier;
 use crate::host::HostState;
 use crate::spsc::{EdgeInSrc, EdgeOutSrc};
 use crate::telemetry::{record_event, stats::round3, RunTelemetry, ScalingEvent};
-use crate::worker::{spawn_worker, OutputSpec, WorkerHandle};
+use crate::worker::{spawn_worker, OutputSpec, WorkerChain, WorkerHandle};
 
 const TICK_MS: u64 = 1;
 const SPAWN_SETTLE_TICKS: u32 = 3;
@@ -69,6 +69,19 @@ fn load_component(
     (component, compile_ms, "jit")
 }
 
+/// A component linker with WASI (and wasi:http when available) wired in.
+/// One per component: a fused stage builds several, one per half, so each
+/// half's imports resolve exactly as they did before fusion.
+fn new_linker(engine: &Engine, log: &Logger) -> ComponentLinker<HostState> {
+    let mut linker: ComponentLinker<HostState> = ComponentLinker::new(engine);
+    wasmtime_wasi::add_to_linker_sync(&mut linker)
+        .expect("Failed to add wasi to component linker");
+    if let Err(e) = wasmtime_wasi_http::add_only_http_to_linker_sync(&mut linker) {
+        warn!(log, "wasi:http not wired", err = e);
+    }
+    linker
+}
+
 /// JIT-compile `.wasm` → `.cwasm` at cold-start time and create an
 /// `InstancePre`. Called only in `compile_mode == "jit"` on the first
 /// spawn; subsequent spawns reuse the cached `InstancePre`.
@@ -115,6 +128,25 @@ fn jit_compile_and_instantiate(
     (instance_pre, compile_ms, instantiate_pre_ms)
 }
 
+/// One stage's control loop.
+///
+/// M2 adds two parameters that make the stage set MUTABLE at runtime:
+///
+/// * `stop` — raised by the morph actuator to retire this stage. The loop
+///   drains every replica, waits for each to confirm exit, then returns. Drain
+///   is the same mechanism scale-down already uses, so the residue path that
+///   conserves events under scale-down conserves them across a morph too.
+///   Never raised for a pipeline that does not morph.
+/// * `initial_replicas` — a replica count to bring up immediately, ABOVE
+///   `min_replicas`, before normal scaling rules take over. A freshly fused
+///   stage starts at `R_ab = Ra + Rb`, not `max(Ra, Rb)`: replica counts encode
+///   service times (Little: Ra ≈ λ·tA) and a fused worker holds its thread for
+///   `tA + tB` per event. Undershooting at the moment the SLO was already under
+///   pressure is the wrong direction to be wrong in; the autoscaler trims down
+///   from here as the deleted edge overhead shows up. 0 for an ordinary boot.
+/// * `live_replicas` — published every tick so the morph actuator can read
+///   `Ra` and `Rb` without racing this loop's private worker list.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_autoscaler_loop(
     stage:         PipelineStage,
     ctrl_port:     u16,
@@ -128,6 +160,9 @@ pub(crate) fn run_autoscaler_loop(
     compile_mode:  String,
     event_format:  String,
     barrier:       Arc<StageEosBarrier>,
+    stop:          Arc<AtomicBool>,
+    initial_replicas: usize,
+    live_replicas: Arc<std::sync::atomic::AtomicUsize>,
 ) {
     let min_rep  = stage.slo.min_replicas;
     let max_rep  = stage.slo.max_replicas;
@@ -158,112 +193,117 @@ pub(crate) fn run_autoscaler_loop(
             .collect()
     };
 
-    let wasm_path = stage.wasm.clone().expect("wasm path resolved in main()");
-    info!(log, "loading component",
-          wasm = wasm_path,
+    // The logical stages this physical stage runs: one for an ordinary stage,
+    // N for a fused one. Everything below is per-half, so fusion adds no
+    // special case to the scaling logic — only to how many components a
+    // replica instantiates.
+    let halves = stage.halves();
+    info!(log, "loading components",
           stage = stage.name,
+          halves = halves.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>().join(" -> "),
           compile_mode = compile_mode);
 
     // ── Component loading: AOT/startup-JIT at startup; deferred-JIT at cold-start ──
     //
-    // `jit_pending_linker`: holds the linker in JIT mode until the first spawn.
-    // `shared_instance_pre`: the InstancePre shared by all workers.  In JIT
-    //   mode it starts as None and is filled on the first spawn; in AOT/startup
-    //   mode it is populated here before the loop.
-    let (mut jit_pending_linker, mut shared_instance_pre): (
-        Option<ComponentLinker<HostState>>,
-        Option<Arc<wasmtime::component::InstancePre<HostState>>>,
-    ) = if compile_mode == "jit" {
-        // Deferred: build the linker now but don't touch the .wasm yet.
-        let mut linker: ComponentLinker<HostState> = ComponentLinker::new(&engine);
-        wasmtime_wasi::add_to_linker_sync(&mut linker)
-            .expect("Failed to add wasi to component linker");
-        if let Err(e) = wasmtime_wasi_http::add_only_http_to_linker_sync(&mut linker) {
-            warn!(log, "wasi:http not wired", err = e);
-        }
+    // `jit_deferred`: in JIT mode the .wasm is not touched until the first
+    //   spawn, so cold-start measurement includes Cranelift compile time.
+    // `worker_chain`: the (logical name, InstancePre) list every worker
+    //   instantiates from. Empty until the deferred JIT compile happens.
+    let jit_deferred = compile_mode == "jit";
+    let mut worker_chain: WorkerChain = Vec::new();
+
+    if jit_deferred {
         info!(log, "autoscaler ready (JIT: compilation deferred to cold-start)",
               stage = stage.name,
               max_rep = stage.slo.max_replicas,
               min_rep = stage.slo.min_replicas);
-        (Some(linker), None)
     } else {
         // AOT or startup-JIT: compile/load now, before the loop.
-        let (component, compile_ms, mode) = load_component(&engine, &wasm_path, &log);
+        for (idx, (logical_name, wasm_path)) in halves.iter().enumerate() {
+            let (component, compile_ms, mode) = load_component(&engine, wasm_path, &log);
+            let linker = new_linker(&engine, &log);
 
-        let mut linker: ComponentLinker<HostState> = ComponentLinker::new(&engine);
-        wasmtime_wasi::add_to_linker_sync(&mut linker)
-            .expect("Failed to add wasi to component linker");
-        if let Err(e) = wasmtime_wasi_http::add_only_http_to_linker_sync(&mut linker) {
-            warn!(log, "wasi:http not wired", err = e);
-        }
+            let t_pre = Instant::now();
+            let instance_pre = linker
+                .instantiate_pre(&component)
+                .expect("Failed to create component InstancePre");
+            let instantiate_pre_ms = t_pre.elapsed().as_secs_f64() * 1000.0;
+            info!(log, "instance_pre ready",
+                  stage = logical_name,
+                  mode = mode,
+                  instantiate_pre_ms = format!("{:.3}", instantiate_pre_ms));
 
-        let t_pre = Instant::now();
-        let instance_pre = linker
-            .instantiate_pre(&component)
-            .expect("Failed to create component InstancePre");
-        let instantiate_pre_ms = t_pre.elapsed().as_secs_f64() * 1000.0;
-        info!(log, "instance_pre ready",
-              stage = stage.name,
-              mode = mode,
-              instantiate_pre_ms = format!("{:.3}", instantiate_pre_ms));
-
-        // ── Warmup instantiate ────────────────────────────────────────────────
-        // The first `instance_pre.instantiate(&mut store)` in a process is
-        // significantly slower than subsequent ones because of one-time
-        // Wasmtime engine setup (Cranelift relocation patching, pool
-        // first-slot mmap + page-fault, signal handler install, etc.) plus
-        // first-call WASI context construction.
-        //
-        // We do that throwaway instantiation here, at autoscaler startup,
-        // before any user-facing cold start. The cost (~0.5 ms on first
-        // stage, ~0.05 ms on subsequent stages) is shifted out of the
-        // measured cold_start_ms window and into agent boot time.
-        //
-        // The `Store` is dropped at end of scope, returning its pool slot.
-        // The dropped instance has no side effects — no events processed,
-        // no sockets touched, no exports called. Pure init/teardown.
-        let t_warm = Instant::now();
-        {
-            let host_state = HostState {
-                table: ResourceTable::new(),
-                wasi:  WasiCtxBuilder::new().build(),
-                http:  WasiHttpCtx::new(),
-                limits: crate::host::default_store_limits(),
-            };
-            let mut warmup_store = Store::new(&engine, host_state);
-            warmup_store.limiter(|s| &mut s.limits);
-            match instance_pre.instantiate(&mut warmup_store) {
-                Ok(_inst) => {
-                    let warmup_ms = t_warm.elapsed().as_secs_f64() * 1000.0;
-                    info!(log, "wasmtime warmup complete",
-                          stage = stage.name,
-                          warmup_ms = format!("{:.3}", warmup_ms));
-                }
-                Err(e) => {
-                    // Non-fatal: if warmup fails, the real first worker will
-                    // surface the same error. Don't abort agent startup over
-                    // an instrumentation step.
-                    warn!(log, "wasmtime warmup failed (continuing)",
-                          stage = stage.name,
-                          err = e);
+            // ── Warmup instantiate ────────────────────────────────────────────
+            // The first `instance_pre.instantiate(&mut store)` in a process is
+            // significantly slower than subsequent ones because of one-time
+            // Wasmtime engine setup (Cranelift relocation patching, pool
+            // first-slot mmap + page-fault, signal handler install, etc.) plus
+            // first-call WASI context construction.
+            //
+            // We do that throwaway instantiation here, at autoscaler startup,
+            // before any user-facing cold start. The cost (~0.5 ms on first
+            // stage, ~0.05 ms on subsequent stages) is shifted out of the
+            // measured cold_start_ms window and into agent boot time. Only the
+            // first half pays it: the effect is per-engine, not per-component.
+            //
+            // The `Store` is dropped at end of scope, returning its pool slot.
+            // The dropped instance has no side effects — no events processed,
+            // no sockets touched, no exports called. Pure init/teardown.
+            if idx == 0 {
+                let t_warm = Instant::now();
+                let host_state = HostState {
+                    table: ResourceTable::new(),
+                    wasi:  WasiCtxBuilder::new().build(),
+                    http:  WasiHttpCtx::new(),
+                    limits: crate::host::default_store_limits(),
+                };
+                let mut warmup_store = Store::new(&engine, host_state);
+                warmup_store.limiter(|s| &mut s.limits);
+                match instance_pre.instantiate(&mut warmup_store) {
+                    Ok(_inst) => {
+                        let warmup_ms = t_warm.elapsed().as_secs_f64() * 1000.0;
+                        info!(log, "wasmtime warmup complete",
+                              stage = stage.name,
+                              warmup_ms = format!("{:.3}", warmup_ms));
+                    }
+                    Err(e) => {
+                        // Non-fatal: if warmup fails, the real first worker will
+                        // surface the same error. Don't abort agent startup over
+                        // an instrumentation step.
+                        warn!(log, "wasmtime warmup failed (continuing)",
+                              stage = stage.name,
+                              err = e);
+                    }
                 }
             }
+
+            let init_action = if mode == "aot" { "init_aot" } else { "init_jit" };
+            record_event(
+                &telemetry, test_start, &stage.name, init_action,
+                0, None, Some(compile_ms), Some(instantiate_pre_ms),
+            );
+            worker_chain.push((logical_name.clone(), Arc::new(instance_pre)));
         }
 
-        let init_action = if mode == "aot" { "init_aot" } else { "init_jit" };
-        record_event(
-            &telemetry, test_start, &stage.name, init_action,
-            0, None, Some(compile_ms), Some(instantiate_pre_ms),
-        );
-
         info!(log, "autoscaler ready",
+              stage = stage.name,
               max_rep = stage.slo.max_replicas,
               min_rep = stage.slo.min_replicas,
               queue_up = stage.slo.queue_up.unwrap_or(50.0),
-              queue_down = stage.slo.queue_down.unwrap_or(0.0),
-              mode = mode);
+              queue_down = stage.slo.queue_down.unwrap_or(0.0));
+    }
 
-        (None, Some(Arc::new(instance_pre)))
+    // Deferred-JIT compile of every half. Called from the spawn paths so the
+    // cost lands inside the measured cold-start window, exactly as before.
+    let compile_chain_now = |chain: &mut WorkerChain| {
+        for (logical_name, wasm_path) in halves.iter() {
+            let linker = new_linker(&engine, &log);
+            let (ip, cm, ipm) =
+                jit_compile_and_instantiate(&engine, wasm_path, linker, &log);
+            record_event(&telemetry, test_start, &stage.name, "init_jit",
+                         0, None, Some(cm), Some(ipm));
+            chain.push((logical_name.clone(), Arc::new(ip)));
+        }
     };
 
     let zmq_ctx = zmq::Context::new();
@@ -315,6 +355,11 @@ pub(crate) fn run_autoscaler_loop(
     let mut up_votes: u32 = 0;
     let mut down_votes: u32 = 0;
     let mut ticks_since_spawn: u32 = u32::MAX;
+    // Spawn floor for the first moments of this stage's life, cleared once
+    // reached. A morph-spawned stage uses it to come up at `R_ab` without
+    // permanently raising `min_replicas` — the autoscaler must stay free to
+    // trim back down once the deleted edge overhead stops showing up.
+    let mut warmup_target: usize = initial_replicas.min(max_rep);
     // Index into telemetry.scaling_events of the most-recently recorded
     // cold_start event whose cold_start_ms is still None.  We back-fill it
     // once the worker's first refill message arrives via the dispatcher metrics
@@ -333,7 +378,31 @@ pub(crate) fn run_autoscaler_loop(
             }
         });
         let current = workers.len();
+        live_replicas.store(current, Ordering::Relaxed);
         ticks_since_spawn = ticks_since_spawn.saturating_add(1);
+        if current >= warmup_target { warmup_target = 0; }
+
+        // ── Stop (morph teardown) ────────────────────────────────────────────
+        // Raise every replica's drain flag and exit once each has confirmed it
+        // finished. Drain is the SAME mechanism scale-down already uses, so the
+        // residue path that conserves events under scale-down conserves them
+        // here too: an in-proc consumer closes its mesh column and hands out
+        // what is left before returning None.
+        //
+        // Checked before the queue-depth fetch, which `continue`s when a
+        // dispatcher is unreachable — a stopping stage must not be able to get
+        // stuck behind that.
+        if stop.load(Ordering::Relaxed) {
+            for w in workers.iter() {
+                w.drain_flag.store(true, Ordering::Relaxed);
+            }
+            if workers.is_empty() {
+                live_replicas.store(0, Ordering::Relaxed);
+                info!(log, "autoscaler stopped (all replicas drained)", stage = stage.name);
+                return;
+            }
+            continue;
+        }
 
         // Queue-depth signal. An in-process consumer stage has no dispatcher to
         // poll, so its input Edge's occupancy is the signal — and we must NOT
@@ -440,15 +509,9 @@ pub(crate) fn run_autoscaler_loop(
             let decision_ts = now_secs_f64();
             // JIT: .wasm→.cwasm compilation happens here, AFTER decision_ts is
             // captured, so the cold-start measurement includes compile time.
-            if shared_instance_pre.is_none() {
-                let linker = jit_pending_linker.take()
-                    .expect("JIT linker already consumed — this is a bug");
-                let (ip, cm, ipm) = jit_compile_and_instantiate(&engine, &wasm_path, linker, &log);
-                record_event(&telemetry, test_start, &stage.name, "init_jit",
-                             0, None, Some(cm), Some(ipm));
-                shared_instance_pre = Some(Arc::new(ip));
+            if worker_chain.is_empty() {
+                compile_chain_now(&mut worker_chain);
             }
-            let instance_pre = shared_instance_pre.as_ref().unwrap();
             info!(log, "cold start: spawning replica",
                   qd = format!("{:.0}", qd),
                   max_rep = max_rep);
@@ -466,12 +529,13 @@ pub(crate) fn run_autoscaler_loop(
                 build_output_specs(replica_idx),
                 input_edge.for_replica(replica_idx),
                 credit_window,
-                &engine, instance_pre,
+                &engine, &worker_chain,
                 &last_active_ts, &avg_latency_us,
                 decision_ts,
                 worker_ctx.clone(),
                 event_format.clone(),
                 barrier.clone(),
+                stop.clone(),
                 log.with_component(&format!("worker/{}", stage.name)),
             ));
             if let Ok(mut tel) = telemetry.lock() {
@@ -491,18 +555,16 @@ pub(crate) fn run_autoscaler_loop(
             continue;
         }
 
-        if current < min_rep {
+        // Below the spawn floor: `min_replicas`, or the (higher, transient)
+        // warm-up target a morph-spawned stage comes up at.
+        let spawn_floor = min_rep.max(warmup_target);
+        if current < spawn_floor {
             let decision_ts = now_secs_f64();
-            if shared_instance_pre.is_none() {
-                let linker = jit_pending_linker.take()
-                    .expect("JIT linker already consumed — this is a bug");
-                let (ip, cm, ipm) = jit_compile_and_instantiate(&engine, &wasm_path, linker, &log);
-                record_event(&telemetry, test_start, &stage.name, "init_jit",
-                             0, None, Some(cm), Some(ipm));
-                shared_instance_pre = Some(Arc::new(ip));
+            if worker_chain.is_empty() {
+                compile_chain_now(&mut worker_chain);
             }
-            let instance_pre = shared_instance_pre.as_ref().unwrap();
-            info!(log, "below min: spawning replica", current = current, min_rep = min_rep);
+            info!(log, "below min: spawning replica",
+                  current = current, min_rep = min_rep, floor = spawn_floor);
             let replica_idx = match free_indices.pop_first() {
                 Some(i) => i,
                 None => {
@@ -517,12 +579,13 @@ pub(crate) fn run_autoscaler_loop(
                 build_output_specs(replica_idx),
                 input_edge.for_replica(replica_idx),
                 credit_window,
-                &engine, instance_pre,
+                &engine, &worker_chain,
                 &last_active_ts, &avg_latency_us,
                 decision_ts,
                 worker_ctx.clone(),
                 event_format.clone(),
                 barrier.clone(),
+                stop.clone(),
                 log.with_component(&format!("worker/{}", stage.name)),
             ));
             record_event(&telemetry, test_start, &stage.name, "spawn",
@@ -536,15 +599,9 @@ pub(crate) fn run_autoscaler_loop(
             && current < max_rep
         {
             let decision_ts = now_secs_f64();
-            if shared_instance_pre.is_none() {
-                let linker = jit_pending_linker.take()
-                    .expect("JIT linker already consumed — this is a bug");
-                let (ip, cm, ipm) = jit_compile_and_instantiate(&engine, &wasm_path, linker, &log);
-                record_event(&telemetry, test_start, &stage.name, "init_jit",
-                             0, None, Some(cm), Some(ipm));
-                shared_instance_pre = Some(Arc::new(ip));
+            if worker_chain.is_empty() {
+                compile_chain_now(&mut worker_chain);
             }
-            let instance_pre = shared_instance_pre.as_ref().unwrap();
             info!(log, "scale up",
                   qd = format!("{:.0}", qd),
                   current = current,
@@ -564,12 +621,13 @@ pub(crate) fn run_autoscaler_loop(
                 build_output_specs(replica_idx),
                 input_edge.for_replica(replica_idx),
                 credit_window,
-                &engine, instance_pre,
+                &engine, &worker_chain,
                 &last_active_ts, &avg_latency_us,
                 decision_ts,
                 worker_ctx.clone(),
                 event_format.clone(),
                 barrier.clone(),
+                stop.clone(),
                 log.with_component(&format!("worker/{}", stage.name)),
             ));
             record_event(&telemetry, test_start, &stage.name, "spawn",

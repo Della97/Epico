@@ -1,0 +1,118 @@
+# fusion-chain — the M2 reference pipeline: a DAG that rewrites its own
+# PHYSICAL topology while its LOGICAL topology stays fixed.
+#
+#   ingest -> normalize -> detect -> finalize          (DAG1, unfused)
+#   ingest -> [normalize|detect]  -> finalize          (DAG2, contracted)
+#
+# `normalize -> detect` is declared fusible, so the agent widens that edge's
+# replica-index spaces at boot and the pair can be contracted at runtime with no
+# mesh swap. The morph schedule below drives the transition at KNOWN instants —
+# which is what makes switch cost S and break-even measurable at all.
+#
+# The two halves are minimal-compute by design: when per-event compute is small
+# the edge dominates service time, which is the regime where fusion pays.
+# `ingest` and `finalize` are never fused, so `detect -> finalize` stays as an
+# unchanged control edge in the same summary.
+#
+# Run standalone:              epico run
+# Conservation across a morph: tests/no_leak_morph.sh
+# Break-even harness:          bench/morph_bench.sh
+
+package: epico:fusionchain@1.0.0
+
+nodes:
+  - name: local
+    host: 127.0.0.1
+    force_tcp: false
+
+# One record type end to end. `normalize.out == detect.in` by construction, so
+# the contraction hands one half's result Val straight to the next with no
+# conversion. Do NOT name this type `event` — that selects the legacy
+# all-optional shared record and skips typed dispatch.
+types:
+  reading:
+    sensor_id: string
+    value:     f64
+
+source:
+  kind: loadgen
+  profile: tp
+  count: 400000
+  sensors: 100
+  blast: true
+
+stages:
+  - name: ingest
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/ingest.rs
+    scaling: { min: 2, max: 4, queue_up: 50, cooldown_up_s: 20, cooldown_down_s: 20 }
+
+  - name: normalize
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/normalize.rs
+    scaling: { min: 2, max: 4, queue_up: 50, cooldown_up_s: 20, cooldown_down_s: 20 }
+
+  - name: detect
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/detect.rs
+    scaling: { min: 2, max: 4, queue_up: 50, cooldown_up_s: 20, cooldown_down_s: 20 }
+
+  - name: finalize
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/finalize.rs
+    scaling: { min: 2, max: 4, queue_up: 50, cooldown_up_s: 20, cooldown_down_s: 20 }
+
+edges:
+  - ingest -> normalize
+  - normalize -> detect
+  - detect -> finalize
+
+# Pre-declared physical alternatives. Only edges listed here can be contracted:
+# the declaration is what tells the agent, at boot, to size `normalize`'s
+# in-mesh for max(4, 4+4) = 8 consumers and `detect`'s out-edge for 8 producer
+# columns, so a fused replica has a valid index by construction.
+#
+# The CLI rejects a pair that could never be contracted (fan-out at the source,
+# fan-in at the target, or split placement) here at parse time, with a named
+# reason, rather than leaving it to be discovered during a benchmark run.
+fusible:
+  - normalize -> detect
+
+# Deterministic morph schedule. `identity` first: redeploying a stage unchanged
+# has zero expected steady-state delta BY CONSTRUCTION, so it isolates switch
+# mechanism cost from any workload effect. Only then fuse, then split back.
+# A surprising number on the first two means the harness is wrong, not the
+# intuition.
+morphs:
+  - { at_s:  6.0, identity: normalize }
+  - { at_s: 12.0, fuse: normalize -> detect }
+  - { at_s: 20.0, split: normalize_detect }
+
+deploy:
+  host: localhost
+  this_host: local
+  ingress: ipc:///tmp/epico-fusionchain-push
+
+  source_format: binary
+  event_format:  binary
+
+  # In-node edges run on in-process queues. The spsc mesh is the transport
+  # whose per-edge cost fusion deletes, so it is the one to measure against.
+  ingress_mode: inprocess
+  edge_impl: spsc
+  spsc_ring_cap: 512
+
+  credit_window: 16
+  batch_events:  1
+
+  # Sampler off: sysinfo's Mach refresh on macOS injects multi-millisecond
+  # jitter, and S is read off per-event wall timestamps around the morph.
+  resource_sample_interval_ms: 0

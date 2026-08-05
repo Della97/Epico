@@ -88,6 +88,36 @@ impl StageEosBarrier {
         self.finishing.load(Ordering::SeqCst)
     }
 
+    /// Hand every marker this barrier has accumulated over to `other`, leaving
+    /// this one empty. Returns how many markers moved.
+    ///
+    /// A morph retires a stage and replaces it with a differently-shaped one,
+    /// and its barrier goes with it. A morph is only STARTED when no barrier
+    /// has seen all its markers (they are mutually exclusive by design — a
+    /// contracted stage's barrier could never receive its marker), but a marker
+    /// can still arrive in the window between that check and the teardown. If
+    /// it did and we dropped the barrier, the run would never terminate.
+    /// Moving the state onto the replacement stage's barrier closes that race,
+    /// so a morph can never lose or double an EOS.
+    pub fn drain_into(&self, other: &StageEosBarrier) -> usize {
+        let n = self.seen.swap(0, Ordering::SeqCst);
+        if n == 0 {
+            return 0;
+        }
+        match self.marker.lock().ok().and_then(|mut m| m.take()) {
+            // `report` both folds the payload and counts one marker; the rest
+            // were already merged into it by whichever branch reported first.
+            Some(payload) => {
+                other.report(payload);
+                other.seen.fetch_add(n - 1, Ordering::SeqCst);
+            }
+            None => {
+                other.seen.fetch_add(n, Ordering::SeqCst);
+            }
+        }
+        n
+    }
+
     /// Called by a worker after its boot succeeded, before its event loop.
     pub fn worker_started(&self) {
         self.live_workers.fetch_add(1, Ordering::SeqCst);
@@ -223,6 +253,55 @@ mod tests {
         assert!(!b.all_markers_seen(), "2 of 3 branches must not finish the stage");
         b.report(marker());
         assert!(b.all_markers_seen());
+    }
+
+    /// A marker that lands during a morph's teardown window must survive onto
+    /// the replacement stage's barrier — otherwise the run never terminates.
+    #[test]
+    fn drain_into_moves_markers_to_the_replacement_barrier() {
+        let old = StageEosBarrier::new(1);
+        let new = StageEosBarrier::new(1);
+        old.report(marker());
+        assert!(old.all_markers_seen());
+
+        assert_eq!(old.drain_into(&new), 1);
+        assert!(!old.all_markers_seen(), "old barrier must be left empty");
+        assert!(new.all_markers_seen(), "new barrier must carry the marker");
+
+        new.worker_started();
+        new.begin_finishing();
+        assert_eq!(new.worker_finished(), Some(marker()));
+    }
+
+    /// Fan-in: every branch's count moves, and the merged payload survives.
+    #[test]
+    fn drain_into_preserves_fan_in_counts_and_merged_payload() {
+        let old = StageEosBarrier::new(2);
+        let new = StageEosBarrier::new(2);
+        old.report(Bytes::from_static(
+            b"{\"__epico_eos\":true,\"loadgen_sent\":100,\"expected_count\":100}",
+        ));
+        old.report(Bytes::from_static(
+            b"{\"__epico_eos\":true,\"loadgen_sent\":50,\"expected_count\":50}",
+        ));
+
+        assert_eq!(old.drain_into(&new), 2);
+        assert!(new.all_markers_seen(), "both branches must move, not just one");
+
+        new.worker_started();
+        new.begin_finishing();
+        let merged = new.worker_finished().expect("merged marker");
+        let v: serde_json::Value = serde_json::from_slice(&merged).unwrap();
+        assert_eq!(v["loadgen_sent"].as_u64(), Some(150));
+    }
+
+    /// An empty barrier moves nothing and must not fabricate a marker.
+    #[test]
+    fn drain_into_is_a_noop_when_nothing_was_seen() {
+        let old = StageEosBarrier::new(1);
+        let new = StageEosBarrier::new(1);
+        assert_eq!(old.drain_into(&new), 0);
+        assert!(!new.all_markers_seen());
     }
 
     #[test]

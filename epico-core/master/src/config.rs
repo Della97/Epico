@@ -37,6 +37,23 @@ pub(crate) struct StageSlo {
 // Pipeline stage
 // ---------------------------------------------------------------------------
 
+/// One logical stage executed inside a fused physical stage.
+///
+/// Host-level fusion (FUSION_SCISSION §2, Option A) runs several components
+/// back to back in one worker thread, from their already-cached `InstancePre`s.
+/// Each half keeps its own logical identity: its own component, its own `Store`,
+/// and its own telemetry hop. Nothing is recompiled or statically linked.
+#[derive(Debug, Deserialize, Clone)]
+pub(crate) struct FusedHalf {
+    /// The LOGICAL stage name. This is what appears in the telemetry hop label
+    /// (`name#replica`), so `per_stage_latency_ms` keeps attributing time to
+    /// each half separately — which is what makes informed scission possible.
+    pub name: String,
+    /// Component path. Falls back to `default_wasm_path(name)` when absent.
+    #[serde(default)]
+    pub wasm: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct PipelineStage {
     pub name: String,
@@ -60,6 +77,49 @@ pub(crate) struct PipelineStage {
     /// YAMLs default to "local" so the field is always present.
     #[serde(default = "default_placement")]
     pub placement: String,
+    /// PHYSICAL fusion: when non-empty, this one physical stage executes the
+    /// listed logical stages back to back in every worker. Empty (the default)
+    /// means an ordinary one-component stage — the entire pre-M2 runtime.
+    ///
+    /// A fused stage is edge contraction on the DAG: its input IS the first
+    /// half's original input edge and its output IS the last half's original
+    /// out-edges. The eliminated interior edge is drained and abandoned, not
+    /// rewired.
+    #[serde(default)]
+    pub fused_from: Vec<FusedHalf>,
+}
+
+impl PipelineStage {
+    /// The logical stages this physical stage executes, in call order, as
+    /// `(logical name, wasm path)`. Exactly one entry for an ordinary stage,
+    /// N for a fused one. The single place the rest of the runtime asks "what
+    /// does this worker actually run", so nothing else has to branch on
+    /// `fused_from`.
+    pub(crate) fn halves(&self) -> Vec<(String, String)> {
+        if self.fused_from.is_empty() {
+            let wasm = self.wasm.clone()
+                .unwrap_or_else(|| default_wasm_path(&self.name));
+            return vec![(self.name.clone(), wasm)];
+        }
+        self.fused_from.iter()
+            .map(|h| {
+                let wasm = h.wasm.clone()
+                    .unwrap_or_else(|| default_wasm_path(&h.name));
+                (h.name.clone(), wasm)
+            })
+            .collect()
+    }
+
+    pub(crate) fn is_fused(&self) -> bool {
+        self.fused_from.len() > 1
+    }
+}
+
+/// Name of the physical stage produced by fusing `a` into `b`. Deterministic so
+/// the YAML `morphs:` schedule can name the fused stage for a later `split:`
+/// without the runtime having to hand an id back.
+pub(crate) fn fused_stage_name(a: &str, b: &str) -> String {
+    format!("{a}_{b}")
 }
 
 pub(crate) fn default_placement() -> String {
@@ -229,6 +289,54 @@ pub(crate) struct Config {
     /// Env var `EPICO_SPSC_RING_CAP` overrides.
     #[serde(default = "default_spsc_ring_cap")]
     pub spsc_ring_cap: usize,
+    /// Pre-declared physical alternatives (M2 design decision D1). Each entry
+    /// is an ordered pair `[a, b]` naming an edge `a -> b` that MAY be
+    /// contracted into one fused stage at runtime.
+    ///
+    /// Declaring the pair up front is what lets the runtime widen the affected
+    /// index spaces at boot: the fused stage needs a valid consumer index on
+    /// `a`'s in-mesh and a valid producer index on `b`'s out-mesh, and those are
+    /// dimension-fixed once built. Widening is a startup sizing decision, so
+    /// fusion needs no runtime mesh swap.
+    ///
+    /// ```yaml
+    /// fusible:
+    ///   - [normalize, detect]
+    /// ```
+    #[serde(default)]
+    pub fusible: Vec<Vec<String>>,
+    /// Deterministic morph schedule. Break-even needs morphs at KNOWN instants,
+    /// repeated N >= 10 times; a controller deciding for itself actively
+    /// obstructs that measurement. The cost-model controller becomes another
+    /// producer of the same requests and changes nothing downstream.
+    ///
+    /// ```yaml
+    /// morphs:
+    ///   - { at_s: 10.0, fuse: [normalize, detect] }
+    ///   - { at_s: 25.0, split: normalize_detect }
+    ///   - { at_s: 40.0, identity: normalize }
+    /// ```
+    #[serde(default)]
+    pub morphs: Vec<MorphSpec>,
+}
+
+/// One scheduled morph from the YAML `morphs:` block. Exactly one of
+/// `fuse` / `split` / `identity` must be set.
+#[derive(Debug, Deserialize, Clone)]
+pub(crate) struct MorphSpec {
+    /// Seconds after agent start at which to issue the request.
+    pub at_s: f64,
+    /// `[a, b]` — contract the edge `a -> b` into one fused stage.
+    #[serde(default)]
+    pub fuse: Option<Vec<String>>,
+    /// Name of a fused stage to split back into its halves.
+    #[serde(default)]
+    pub split: Option<String>,
+    /// Redeploy a stage unchanged. Zero expected steady-state delta by
+    /// construction, which is exactly what isolates SWITCH MECHANISM COST from
+    /// any workload effect — the first of the three ordered DAG pairs.
+    #[serde(default)]
+    pub identity: Option<String>,
 }
 
 pub(crate) fn default_source_format() -> String {
@@ -341,6 +449,92 @@ impl Config {
             .filter(|s| self.out_degree(&s.name) == 0)
             .collect()
     }
+
+    pub(crate) fn stage(&self, name: &str) -> Option<&PipelineStage> {
+        self.pipeline.iter().find(|s| s.name == name)
+    }
+
+    /// Declared fusible pairs, as `(a, b)`. Malformed entries (not exactly two
+    /// names, or naming a stage this host doesn't run) are dropped — the caller
+    /// logs them; a bad declaration must not stop the agent booting.
+    pub(crate) fn fusible_pairs(&self) -> Vec<(String, String)> {
+        self.fusible.iter()
+            .filter(|p| p.len() == 2)
+            .filter(|p| self.stage(&p[0]).is_some() && self.stage(&p[1]).is_some())
+            .map(|p| (p[0].clone(), p[1].clone()))
+            .collect()
+    }
+
+    /// Replica-index space width the physical stage occupying `stage`'s INPUT
+    /// edge may need.
+    ///
+    /// Ordinarily that is just the stage's own `max_replicas`. But if `stage` is
+    /// the `a` half of a declared fusible pair, the fused stage consumes on
+    /// exactly this edge with up to `max_a + max_b` replicas — so the mesh is
+    /// built that wide at boot and a fused replica `r` is a valid consumer
+    /// index by construction, with no resize, ever.
+    pub(crate) fn max_consumers(&self, stage: &str) -> usize {
+        let own = self.stage(stage).map(|s| s.slo.max_replicas).unwrap_or(0);
+        self.fusible_pairs().iter()
+            .filter(|(a, _)| a == stage)
+            .filter_map(|(a, b)| self.fused_max_replicas(a, b))
+            .fold(own, usize::max)
+    }
+
+    /// Producer-index space width `stage` may need on each of its OUT-edges.
+    /// Mirror of [`Config::max_consumers`]: if `stage` is the `b` half of a
+    /// fusible pair, the fused stage produces on this edge.
+    pub(crate) fn max_producers(&self, stage: &str) -> usize {
+        let own = self.stage(stage).map(|s| s.slo.max_replicas).unwrap_or(0);
+        self.fusible_pairs().iter()
+            .filter(|(_, b)| b == stage)
+            .filter_map(|(a, b)| self.fused_max_replicas(a, b))
+            .fold(own, usize::max)
+    }
+
+    /// `max_ab = max_a + max_b`. Replica counts encode service times (Little:
+    /// Ra ≈ λ·tA), and a fused worker holds its thread for tA + tB per event,
+    /// so the fused ceiling is the SUM, not the max.
+    pub(crate) fn fused_max_replicas(&self, a: &str, b: &str) -> Option<usize> {
+        Some(self.stage(a)?.slo.max_replicas + self.stage(b)?.slo.max_replicas)
+    }
+
+    /// Why the edge `a -> b` may not be contracted, or `None` if it may.
+    ///
+    /// Fusion is edge contraction on the DAG, so it is only legal on a linear
+    /// chain segment: fusing across a fan-out or a fan-in would change
+    /// semantics (broadcast copies, merge ordering). Co-location is required
+    /// because host-level fusion is intra-process by definition.
+    pub(crate) fn fusion_illegal_reason(&self, a: &str, b: &str) -> Option<String> {
+        let (Some(sa), Some(sb)) = (self.stage(a), self.stage(b)) else {
+            return Some(format!("stage {a:?} or {b:?} is not on this host"));
+        };
+        if !self.edges.iter().any(|e| e.from == a && e.to == b) {
+            return Some(format!("no edge {a} -> {b} in the topology"));
+        }
+        if self.out_degree(a) != 1 {
+            return Some(format!("out-degree({a}) = {} != 1 (fan-out)", self.out_degree(a)));
+        }
+        if self.in_degree(b) != 1 {
+            return Some(format!("in-degree({b}) = {} != 1 (fan-in)", self.in_degree(b)));
+        }
+        if sa.placement != sb.placement {
+            return Some(format!(
+                "{a} is placed on {:?} but {b} on {:?}; fusion is intra-process",
+                sa.placement, sb.placement
+            ));
+        }
+        if sa.is_fused() || sb.is_fused() {
+            return Some(format!("{a} or {b} is already a fused stage"));
+        }
+        if !self.fusible_pairs().iter().any(|(x, y)| x == a && y == b) {
+            return Some(format!(
+                "[{a}, {b}] is not declared under `fusible:`; index spaces were \
+                 not widened for it at boot"
+            ));
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -361,6 +555,7 @@ mod topology_tests {
                 cooldown_up_s: None, cooldown_down_s: None, calm_window: None,
             },
             placement: "local".to_string(),
+            fused_from: Vec::new(),
         }
     }
 
@@ -432,6 +627,66 @@ mod topology_tests {
         assert_eq!(preds, vec!["l", "r"]);
         assert_eq!(c.sinks().len(), 1);
         assert_eq!(c.sinks()[0].name, "merge");
+    }
+
+    fn scaled(name: &str, max: usize) -> PipelineStage {
+        let mut s = stage(name, None);
+        s.slo.max_replicas = max;
+        s
+    }
+
+    /// Fusion is edge contraction, so it is legal only on a linear chain
+    /// segment. Fan-out at `a` or fan-in at `b` would change semantics
+    /// (broadcast copies / merge ordering) and must be refused by NAME, not
+    /// discovered during a benchmark run.
+    #[test]
+    fn fusion_legality_refuses_fan_out_fan_in_and_undeclared_pairs() {
+        let mut c = cfg(
+            vec![
+                scaled("src", 1), scaled("l", 2), scaled("r", 2), scaled("merge", 3),
+            ],
+            vec![("src", "l"), ("src", "r"), ("l", "merge"), ("r", "merge")],
+        );
+        c.normalize_topology();
+        c.fusible = vec![
+            vec!["src".into(), "l".into()],
+            vec!["l".into(), "merge".into()],
+        ];
+
+        // src fans out (out-degree 2).
+        assert!(c.fusion_illegal_reason("src", "l").unwrap().contains("fan-out"));
+        // merge fans in (in-degree 2).
+        assert!(c.fusion_illegal_reason("l", "merge").unwrap().contains("fan-in"));
+        // No such edge at all.
+        assert!(c.fusion_illegal_reason("l", "r").unwrap().contains("no edge"));
+    }
+
+    /// A legal, declared pair passes; the same pair undeclared is refused,
+    /// because its index spaces were never widened at boot.
+    #[test]
+    fn fusion_requires_a_declared_pair_and_widens_its_index_spaces() {
+        let mut c = cfg(
+            vec![scaled("a", 4), scaled("b", 2), scaled("c", 1)],
+            vec![("a", "b"), ("b", "c")],
+        );
+        c.normalize_topology();
+
+        assert!(c.fusion_illegal_reason("a", "b").unwrap().contains("not declared"));
+        // Undeclared: every index space stays at its own stage's ceiling.
+        assert_eq!(c.max_consumers("a"), 4);
+        assert_eq!(c.max_producers("b"), 2);
+
+        c.fusible = vec![vec!["a".into(), "b".into()]];
+        assert_eq!(c.fusion_illegal_reason("a", "b"), None);
+        // max_ab = 4 + 2: a fused worker holds its thread for tA + tB, so the
+        // ceiling is the SUM. `a`'s in-mesh must accept 6 consumers and `b`'s
+        // out-edge 6 producers, or a fused replica would have no valid index.
+        assert_eq!(c.fused_max_replicas("a", "b"), Some(6));
+        assert_eq!(c.max_consumers("a"), 6);
+        assert_eq!(c.max_producers("b"), 6);
+        // Untouched stages keep their own width — widening is not global.
+        assert_eq!(c.max_consumers("b"), 2);
+        assert_eq!(c.max_producers("a"), 4);
     }
 
     /// Normalization must not clobber explicit values on a second call.

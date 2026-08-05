@@ -153,6 +153,28 @@ pub fn write_header(
     hops: &[(String, f64, f64)],
     new_hop: Option<Hop<'_>>,
 ) {
+    match new_hop {
+        Some(h) => write_header_hops(out, ts_wall, ts, seq, key_hash, hops, &[h]),
+        None    => write_header_hops(out, ts_wall, ts, seq, key_hash, hops, &[]),
+    }
+}
+
+/// Multi-hop form of [`write_header`]: appends `new_hops` (zero or more) after
+/// the hops the event already carries.
+///
+/// A fused worker runs several logical stages back to back inside one host call
+/// chain and appends one hop per half, so the contracted edge's `inter_stage`
+/// gap collapses to ~0 while each half stays individually attributable
+/// (see TODOs/M2 — host-level fusion).
+pub fn write_header_hops(
+    out: &mut Vec<u8>,
+    ts_wall: Option<f64>,
+    ts: Option<f64>,
+    seq: Option<u64>,
+    key_hash: Option<u64>,
+    hops: &[(String, f64, f64)],
+    new_hops: &[Hop<'_>],
+) {
     out.push(BIN_MAGIC);
     out.push(if key_hash.is_some() { BIN_VERSION_KEYED } else { BIN_VERSION });
     out.push(0); // flags
@@ -183,7 +205,7 @@ pub fn write_header(
         out.extend_from_slice(&v.to_le_bytes());
     }
 
-    let n_hops = hops.len() + usize::from(new_hop.is_some());
+    let n_hops = hops.len() + new_hops.len();
     out.extend_from_slice(&(n_hops.min(u16::MAX as usize) as u16).to_le_bytes());
     let write_hop = |out: &mut Vec<u8>, name: &str, enter: f64, exit: f64| {
         let nb = name.as_bytes();
@@ -196,8 +218,8 @@ pub fn write_header(
     for (n, e, x) in hops {
         write_hop(out, n, *e, *x);
     }
-    if let Some((n, e, x)) = new_hop {
-        write_hop(out, n, e, x);
+    for (n, e, x) in new_hops {
+        write_hop(out, n, *e, *x);
     }
 }
 

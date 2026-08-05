@@ -21,10 +21,94 @@ use epico_logger::{debug, error, info, warn};
 
 use crate::config::PipelineStage;
 use crate::eos::StageEosBarrier;
-use crate::conversion::{extract_record_fields, extract_result_event_fields};
+use crate::conversion::{extract_record_fields, extract_result_event_fields, RecordField};
 use crate::envelope::{EnvelopeFormat, EventEnvelope};
 use crate::host::HostState;
 use crate::spsc::{EdgeIn, EdgeOut};
+
+/// One logical stage's live instance inside a worker: its own `Store`, its own
+/// resolved `process-event`, its own cached field layout.
+///
+/// An ordinary worker holds exactly one of these. A FUSED worker holds several
+/// and calls them back to back in the same thread with the intermediate value
+/// never leaving the host — that is the whole mechanism behind stage fusion
+/// (FUSION_SCISSION §2, Option A). Keeping one `Store` per half preserves the
+/// sandbox boundary between halves exactly as it was before fusion, and lets
+/// each half re-arm its own epoch budget so isolation semantics stay faithful
+/// to the unfused pipeline.
+struct StageInstance {
+    store:        Store<HostState>,
+    process_fn:   Func,
+    param_types:  Vec<Type>,
+    result_types: Vec<Type>,
+    in_fields:    Vec<RecordField>,
+    out_fields:   Vec<RecordField>,
+    /// Telemetry label `logical_stage#replica`. The collector strips `#r` for
+    /// per-stage aggregation, so a fused worker's halves keep showing up under
+    /// their ORIGINAL logical names — the morph is visible in the data without
+    /// any collector or summary change.
+    hop_label:    String,
+    /// Reused across events so the hot loop allocates nothing for results.
+    results:      Vec<Val>,
+    typed:        Option<Box<dyn crate::typed::PreparedDispatch>>,
+}
+
+/// One half's post-call output: the lifted values plus its hop timestamps.
+struct HalfOutput {
+    event_val:  Val,
+    bench_val:  Val,
+    enter:      f64,
+    exit:       f64,
+    latency_us: u64,
+}
+
+impl StageInstance {
+    /// Invoke this half and lift its results into owned host-side values.
+    ///
+    /// Ordering is strictly `call → clone results → post_return`. The clone is
+    /// what makes chaining sound: component-model `Val`s are lifted into owned
+    /// Rust data, so the returned event does not borrow guest memory and stays
+    /// valid as the NEXT half's parameter after this half's `post_return`.
+    ///
+    /// `post_return` is only legal after a SUCCESSFUL call, so the error path
+    /// returns before it (calling it after a failed call panics inside
+    /// wasmtime).
+    fn call(&mut self, ev: Val, bench: Val) -> anyhow::Result<HalfOutput> {
+        // `Func::call` requires the result slice length to equal the function's
+        // declared result count; earlier iterations may have grown it.
+        self.results.truncate(self.result_types.len());
+        // Fresh CPU budget per half: a runaway guest traps instead of pinning
+        // this worker thread, and a fused chain of two halves gets two budgets
+        // rather than one shared one.
+        self.store.set_epoch_deadline(crate::host::MAX_CALL_EPOCH_TICKS);
+
+        let enter = now_secs_f64();
+        let t0    = Instant::now();
+        self.process_fn.call(&mut self.store, &[ev, bench], &mut self.results)?;
+        let exit       = now_secs_f64();
+        let latency_us = t0.elapsed().as_micros() as u64;
+
+        // The WIT signature is `process-event(...) -> tuple<event, bench-ctx>`,
+        // which wasmtime exposes as ONE result of `Type::Tuple`. Fall back to
+        // results[0] verbatim if a future WIT returns the event directly.
+        let (event_val, bench_val) = match (self.results.first(), self.result_types.first()) {
+            (Some(Val::Tuple(elems)), Some(Type::Tuple(_))) if elems.len() >= 2 => {
+                (elems[0].clone(), elems[1].clone())
+            }
+            (Some(v), _) => (v.clone(), Val::Bool(false)),
+            (None, _)    => (Val::Bool(false), Val::Bool(false)),
+        };
+
+        let _ = self.process_fn.post_return(&mut self.store);
+        Ok(HalfOutput { event_val, bench_val, enter, exit, latency_us })
+    }
+
+    /// Output field layout for encoding. Some stages declare no distinct output
+    /// record, in which case the input layout is the right one.
+    fn encode_fields(&self) -> &[RecordField] {
+        if self.out_fields.is_empty() { &self.in_fields } else { &self.out_fields }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Worker handle
@@ -45,6 +129,10 @@ pub(crate) struct WorkerHandle {
 // Spawn
 // ---------------------------------------------------------------------------
 
+/// The components a worker instantiates, in call order: `(logical stage name,
+/// cached InstancePre)`. One entry for an ordinary stage; N for a fused one.
+pub(crate) type WorkerChain = Vec<(String, Arc<InstancePre<HostState>>)>;
+
 pub(crate) fn spawn_worker(
     stage:          &PipelineStage,
     replica_idx:    usize,
@@ -53,19 +141,20 @@ pub(crate) fn spawn_worker(
     input_edge:     Option<EdgeIn>,
     credit_window:  u32,
     engine:         &Engine,
-    instance_pre:   &Arc<InstancePre<HostState>>,
+    chain:          &WorkerChain,
     heartbeat:      &Arc<AtomicU64>,
     avg_latency_us: &Arc<AtomicU64>,
     decision_ts:    f64,
     worker_ctx:     zmq::Context,
     event_format:   String,
     barrier:        Arc<StageEosBarrier>,
+    stage_stop:     Arc<AtomicBool>,
     log:            Logger,
 ) -> WorkerHandle {
     let stage_clone       = stage.clone();
     let in_ep             = in_endpoint.to_string();
     let engine_clone      = engine.clone();
-    let instance_pre_clone = instance_pre.clone();
+    let chain_clone       = chain.clone();
     let heartbeat_clone   = heartbeat.clone();
     let avg_lat_clone     = avg_latency_us.clone();
     let drain_flag        = Arc::new(AtomicBool::new(false));
@@ -76,9 +165,9 @@ pub(crate) fn spawn_worker(
     let handle = std::thread::spawn(move || {
         run_wasm_worker(
             stage_clone, replica_idx, in_ep, output_specs, input_edge, credit_window,
-            engine_clone, instance_pre_clone,
+            engine_clone, chain_clone,
             heartbeat_clone, avg_lat_clone,
-            drain_clone, decision_ts, worker_ctx, event_format, barrier, log,
+            drain_clone, stage_stop, decision_ts, worker_ctx, event_format, barrier, log,
         );
         done_clone.store(true, Ordering::Relaxed);
     });
@@ -123,7 +212,7 @@ impl WorkerInput {
     /// blocking pop on the queue path. Identical receive semantics to the old
     /// inline loop: drain is checked first, then buffered batch events, then
     /// the socket; an `EAGAIN` recv timeout retries, a hard error exits.
-    fn next_event(&mut self, drain: &AtomicBool) -> Option<Bytes> {
+    fn next_event(&mut self, drain: &AtomicBool, stop: &AtomicBool) -> Option<Bytes> {
         match self {
             WorkerInput::Zmq { dealer, pending } => loop {
                 if drain.load(Ordering::Relaxed) {
@@ -177,7 +266,10 @@ impl WorkerInput {
                     Err(_)                  => return None,
                 }
             },
-            WorkerInput::Queue(edge) => edge.pop(drain),
+            // The zmq arm needs no `stop` case: a draining worker sends no more
+            // credit refills, so the dispatcher stops feeding it and the
+            // DONTWAIT recv above returns EAGAIN within one window.
+            WorkerInput::Queue(edge) => edge.pop(drain, stop),
         }
     }
 
@@ -250,10 +342,14 @@ fn run_wasm_worker(
     input_edge:     Option<EdgeIn>,
     credit_window:  u32,
     engine:         Engine,
-    instance_pre:   Arc<InstancePre<HostState>>,
+    chain_pres:     WorkerChain,
     heartbeat:      Arc<AtomicU64>,
     avg_latency_us: Arc<AtomicU64>,
     drain_flag:     Arc<AtomicBool>,
+    // The stage-level hard-retirement flag, shared with every sibling replica
+    // and with the autoscaler. See `EdgeIn::pop` for why it differs from
+    // `drain_flag` on the shared MPMC ring.
+    stage_stop:     Arc<AtomicBool>,
     decision_ts:    f64,
     worker_ctx:     zmq::Context,
     event_format:   String,
@@ -261,11 +357,11 @@ fn run_wasm_worker(
     log:            Logger,
 ) {
     let spawn_ts   = decision_ts;
-    // Telemetry hop label: `stage#replica`. The collector strips the `#r`
-    // suffix for per-stage aggregation (so existing per_stage_* metrics and
-    // analyze scripts are unchanged) and additionally aggregates by the full
-    // label for the new per_replica summary block.
+    // Physical-stage label, for logs and refill payloads. Per-EVENT telemetry
+    // labels are per-half and live on each `StageInstance` — a fused worker
+    // emits one hop per logical stage, under the logical stage's own name.
     let hop_label = format!("{}#{}", stage.name, replica_idx);
+    let fused     = chain_pres.len() > 1;
 
     // Output sends must never abort: an event that reaches the output side has
     // already been consumed from the input, so dropping it because OUR drain
@@ -362,82 +458,6 @@ fn run_wasm_worker(
     }
     let t_dealer_connect_ms = start_time.elapsed().as_secs_f64() * 1000.0;
 
-    // ── Component instantiation ───────────────────────────────────────────────
-    let host_state = HostState {
-        table: ResourceTable::new(),
-        wasi:  WasiCtxBuilder::new().build(),
-        http:  WasiHttpCtx::new(),
-        limits: crate::host::default_store_limits(),
-    };
-    let mut store = Store::new(&engine, host_state);
-    // Bound this instance's resource growth and make it interruptible: a guest
-    // that exceeds its memory ceiling gets a graceful error, and one that runs
-    // past its per-call epoch deadline (armed before each call below) traps
-    // instead of pinning this worker thread.
-    store.limiter(|s| &mut s.limits);
-    store.epoch_deadline_trap();
-
-    let t_before_instantiate_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-    let instance = match instance_pre.instantiate(&mut store) {
-        Ok(i)  => i,
-        Err(e) => {
-            error!(log, "component instantiation failed", err = e);
-            return;
-        }
-    };
-    let t_instantiate_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-
-    // ── Locate process-event ──────────────────────────────────────────────────
-    let component_ref = instance_pre.component();
-    let mut func_ty_opt = None;
-    let mut process_fn_opt: Option<Func> = None;
-
-    for iface_name in &[
-        "epico:pipeline/process@0.1.0",
-        "epico:pipeline/process",
-    ] {
-        if let Some((_iface_item, iface_idx)) = component_ref.export_index(None, iface_name) {
-            if let Some((ComponentItem::ComponentFunc(ft), fn_idx)) =
-                component_ref.export_index(Some(&iface_idx), "process-event")
-            {
-                process_fn_opt = instance.get_func(&mut store, &fn_idx);
-                func_ty_opt    = Some(ft);
-                break;
-            }
-        }
-    }
-
-    let process_fn = match process_fn_opt {
-        Some(f) => f,
-        None    => {
-            error!(log, "no process-event export found", stage = stage.name);
-            return;
-        }
-    };
-    let func_ty = match func_ty_opt {
-        Some(t) => t,
-        None    => {
-            error!(log, "could not introspect process-event type", stage = stage.name);
-            return;
-        }
-    };
-
-    let param_types:  Vec<Type> = func_ty.params().collect();
-    let result_types: Vec<Type> = func_ty.results().collect();
-
-    if param_types.len() < 2 {
-        error!(log, "process-event has wrong param count",
-              stage = stage.name,
-              expected = "2",
-              got = param_types.len());
-        return;
-    }
-
-    let in_fields  = extract_record_fields(&param_types[0]);
-    let out_fields = result_types
-        .first()
-        .map(extract_result_event_fields)
-        .unwrap_or_default();
     let envelope_format = match EnvelopeFormat::parse(&event_format) {
         Ok(f) => f,
         Err(e) => {
@@ -459,42 +479,152 @@ fn run_wasm_worker(
         info!(log, "binary edges active: stage output uses binary envelope");
     }
 
-    // Typed fast path: if the generated agent registered concrete types for
-    // this stage (and EPICO_DYNAMIC_DISPATCH != 1), type the resolved Func
-    // once and skip the per-event Val layer entirely. Falls back to the
-    // dynamic path on any prepare failure.
-    let mut typed_dispatch: Option<Box<dyn crate::typed::PreparedDispatch>> =
-        match crate::typed::lookup(&stage.name) {
-            Some(d) => match d.prepare(&mut store, process_fn) {
-                Ok(p) => {
-                    info!(log, "TYPED DISPATCH ACTIVE — Val layer bypassed", stage = stage.name);
-                    Some(p)
+    // ── Component instantiation (one per fused half) ──────────────────────────
+    // Nothing is compiled here: every half comes from an already-cached
+    // `InstancePre`, so a fused replica's cold start is exactly N instantiates —
+    // the same cost as spawning one replica of each half today.
+    let t_before_instantiate_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+    let mut instantiate_acc_ms  = 0.0_f64;
+    let mut chain: Vec<StageInstance> = Vec::with_capacity(chain_pres.len());
+
+    for (logical_name, instance_pre) in chain_pres.iter() {
+        let host_state = HostState {
+            table: ResourceTable::new(),
+            wasi:  WasiCtxBuilder::new().build(),
+            http:  WasiHttpCtx::new(),
+            limits: crate::host::default_store_limits(),
+        };
+        let mut store = Store::new(&engine, host_state);
+        // Bound this instance's resource growth and make it interruptible: a
+        // guest that exceeds its memory ceiling gets a graceful error, and one
+        // that runs past its per-call epoch deadline (armed before each call)
+        // traps instead of pinning this worker thread. Per-half, so fusing two
+        // stages does not weaken either one's sandbox.
+        store.limiter(|s| &mut s.limits);
+        store.epoch_deadline_trap();
+
+        let t_inst0 = start_time.elapsed().as_secs_f64() * 1000.0;
+        let instance = match instance_pre.instantiate(&mut store) {
+            Ok(i)  => i,
+            Err(e) => {
+                error!(log, "component instantiation failed",
+                       stage = logical_name, err = e);
+                return;
+            }
+        };
+        instantiate_acc_ms += start_time.elapsed().as_secs_f64() * 1000.0 - t_inst0;
+
+        // ── Locate process-event ──────────────────────────────────────────────
+        let component_ref = instance_pre.component();
+        let mut func_ty_opt = None;
+        let mut process_fn_opt: Option<Func> = None;
+
+        for iface_name in &[
+            "epico:pipeline/process@0.1.0",
+            "epico:pipeline/process",
+        ] {
+            if let Some((_iface_item, iface_idx)) = component_ref.export_index(None, iface_name) {
+                if let Some((ComponentItem::ComponentFunc(ft), fn_idx)) =
+                    component_ref.export_index(Some(&iface_idx), "process-event")
+                {
+                    process_fn_opt = instance.get_func(&mut store, &fn_idx);
+                    func_ty_opt    = Some(ft);
+                    break;
                 }
-                Err(e) => {
-                    warn!(log, "typed dispatch prepare failed; using dynamic path",
-                          stage = stage.name,
-                          err = e);
-                    None
-                }
-            },
-            None => None,
+            }
+        }
+
+        let process_fn = match process_fn_opt {
+            Some(f) => f,
+            None    => {
+                error!(log, "no process-event export found", stage = logical_name);
+                return;
+            }
+        };
+        let func_ty = match func_ty_opt {
+            Some(t) => t,
+            None    => {
+                error!(log, "could not introspect process-event type", stage = logical_name);
+                return;
+            }
         };
 
-    let t_export_lookup_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+        let param_types:  Vec<Type> = func_ty.params().collect();
+        let result_types: Vec<Type> = func_ty.results().collect();
 
-    // DEBUG: report the actual variant of result_types[0]. We expect a
-    // Type::Record (the event), but the WIT signature returns
-    // tuple<event, bench-ctx>, so what wasmtime gives us here might be
-    // a Tuple — in which case extract_record_fields returns []
-    // because it only handles Record.
-    let _result0_kind = match &result_types[0] {
-        Type::Record(_)  => "Record",
-        Type::Tuple(_)   => "Tuple",
-        Type::List(_)    => "List",
-        Type::String     => "String",
-        Type::Bool       => "Bool",
-        _                => "Other",
-    };
+        if param_types.len() < 2 {
+            error!(log, "process-event has wrong param count",
+                  stage = logical_name,
+                  expected = "2",
+                  got = param_types.len());
+            return;
+        }
+
+        let in_fields  = extract_record_fields(&param_types[0]);
+        let out_fields = result_types
+            .first()
+            .map(extract_result_event_fields)
+            .unwrap_or_default();
+
+        // Typed fast path: if the generated agent registered concrete types for
+        // this stage (and EPICO_DYNAMIC_DISPATCH != 1), type the resolved Func
+        // once and skip the per-event Val layer entirely. Falls back to the
+        // dynamic path on any prepare failure.
+        //
+        // A FUSED chain always runs dynamic: `PreparedDispatch::call` goes
+        // envelope→bytes in one shot and so cannot be chained without a new
+        // trait method. Comparing a typed unfused baseline against a dynamic
+        // fused arm would measure typed-vs-dynamic rather than unfused-vs-fused,
+        // so BOTH arms must be run with `EPICO_DYNAMIC_DISPATCH=1` for the M2
+        // numbers. Chained typed dispatch is real work, deferred until
+        // break-even is known.
+        let typed: Option<Box<dyn crate::typed::PreparedDispatch>> = if fused {
+            None
+        } else {
+            match crate::typed::lookup(logical_name) {
+                Some(d) => match d.prepare(&mut store, process_fn) {
+                    Ok(p) => {
+                        info!(log, "TYPED DISPATCH ACTIVE — Val layer bypassed",
+                              stage = logical_name);
+                        Some(p)
+                    }
+                    Err(e) => {
+                        warn!(log, "typed dispatch prepare failed; using dynamic path",
+                              stage = logical_name, err = e);
+                        None
+                    }
+                },
+                None => None,
+            }
+        };
+
+        let results = vec![Val::Bool(false); result_types.len()];
+        chain.push(StageInstance {
+            store,
+            process_fn,
+            param_types,
+            result_types,
+            in_fields,
+            out_fields,
+            hop_label: format!("{}#{}", logical_name, replica_idx),
+            results,
+            typed,
+        });
+    }
+
+    if chain.is_empty() {
+        error!(log, "worker has no components to run", stage = stage.name);
+        return;
+    }
+    if fused {
+        info!(log, "FUSED WORKER — halves run back to back, edge deleted",
+              stage = stage.name,
+              halves = chain.iter().map(|c| c.hop_label.clone())
+                            .collect::<Vec<_>>().join(" -> "));
+    }
+
+    let t_instantiate_ms   = t_before_instantiate_ms + instantiate_acc_ms;
+    let t_export_lookup_ms = start_time.elapsed().as_secs_f64() * 1000.0;
 
     let boot_ms     = start_time.elapsed().as_secs_f64() * 1000.0;
     let now_ts      = now_secs_f64();
@@ -573,8 +703,9 @@ fn run_wasm_worker(
     // with no extra round-trips.
     let refill_threshold: u32 = (credit_window / 2).max(1);
     let mut processed_since_refill: u32 = 0;
-    // Reused across iterations — previously allocated per event.
-    let mut results = vec![Val::Bool(false); result_types.len()];
+    // Per-half `(enter_ts, exit_ts)` for the event in flight, index-aligned with
+    // `chain`. Hoisted so the hot loop allocates nothing.
+    let mut hop_times: Vec<(f64, f64)> = Vec::with_capacity(chain.len());
     // The boot-phase refill fields (cold_start_ms, ph_*) never change after
     // worker boot; send them once and use a compact payload afterwards. The
     // autoscaler parses refills with `.get` + defaults, so absent keys are
@@ -594,7 +725,7 @@ fn run_wasm_worker(
     // per-event body below is unchanged. With batch_events=1 each message holds
     // a single event and `pending` stays empty (legacy behaviour).
     loop {
-        let event_owned = match worker_input.next_event(&drain_flag) {
+        let event_owned = match worker_input.next_event(&drain_flag, &stage_stop) {
             Some(ev) => ev,
             None     => break,
         };
@@ -716,9 +847,13 @@ fn run_wasm_worker(
         }
 
         // ── Typed fast path ───────────────────────────────────────────────
-        if let Some(tp) = typed_dispatch.as_mut() {
+        // Never taken by a fused chain (see the `prepare` site above).
+        if let Some((tp, st_store, st_hop)) = chain.first_mut().and_then(|c| {
+            let StageInstance { typed, store, hop_label, .. } = c;
+            typed.as_mut().map(|t| (t, store, &*hop_label))
+        }) {
             let mut enter_exit = (0.0_f64, 0.0_f64);
-            match tp.call(&mut store, &envelope, &hop_label, out_format, &mut enter_exit) {
+            match tp.call(st_store, &envelope, st_hop, out_format, &mut enter_exit) {
                 Ok(out_bytes) => {
                     let (enter_ts, exit_ts) = enter_exit;
                     let latency_us = ((exit_ts - enter_ts) * 1e6).max(0.0) as u64;
@@ -750,7 +885,19 @@ fn run_wasm_worker(
             continue;
         }
 
-        let ev_val = match envelope.input_val(&in_fields, &param_types[0]) {
+        // ── Dynamic path — and the ONLY path for a fused chain ─────────────
+        //
+        //   recv → decode ONCE → A.call → post_return(A)
+        //                      → B.call → post_return(B)
+        //        → encode ONCE, appending one hop per half → send
+        //
+        // The intermediate value never leaves the host: `A`'s result `Val` is
+        // handed straight to `B` as its parameter. Per-edge WIT compatibility
+        // (`A.out == B.in`) is validated at CLI parse time, so the structure is
+        // acceptable by construction. Nothing is serialized, no queue is
+        // touched, no thread is handed off — which is exactly the cost fusion
+        // deletes.
+        let ev_val = match envelope.input_val(&chain[0].in_fields, &chain[0].param_types[0]) {
             Ok(v) => v,
             Err(e) => {
                 error!(log, "event decode failed", err = e);
@@ -758,7 +905,7 @@ fn run_wasm_worker(
                 continue;
             }
         };
-        let bench_val = match envelope.bench_val(&param_types[1]) {
+        let bench_val = match envelope.bench_val(&chain[0].param_types[1]) {
             Ok(v) => v,
             Err(e) => {
                 error!(log, "bench decode failed", err = e);
@@ -767,91 +914,66 @@ fn run_wasm_worker(
             }
         };
 
-        let enter_ts = now_secs_f64();
-        let t0       = Instant::now();
-
-        // `results` is hoisted out of the loop and reused. The tuple-drilling
-        // below stashes the bench Val into results[1], growing the vec to 2;
-        // Func::call requires the slice length to equal the function's result
-        // count (1), so restore it before every call.
-        results.truncate(result_types.len());
-        // Give this invocation a fresh CPU budget. If the guest runs past it the
-        // call returns a trap (handled below) rather than hanging the worker.
-        store.set_epoch_deadline(crate::host::MAX_CALL_EPOCH_TICKS);
-        let call_result = process_fn.call(&mut store, &[ev_val, bench_val], &mut results);
-
-        if let Err(e) = call_result {
-            error!(log, "process-event call error", err = e);
-            worker_input.send_control(b"");
-            // NOTE: no post_return here — it is only legal after a SUCCESSFUL
-            // call; invoking it after a failed one panics inside wasmtime
-            // ("post_return can only be called after a function has
-            // previously been called").
-            continue;
+        hop_times.clear();
+        let mut latency_us: u64 = 0;
+        // The value travelling down the chain. `None` after a failed half —
+        // which is also how the loop signals that this event must be dropped.
+        let mut carry: Option<(Val, Val)> = Some((ev_val, bench_val));
+        for half in chain.iter_mut() {
+            let Some((ev, bench)) = carry.take() else { break };
+            match half.call(ev, bench) {
+                Ok(out) => {
+                    hop_times.push((out.enter, out.exit));
+                    latency_us += out.latency_us;
+                    carry = Some((out.event_val, out.bench_val));
+                }
+                Err(e) => {
+                    error!(log, "process-event call error",
+                           stage = half.hop_label.as_str(), err = e);
+                    break;
+                }
+            }
         }
+        let Some((ev_val, bench_val)) = carry else {
+            worker_input.send_control(b"");
+            continue;
+        };
 
-        let exit_ts    = now_secs_f64();
-        let latency_us = t0.elapsed().as_micros() as u64;
-        let prev_us    = avg_latency_us.load(Ordering::Relaxed);
+        let prev_us = avg_latency_us.load(Ordering::Relaxed);
         avg_latency_us.store((prev_us * 3 + latency_us) / 4, Ordering::Relaxed);
 
-        // Serialization timing starts BEFORE encode_output. (Previously the
-        // stopwatch started after final_bytes was already computed, so the
-        // reported serde_us was parse-only and the serialize cost was
-        // silently attributed to "other host" overhead.)
+        // Serialization timing starts BEFORE the encode, so the reported
+        // serde_us covers parse AND serialize rather than parse alone.
         let serialize_t0 = Instant::now();
-        let final_bytes = if !results.is_empty() {
-            // The WIT signature is `process-event(...) -> tuple<event, bench-ctx>`.
-            // wasmtime exposes that as a single result of Type::Tuple,
-            // not as two separate results. Drill into the tuple:
-            // - results[0] is Val::Tuple([event_val, bench_val])
-            // - We want event_val for downstream serialization, and
-            //   bench_val for the bench_json call below.
-            //
-            // Fall back to results[0] verbatim if we don't see a Tuple,
-            // for compatibility with any future WIT that returns the
-            // event directly.
-            let (event_val, bench_val_from_tuple) = match (&results[0], &result_types[0]) {
-                (Val::Tuple(elems), Type::Tuple(_)) if elems.len() >= 2 => {
-                    (elems[0].clone(), Some(elems[1].clone()))
-                }
-                _ => (results[0].clone(), None),
-            };
-            // Stash bench_val into results[1] slot for the bench_json
-            // call below, which expects results.get(1).
-            if let Some(bv) = bench_val_from_tuple {
-                if results.len() < 2 {
-                    results.push(bv);
-                } else {
-                    results[1] = bv;
-                }
-            }
-            let bench_result = results.get(1).unwrap_or(&Val::Bool(false));
-            let fields = if out_fields.is_empty() { &in_fields } else { &out_fields };
-            match envelope.encode_output(
-                &event_val,
-                fields,
-                bench_result,
-                &hop_label,
-                enter_ts,
-                exit_ts,
-                out_format,
-            ) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    error!(log, "event encode failed", err = e);
-                    worker_input.send_control(b"");
-                    let _ = process_fn.post_return(&mut store);
-                    continue;
-                }
-            }
+        // The LAST half's output layout is what leaves this physical stage.
+        let last = chain.last().expect("chain is non-empty");
+        let encoded = if chain.len() == 1 {
+            let (enter_ts, exit_ts) = hop_times[0];
+            envelope.encode_output(
+                &ev_val, last.encode_fields(), &bench_val,
+                &last.hop_label, enter_ts, exit_ts, out_format,
+            )
         } else {
-            Bytes::new()
+            // One hop per half, adjacent in time: the contracted edge's
+            // `inter_stage` gap collapses to ~0 in the existing summary while
+            // `per_stage_latency_ms` still attributes time to each half.
+            let hops: Vec<(&str, f64, f64)> = chain.iter().zip(hop_times.iter())
+                .map(|(h, (e, x))| (h.hop_label.as_str(), *e, *x))
+                .collect();
+            envelope.encode_output_hops(
+                &ev_val, last.encode_fields(), &bench_val, &hops, out_format,
+            )
+        };
+        let final_bytes = match encoded {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!(log, "event encode failed", err = e);
+                worker_input.send_control(b"");
+                continue;
+            }
         };
 
         serde_ns += serialize_t0.elapsed().as_nanos() as u64;
-
-        let _ = process_fn.post_return(&mut store);
 
         if !final_bytes.is_empty() {
             send_all(&worker_outputs, final_bytes, &never_drain);

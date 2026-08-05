@@ -1,0 +1,132 @@
+# .morph_bench.yaml — the break-even measurement config (roadmap M2, phase 4).
+#
+# Distinct from .morph_test.yaml, and the differences are the whole point:
+#
+#   .morph_test.yaml   pulse source, idle gaps, min_replicas 0.
+#                      Proves CONSERVATION across the switch. Bursty on purpose:
+#                      the morph has to cope with a stage set that is also
+#                      scaling.
+#
+#   .morph_bench.yaml  tp source, sustained, fixed replica counts.
+#                      Measures SWITCH COST S and break-even. Bursty load would
+#                      make the numbers a lottery on whether a morph happened to
+#                      land inside a burst.
+#
+# Three properties this config needs that the conservation config deliberately
+# lacks:
+#
+#   1. SUSTAINED load. S is read as the hole a switch punches in the arrival
+#      stream; over an idle pipeline there is no stream and no hole. `tp`
+#      without `blast` uses blocking sends, so the count stays exact AND the
+#      source never stops pushing.
+#
+#   2. The PIPELINE, not the source, must be the bottleneck. With
+#      min == max == 2 the stage set cannot scale out from under the
+#      measurement, so the throughput ceiling is set by per-event service time —
+#      which is what fusion changes. If the source were the limit, fusing would
+#      show no throughput gain no matter how much edge cost it deleted, and
+#      break-even would read "never" for the wrong reason.
+#
+#   3. FIXED replica counts across the switch. An autoscaler reacting to the
+#      stall would mix a scaling response into the switch cost. (The fused stage
+#      still comes up at R_ab = Ra + Rb = 4, then holds.)
+#
+# The morphs are spaced 8 s apart: far enough that each transition's before- and
+# after-windows are clean steady state, and repeated so a single run yields
+# several samples of each verb. Break-even wants distributions, not one number —
+# bench/morph_bench.sh repeats the whole run N times on top of that.
+#
+# Run:  bench/morph_bench.sh          (from repo root)
+
+package: epico:morphbench@1.0.0
+
+nodes:
+  - name: local
+    host: 127.0.0.1
+    force_tcp: false
+
+types:
+  reading:
+    sensor_id: string
+    value:     f64
+
+# Blocking sends, exact count, no idle. The count must OUTLAST the morph
+# schedule with steady state on both sides of the LAST transition — a run that
+# ends inside a post-morph window silently reports the drain as a throughput
+# collapse. At the ~350 k ev/s this pipeline sustains, 24 M events is ~70 s
+# against a schedule that finishes at 48 s.
+source:
+  kind: loadgen
+  profile: tp
+  count: 24000000
+  sensors: 100
+
+stages:
+  - name: ingest
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/ingest.rs
+    scaling: { min: 2, max: 2, queue_up: 50, cooldown_up_s: 60, cooldown_down_s: 60 }
+
+  - name: normalize
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/normalize.rs
+    scaling: { min: 2, max: 2, queue_up: 50, cooldown_up_s: 60, cooldown_down_s: 60 }
+
+  - name: detect
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/detect.rs
+    scaling: { min: 2, max: 2, queue_up: 50, cooldown_up_s: 60, cooldown_down_s: 60 }
+
+  - name: finalize
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/finalize.rs
+    scaling: { min: 2, max: 2, queue_up: 50, cooldown_up_s: 60, cooldown_down_s: 60 }
+
+edges:
+  - ingest -> normalize
+  - normalize -> detect
+  - detect -> finalize
+
+fusible:
+  - normalize -> detect
+
+# The three ordered DAG pairs, in order, twice.
+#
+#   identity  DAG1 -> DAG1. Zero expected steady-state delta BY CONSTRUCTION,
+#             which isolates switch mechanism cost from any workload effect.
+#             A non-zero gain here means the harness is wrong.
+#   fuse      DAG1 -> DAG2. The direction of the change is predictable;
+#             predictability is the feature. This validates the harness, it
+#             does not discover an optimization.
+#   split     DAG2 -> DAG1, the inverse.
+morphs:
+  - { at_s:  8.0, identity: normalize }
+  - { at_s: 16.0, fuse: normalize -> detect }
+  - { at_s: 24.0, split: normalize_detect }
+  - { at_s: 32.0, identity: normalize }
+  - { at_s: 40.0, fuse: normalize -> detect }
+  - { at_s: 48.0, split: normalize_detect }
+
+deploy:
+  host: localhost
+  this_host: local
+  ingress: ipc:///tmp/epico-morphbench-push
+
+  source_format: binary
+  event_format:  binary
+
+  ingress_mode: inprocess
+  edge_impl: spsc
+  spsc_ring_cap: 512
+
+  credit_window: 16
+  batch_events:  1
+  resource_sample_interval_ms: 0

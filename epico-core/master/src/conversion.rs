@@ -321,9 +321,7 @@ fn json_to_bench_hops(_v: Option<&serde_json::Value>, _bench_type: &Type) -> Val
 pub(crate) fn bench_val_to_json(
     _val: &Val,
     original_json: &serde_json::Value,
-    stage_name: &str,
-    enter_ts: f64,
-    exit_ts: f64,
+    new_hops: &[epico_wire::Hop<'_>],
 ) -> serde_json::Value {
     use serde_json::{json, Map, Value};
     let mut map = Map::new();
@@ -335,13 +333,16 @@ pub(crate) fn bench_val_to_json(
         }
     }
 
-    // Append new hop.
+    // Append this physical stage's hops — one per fused half, so both halves of
+    // a fused worker stay individually attributable.
     let mut hops = original_json
         .get("bench_hops")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    hops.push(json!([stage_name, enter_ts, exit_ts]));
+    for (stage_name, enter_ts, exit_ts) in new_hops {
+        hops.push(json!([stage_name, enter_ts, exit_ts]));
+    }
     map.insert("bench_hops".to_string(), Value::Array(hops));
 
     Value::Object(map)

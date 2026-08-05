@@ -140,6 +140,30 @@ pub struct PipelineSpec {
     /// Slot capacity of each individual SPSC ring. Only used when
     /// `edge_impl: spsc`. Default 256. Env override: EPICO_SPSC_RING_CAP.
     pub spsc_ring_cap: usize,
+    /// Pre-declared physical alternatives: ordered edges `a -> b` that may be
+    /// contracted into one fused stage at runtime. Declaring a pair is what
+    /// lets the agent widen the affected replica-index spaces at boot, so
+    /// fusion needs no runtime mesh swap.
+    pub fusible: Vec<(String, String)>,
+    /// Deterministic morph schedule. Break-even needs morphs at known instants,
+    /// repeated; a controller deciding for itself obstructs that measurement.
+    pub morphs: Vec<MorphEntry>,
+}
+
+/// One scheduled topology morph. Exactly one action per entry.
+#[derive(Debug, Clone)]
+pub struct MorphEntry {
+    /// Seconds after agent start.
+    pub at_s: f64,
+    pub action: MorphAction,
+}
+
+#[derive(Debug, Clone)]
+pub enum MorphAction {
+    Fuse(String, String),
+    Split(String),
+    /// Redeploy unchanged — isolates switch mechanism cost from workload effect.
+    Identity(String),
 }
 
 /// A native boundary node (source or sink) compiled into the per-pipeline
@@ -265,6 +289,13 @@ struct NewFormat {
     stages: Vec<NewStage>,
     #[serde(default)]
     edges: Vec<String>,
+    /// Edges that MAY be contracted at runtime, written like `edges:`:
+    /// `- normalize -> detect`.
+    #[serde(default)]
+    fusible: Vec<String>,
+    /// Scheduled morphs: `- { at_s: 10.0, fuse: normalize -> detect }`.
+    #[serde(default)]
+    morphs: Vec<RawMorph>,
     #[serde(default)]
     deploy: DeploySpec,
     /// Optional event source launched alongside the agent. See `SourceSpec`.
@@ -287,6 +318,17 @@ struct RawSource {
     placement: Option<String>,
     #[serde(flatten)]
     params: BTreeMap<String, serde_yaml::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawMorph {
+    at_s: f64,
+    #[serde(default)]
+    fuse: Option<String>,
+    #[serde(default)]
+    split: Option<String>,
+    #[serde(default)]
+    identity: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -585,13 +627,7 @@ fn from_new_format(raw: NewFormat, yaml_dir: &Path) -> Result<PipelineSpec> {
     let edges: Result<Vec<(String, String)>> = raw
         .edges
         .iter()
-        .map(|e| {
-            let parts: Vec<&str> = e.split("->").map(str::trim).collect();
-            if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-                bail!("bad edge spec {:?}; expected 'from -> to'", e);
-            }
-            Ok((parts[0].to_string(), parts[1].to_string()))
-        })
+        .map(|e| parse_arrow(e))
         .collect();
     let mut edges = edges?;
 
@@ -655,6 +691,71 @@ fn from_new_format(raw: NewFormat, yaml_dir: &Path) -> Result<PipelineSpec> {
                 );
             }
         }
+    }
+
+    // ── Fusible pairs ─────────────────────────────────────────────────────
+    // Fusion is edge contraction on the DAG, so a pair is only fusible on a
+    // linear chain segment: contracting across a fan-out or a fan-in would
+    // change semantics (broadcast copies, merge ordering). Rejecting an
+    // impossible declaration HERE — before any cargo build is kicked off, with
+    // a named reason — is the point; the alternative is discovering it during a
+    // benchmark run when the actuator refuses the morph.
+    let mut fusible: Vec<(String, String)> = Vec::new();
+    for spec in &raw.fusible {
+        let (a, b) = parse_arrow(spec)
+            .with_context(|| format!("bad fusible spec {spec:?}"))?;
+        if !known.contains(a.as_str()) || !known.contains(b.as_str()) {
+            bail!("fusible {a} -> {b} names a stage that is not declared");
+        }
+        if !edges.iter().any(|(f, t)| *f == a && *t == b) {
+            bail!("fusible {a} -> {b} is not an edge of this pipeline");
+        }
+        let out_deg = edges.iter().filter(|(f, _)| *f == a).count();
+        let in_deg  = edges.iter().filter(|(_, t)| *t == b).count();
+        if out_deg != 1 {
+            bail!("fusible {a} -> {b}: out-degree({a}) = {out_deg}, not 1 — \
+                   contracting across a fan-out would change semantics");
+        }
+        if in_deg != 1 {
+            bail!("fusible {a} -> {b}: in-degree({b}) = {in_deg}, not 1 — \
+                   contracting across a fan-in would change semantics");
+        }
+        let pa = &stage_by_name[a.as_str()].placement;
+        let pb = &stage_by_name[b.as_str()].placement;
+        if pa != pb {
+            bail!("fusible {a} -> {b}: {a} is placed on {pa:?} but {b} on {pb:?}; \
+                   host-level fusion is intra-process by definition");
+        }
+        fusible.push((a, b));
+    }
+
+    // ── Morph schedule ────────────────────────────────────────────────────
+    let mut morphs: Vec<MorphEntry> = Vec::new();
+    for m in &raw.morphs {
+        let action = match (&m.fuse, &m.split, &m.identity) {
+            (Some(spec), None, None) => {
+                let (a, b) = parse_arrow(spec)
+                    .with_context(|| format!("bad morph fuse spec {spec:?}"))?;
+                if !fusible.iter().any(|(x, y)| *x == a && *y == b) {
+                    bail!("morph at {}s fuses {a} -> {b}, which is not declared \
+                           under `fusible:` — index spaces are widened for \
+                           declared pairs only, at boot", m.at_s);
+                }
+                MorphAction::Fuse(a, b)
+            }
+            (None, Some(name), None) => MorphAction::Split(name.clone()),
+            (None, None, Some(name)) => {
+                if !known.contains(name.as_str()) {
+                    bail!("morph at {}s redeploys unknown stage {name:?}", m.at_s);
+                }
+                MorphAction::Identity(name.clone())
+            }
+            _ => bail!(
+                "morph at {}s needs exactly one of `fuse: a -> b`, \
+                 `split: <stage>`, `identity: <stage>`", m.at_s
+            ),
+        };
+        morphs.push(MorphEntry { at_s: m.at_s, action });
     }
 
     // Resolve this_host: explicit field wins, otherwise default to the
@@ -777,7 +878,19 @@ fn from_new_format(raw: NewFormat, yaml_dir: &Path) -> Result<PipelineSpec> {
         source_threads: raw.deploy.source_threads,
         edge_impl,
         spsc_ring_cap: raw.deploy.spsc_ring_cap.unwrap_or(256),
+        fusible,
+        morphs,
     })
+}
+
+/// Parse an `a -> b` spec, whitespace-flexible. Shared by `edges:` and
+/// `fusible:` so the two blocks can never drift in syntax.
+fn parse_arrow(spec: &str) -> Result<(String, String)> {
+    let parts: Vec<&str> = spec.split("->").map(str::trim).collect();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        bail!("bad spec {:?}; expected 'from -> to'", spec);
+    }
+    Ok((parts[0].to_string(), parts[1].to_string()))
 }
 
 fn from_old_format(raw: OldFormat, yaml_dir: &Path) -> Result<PipelineSpec> {
@@ -890,5 +1003,8 @@ fn from_old_format(raw: OldFormat, yaml_dir: &Path) -> Result<PipelineSpec> {
         // Old-format YAMLs predate in-process edges; keep ZMQ path unchanged.
         edge_impl: "zmq".to_string(),
         spsc_ring_cap: 256,
+        // Old-format YAMLs predate runtime morphing: static topology only.
+        fusible: Vec::new(),
+        morphs: Vec::new(),
     })
 }
