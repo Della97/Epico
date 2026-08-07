@@ -17,6 +17,7 @@ use crate::config::{make_pull_endpoint, make_push_endpoint, PipelineStage};
 use crate::eos::StageEosBarrier;
 use crate::host::HostState;
 use crate::spsc::{EdgeInSrc, EdgeOutSrc};
+use crate::telemetry::live::{StageTiming, TimingCursor};
 use crate::telemetry::{record_event, stats::round3, RunTelemetry, ScalingEvent};
 use crate::worker::{spawn_worker, OutputSpec, WorkerChain, WorkerHandle};
 
@@ -163,6 +164,14 @@ pub(crate) fn run_autoscaler_loop(
     stop:          Arc<AtomicBool>,
     initial_replicas: usize,
     live_replicas: Arc<std::sync::atomic::AtomicUsize>,
+    // Shared with every replica of this stage; sampled below on the same
+    // decimated tick as `queue_depth_samples`. See `telemetry::live`.
+    timing: Arc<StageTiming>,
+    // Published every tick alongside `live_replicas`, for the same reason: the
+    // controller needs this stage's backlog without racing this loop's private
+    // state, and `queue_depth_samples` is decimated for the summary and lives
+    // behind the telemetry mutex.
+    live_queue_depth: Arc<AtomicU64>,
 ) {
     let min_rep  = stage.slo.min_replicas;
     let max_rep  = stage.slo.max_replicas;
@@ -352,6 +361,10 @@ pub(crate) fn run_autoscaler_loop(
     let mut free_indices: std::collections::BTreeSet<usize> = (0..max_rep).collect();
     // Monotonic tick counter, for decimating time-series samples below.
     let mut tick: u64 = 0;
+    // This loop's private view of the stage's timing counters. Private because
+    // the collector reads the same block on its own cadence for the live stats;
+    // each holds its own cursor so neither consumes the other's samples.
+    let mut timing_cursor = TimingCursor::default();
     let mut up_votes: u32 = 0;
     let mut down_votes: u32 = 0;
     let mut ticks_since_spawn: u32 = u32::MAX;
@@ -417,6 +430,7 @@ pub(crate) fn run_autoscaler_loop(
                 None    => continue,
             }
         };
+        live_queue_depth.store(qd as u64, Ordering::Relaxed);
 
         if let Some(metrics) = dispatcher_metrics.as_ref() {
         if !metrics.worker_samples.is_empty() {
@@ -450,12 +464,45 @@ pub(crate) fn run_autoscaler_loop(
         // block above, so in-proc stages (dispatcher_metrics == None) produced
         // an empty queue_depth block in the summary and nothing to plot.
         if tick % 50 == 0 {
+            // Worker timing (D7). On the zmq path the block above already
+            // pushed per-event samples forwarded by the dispatcher; here the
+            // SAME maps are fed from the stage's shared counters, which exist
+            // on every transport. `advance` returns None when no event was
+            // processed in the window, so an idle stage contributes nothing
+            // rather than a run of zeros that would drag its quantiles down.
+            //
+            // The two sources differ in shape and that is deliberate: the zmq
+            // path samples individual events, this one samples a ~50 ms mean.
+            // A mean is the right unit here — the summary block reports
+            // distributions over samples, and a 50 ms window at any rate the
+            // pipeline runs at is many events, so the sample count stays high
+            // enough for the percentiles to mean something.
             if let Ok(mut tel) = telemetry.try_lock() {
                 let t_s = test_start.elapsed().as_secs_f64();
                 tel.queue_depth_samples
                     .entry(stage.name.clone())
                     .or_default()
                     .push((round3(t_s), qd as u64));
+
+                // Advanced INSIDE the guard: the cursor consumes the window it
+                // reads, so advancing before a `try_lock` that then fails would
+                // discard that window's timing outright rather than merely
+                // deferring it.
+                let timing_delta = if dispatcher_metrics.is_none() {
+                    timing_cursor.advance(&timing)
+                } else {
+                    None
+                };
+                if let Some(d) = timing_delta {
+                    tel.total_us_samples
+                        .entry(stage.name.clone())
+                        .or_default()
+                        .push(d.total_ns_per_event);
+                    tel.serde_us_samples
+                        .entry(stage.name.clone())
+                        .or_default()
+                        .push(d.serde_ns_per_event);
+                }
             }
         }
 
@@ -536,6 +583,7 @@ pub(crate) fn run_autoscaler_loop(
                 event_format.clone(),
                 barrier.clone(),
                 stop.clone(),
+                timing.clone(),
                 log.with_component(&format!("worker/{}", stage.name)),
             ));
             if let Ok(mut tel) = telemetry.lock() {
@@ -586,6 +634,7 @@ pub(crate) fn run_autoscaler_loop(
                 event_format.clone(),
                 barrier.clone(),
                 stop.clone(),
+                timing.clone(),
                 log.with_component(&format!("worker/{}", stage.name)),
             ));
             record_event(&telemetry, test_start, &stage.name, "spawn",
@@ -628,6 +677,7 @@ pub(crate) fn run_autoscaler_loop(
                 event_format.clone(),
                 barrier.clone(),
                 stop.clone(),
+                timing.clone(),
                 log.with_component(&format!("worker/{}", stage.name)),
             ));
             record_event(&telemetry, test_start, &stage.name, "spawn",

@@ -1,0 +1,119 @@
+# .controller_negative_test.yaml — the controller correctly doing NOTHING
+# (roadmap M2, phase 5e).
+#
+# This is the fixture the plan says not to skip:
+#
+#   > 5e is the one to not skip. A controller that morphs when it should not is
+#   > worse than no controller, and only a negative test catches it.
+#
+# It is `.controller_test.yaml` with two changes, and nothing else:
+#
+#   1. Both halves are COMPUTE-BOUND (`*_compute_bound.rs`, ~200k spin
+#      iterations each), so per-event wasm cost sits in the hundreds of
+#      microseconds instead of single digits.
+#   2. The source is PACED (`profile: steady`) rather than blasting, so the
+#      pipeline keeps up and the queues stay shallow.
+#
+# The second change is what makes the first legible, and it is worth stating
+# plainly because it is the subtlety in this whole phase: the per-edge gap the
+# controller reads is `next.enter_ts - prev.exit_ts`, which under saturation is
+# dominated by QUEUEING, not by transport. Blast a compute-bound pipeline and
+# its edges look expensive — because the consumer is slow, not because the edge
+# is. Only an unsaturated pipeline reveals an edge's true transport cost, and
+# only then can "is this edge or is this compute" be answered at all.
+#
+# So the expected verdict here is zero morphs, and the log must show the
+# controller reaching that conclusion on COST grounds — not silently sitting
+# out because it was never armed.
+#
+# Run:  tests/controller_refuses_compute_bound.sh   (from repo root)
+
+package: epico:controllernegative@1.0.0
+
+nodes:
+  - name: local
+    host: 127.0.0.1
+    force_tcp: false
+
+types:
+  reading:
+    sensor_id: string
+    value:     f64
+
+# Paced, and deliberately below capacity. Two replicas x ~2.5k ev/s per replica
+# per stage is roughly 5k ev/s of headroom; 2k ev/s keeps every queue shallow so
+# the edge gap reads transport cost rather than backlog. 20 s is ~10x the
+# controller's cooldown, so it gets tens of decisions to get this wrong in.
+source:
+  kind: loadgen
+  profile: steady
+  rate: 2000
+  duration: 20
+  sensors: 100
+
+stages:
+  - name: ingest
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/ingest.rs
+    scaling: { min: 1, max: 2, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 5.0 }
+
+  - name: normalize
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/normalize_compute_bound.rs
+    # min == max on both heavy halves. The capacity has to be present from the
+    # first event: a stage that starts at one replica is briefly saturated while
+    # the autoscaler catches up, and a saturated edge reads expensive no matter
+    # what is actually slow — which would hand the controller the wrong evidence
+    # for reasons that have nothing to do with the property under test.
+    scaling: { min: 2, max: 2, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 5.0 }
+
+  - name: detect
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/detect_compute_bound.rs
+    scaling: { min: 2, max: 2, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 5.0 }
+
+  - name: finalize
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/finalize.rs
+    scaling: { min: 1, max: 2, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 5.0 }
+
+edges:
+  - ingest -> normalize
+  - normalize -> detect
+  - detect -> finalize
+
+# The pair IS declared fusible. That matters: the controller must refuse on the
+# evidence, not because it had nothing available to propose. A run that passes
+# only because `fusible:` was empty would prove nothing.
+fusible:
+  - normalize -> detect
+
+controller:
+  enabled: true
+  period_s: 0.25
+  significance_floor_us: 100.0
+  window_s: 2
+  cooldown_fuse_s: 2.0
+
+deploy:
+  host: localhost
+  this_host: local
+  ingress: ipc:///tmp/epico-controllernegative-push
+  source_format: json
+  event_format:  json
+
+  ingress_mode: inprocess
+  edge_impl: spsc
+  spsc_ring_cap: 512
+
+  credit_window: 16
+  batch_events:  1
+  resource_sample_interval_ms: 0

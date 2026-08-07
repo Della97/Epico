@@ -5,6 +5,11 @@
 //!                        the writer discipline that governs them.
 //!   * `collector.rs`   — [`collector::CollectorStats`], the collector thread's
 //!                        lock-free per-event accumulator (hops, e2e, reservoir).
+//!   * `live.rs`        — [`live::LiveStats`], the rolling in-run view a
+//!                        *controller* reads. Everything else in this module is
+//!                        written once and read at shutdown; that is read every
+//!                        second while the run is going. See its module docs
+//!                        for the writer table.
 //!   * `summary.rs`     — [`summary::build_summary`] and the per-block builders
 //!                        that shape `master_<ts>_summary.json`.
 //!   * `resources.rs`   — the CPU + RSS sampler thread.
@@ -30,6 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub(crate) mod collector;
+pub(crate) mod live;
 pub(crate) mod resources;
 pub(crate) mod stats;
 pub(crate) mod summary;

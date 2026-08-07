@@ -318,6 +318,65 @@ pub(crate) struct Config {
     /// ```
     #[serde(default)]
     pub morphs: Vec<MorphSpec>,
+    /// The cost-model controller: the alternative producer of the same requests
+    /// `morphs:` emits, deciding for itself from live per-edge statistics.
+    ///
+    /// Off by default, and deliberately so. Break-even needs morphs at KNOWN
+    /// instants, so a controller forming its own opinion actively obstructs
+    /// that measurement — the two are alternatives, not layers. Enabling it
+    /// alongside a non-empty `morphs:` block is refused at boot rather than
+    /// letting two producers race on one channel.
+    ///
+    /// ```yaml
+    /// controller:
+    ///   enabled: true
+    ///   significance_floor_us: 200.0   # calibrated; see the field docs
+    /// ```
+    #[serde(default)]
+    pub controller: Option<ControllerSpec>,
+}
+
+/// The YAML `controller:` block. Every knob is optional and falls back to the
+/// measurement-derived defaults in [`crate::controller::ControllerCfg`].
+#[derive(Debug, Deserialize, Clone, Default)]
+pub(crate) struct ControllerSpec {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Seconds between decisions. Default 1.0 — autoscalers tick at 1 ms, but a
+    /// morph costs ~10^3 times what a replica spawn does.
+    #[serde(default)]
+    pub period_s: Option<f64>,
+    /// Edge-dominance factor: the edge must cost `alpha` times the compute it
+    /// joins before contracting it is considered. Default 1.0.
+    #[serde(default)]
+    pub alpha: Option<f64>,
+    /// Default 5.0 — at least ten times the measured 0.20 s break-even.
+    #[serde(default)]
+    pub cooldown_fuse_s: Option<f64>,
+    /// Default 30.0. Asymmetric on purpose: on current evidence splitting is
+    /// never a throughput win, so it is made reluctant.
+    #[serde(default)]
+    pub cooldown_split_s: Option<f64>,
+    /// Smallest per-event edge cost, in microseconds, that counts as a real
+    /// gain rather than run-to-run noise.
+    ///
+    /// **Calibrate this; do not accept the default.** Run the identity arm of
+    /// `bench/morph_bench.sh` against the deployed build and take the spread of
+    /// its per-event `inter_stage` p50 — an identity morph redeploys the same
+    /// topology, so anything it appears to "gain" is noise by construction, and
+    /// that spread is the floor. It moves with the workload (the phase-4 arms
+    /// differed by 5x between uniform and skewed), which is exactly why it is
+    /// configuration rather than a constant. The value in force is logged at
+    /// boot and repeated in every refusal it causes.
+    #[serde(default)]
+    pub significance_floor_us: Option<f64>,
+    /// Seconds of history each query averages over. Default 5.
+    #[serde(default)]
+    pub window_s: Option<u64>,
+    /// Below this event rate an edge's quantiles rest on too few observations
+    /// to act on. Default 100.
+    #[serde(default)]
+    pub min_rate_eps: Option<f64>,
 }
 
 /// One scheduled morph from the YAML `morphs:` block. Exactly one of

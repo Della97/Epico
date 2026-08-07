@@ -37,7 +37,7 @@ types:
 source:
   kind: loadgen
   profile: tp
-  count: 400000
+  count: 4000000
   sensors: 100
   blast: true
 

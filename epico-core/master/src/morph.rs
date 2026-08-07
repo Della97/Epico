@@ -58,6 +58,7 @@ use wasmtime::Engine;
 use crate::config::{fused_stage_name, Config, FusedHalf, PipelineStage};
 use crate::eos::StageEosBarrier;
 use crate::spsc::{EdgeInSrc, EdgeOutSrc};
+use crate::telemetry::live::TimingRegistry;
 use crate::telemetry::{record_event, RunTelemetry};
 
 /// How long the actuator waits for the eliminated edge to empty before giving
@@ -147,6 +148,10 @@ pub(crate) struct StageRuntime {
     handle:        std::thread::JoinHandle<()>,
     barrier:       Arc<StageEosBarrier>,
     live_replicas: Arc<AtomicUsize>,
+    /// Backlog on this stage's input, republished every autoscaler tick. The
+    /// controller's pressure test reads the same signal the autoscaler scales
+    /// on, rather than inventing a second notion of "busy".
+    queue_depth:   Arc<std::sync::atomic::AtomicU64>,
     /// The deployment this stage was started from — a split reads the fused
     /// stage's halves back out of here.
     deployment:    StageDeployment,
@@ -171,6 +176,12 @@ pub(crate) struct Deployer {
     pub config:       Config,
     /// Immutable after boot: one entry per stage declared in the pipeline.
     pub templates:    HashMap<String, StageDeployment>,
+    /// Per-stage worker timing, keyed by physical stage name. It lives here
+    /// rather than in `templates` because a morph *creates* physical stages:
+    /// `fn-a+fn-b` has no template and no counters until the fusion that makes
+    /// it. Registered on the way up by `spawn_stage`; read by the collector for
+    /// the live stats and by each stage's own autoscaler for the summary.
+    pub timings:      Arc<TimingRegistry>,
     stages:           Mutex<HashMap<String, StageRuntime>>,
     /// True while a transition is in flight. Read by the supervisor loop, which
     /// must not mistake a transient empty/quiescing stage set for a crash, and
@@ -188,9 +199,13 @@ impl Deployer {
         log:          Logger,
         config:       Config,
         templates:    HashMap<String, StageDeployment>,
+        // Shared with the collector rather than created here: the collector
+        // starts before any stage does, and it is the registry's other reader.
+        timings:      Arc<TimingRegistry>,
     ) -> Self {
         Deployer {
             engine, telemetry, test_start, compile_mode, event_format, log, config, templates,
+            timings,
             stages: Mutex::new(HashMap::new()),
             morph_in_flight: Arc::new(AtomicBool::new(false)),
         }
@@ -224,6 +239,7 @@ impl Deployer {
         let stop          = Arc::new(AtomicBool::new(false));
         let barrier       = Arc::new(StageEosBarrier::new(dep.expected_in.max(1)));
         let live_replicas = Arc::new(AtomicUsize::new(0));
+        let queue_depth   = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let stage_c   = dep.stage.clone();
         let in_edge   = dep.in_edge.clone();
@@ -239,18 +255,61 @@ impl Deployer {
         let barrier_c = barrier.clone();
         let stop_c    = stop.clone();
         let live_c    = live_replicas.clone();
+        let qd_c      = queue_depth.clone();
+        // Registered before the thread starts, so a controller that samples
+        // between spawn and the stage's first tick sees an idle stage rather
+        // than a missing one.
+        let timing_c  = self.timings.get_or_insert(&name);
 
         let handle = std::thread::spawn(move || {
             crate::autoscaler::run_autoscaler_loop(
                 stage_c, ctrl_port, cw, in_edge, out_edges, engine_c, stage_log, tel_c,
                 test_start, compile_c, format_c, barrier_c, stop_c, initial_replicas, live_c,
+                timing_c, qd_c,
             );
         });
 
         let mut stages = self.stages.lock().expect("stage registry poisoned");
         stages.insert(name, StageRuntime {
-            stop, handle, barrier, live_replicas, deployment: dep,
+            stop, handle, barrier, live_replicas, queue_depth, deployment: dep,
         });
+    }
+
+    /// Per-stage runtime state for the controller, in one lock acquisition.
+    ///
+    /// Taken as a single consistent-enough snapshot rather than field by field:
+    /// the decision compares `live` against `max` and reads `queue_depth` in the
+    /// same breath, and sampling those across separate lock acquisitions is how
+    /// a controller ends up reasoning about a stage that no longer exists.
+    pub(crate) fn stage_signals(&self) -> HashMap<String, crate::controller::StageSignal> {
+        let stages = self.stages.lock().expect("stage registry poisoned");
+        stages
+            .iter()
+            .map(|(name, rt)| {
+                let slo = &rt.deployment.stage.slo;
+                (
+                    name.clone(),
+                    crate::controller::StageSignal {
+                        live: rt.live(),
+                        max: slo.max_replicas,
+                        queue_depth: rt.queue_depth.load(Ordering::Relaxed),
+                        // Filled in by the controller loop from its own previous
+                        // tick: "rising" is a property of the time series, and
+                        // the registry holds only the present.
+                        queue_depth_prev: 0,
+                        queue_up: slo.queue_up.unwrap_or(50.0),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Instance-pool slots currently committed to live replicas. The engine was
+    /// sized at boot for `total_max`, so the controller's admission check is
+    /// `total_max - this`.
+    pub(crate) fn live_replica_total(&self) -> usize {
+        let stages = self.stages.lock().expect("stage registry poisoned");
+        stages.values().map(|s| s.live()).sum()
     }
 
     /// Retire a stage: raise its stop flag and block until its control loop has

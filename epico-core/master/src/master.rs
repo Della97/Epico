@@ -17,6 +17,7 @@ use epico_logger::{error, info, warn};
 
 mod autoscaler;
 mod config;
+mod controller;
 mod conversion;
 pub mod envelope;
 mod eos;
@@ -380,14 +381,27 @@ pub fn run_agent(
     let collector_uri = config.collector.clone()
         .unwrap_or_else(|| "tcp://0.0.0.0:9999".to_string());
 
+    // ── Live statistics (M2 phase 5) ─────────────────────────────────────────
+    // Created HERE, before the collector thread, because both of its writers
+    // start earlier than the `Deployer` that logically owns the stage set: the
+    // collector folds per-edge gaps from the moment the first event lands, and
+    // it pulls per-stage compute through the timing registry, which the
+    // Deployer then shares rather than creates. The controller (spawned below,
+    // once the morph channel exists) is the only reader.
+    let timings = Arc::new(crate::telemetry::live::TimingRegistry::default());
+    let live_stats = Arc::new(crate::telemetry::live::LiveStatsHandle::default());
+
     let col_telemetry = telemetry.clone();
     let col_running   = Arc::new(AtomicBool::new(true));
     let col_running2  = col_running.clone();
     let col_log       = log.with_component("master/collector");
     let col_egress    = egress_sink_edge;
+    let col_timings   = timings.clone();
+    let col_live      = live_stats.clone();
 
     let collector_handle = std::thread::spawn(move || {
-        run_collector(&collector_uri, col_telemetry, col_running2, col_log, test_start, col_egress, custom_sink);
+        run_collector(&collector_uri, col_telemetry, col_running2, col_log, test_start,
+                      col_egress, custom_sink, col_timings, col_live);
     });
 
     // ── Source (in-process ingress) ───────────────────────────────────────────
@@ -541,6 +555,7 @@ pub fn run_agent(
         log.clone(),
         config.clone(),
         templates.clone(),
+        timings.clone(),
     ));
 
     for stage in config.pipeline.iter() {
@@ -560,11 +575,37 @@ pub fn run_agent(
         let dep_c = deployer.clone();
         std::thread::spawn(move || morph::run_actuator(morph_rx, dep_c));
     }
+    // Exactly one policy may drive that channel. A scripted schedule exists to
+    // put morphs at KNOWN instants so switch cost and break-even are
+    // measurable; a controller forming its own opinion destroys that, and the
+    // two racing would produce a run whose morph history means nothing. Refuse
+    // at boot rather than silently letting one win.
+    let controller_cfg = controller::ControllerCfg::from_spec(
+        config.controller.as_ref().unwrap_or(&Default::default()),
+    );
+    if controller_cfg.enabled && !config.morphs.is_empty() {
+        error!(log, "`controller: {enabled: true}` and a non-empty `morphs:` block are \
+                     mutually exclusive — a scripted schedule exists to place morphs at \
+                     known instants, which is exactly what a controller deciding for \
+                     itself would destroy. Remove one.");
+        std::process::exit(1);
+    }
+
     if !config.morphs.is_empty() {
         let specs = config.morphs.clone();
         let sched_log = log.with_component("morph/schedule");
         std::thread::spawn(move || {
             morph::run_schedule(specs, morph_tx, test_start_instant, sched_log);
+        });
+    } else if controller_cfg.enabled {
+        let dep_c  = deployer.clone();
+        let live_c = live_stats.clone();
+        let ctl_log = log.with_component("morph/controller");
+        std::thread::spawn(move || {
+            controller::run_controller(
+                controller_cfg, dep_c, live_c, morph_tx, total_max,
+                test_start_instant, ctl_log,
+            );
         });
     }
 
@@ -984,6 +1025,8 @@ fn run_collector(
     test_start: f64,
     egress_edge: Option<Edge>,
     mut sink: Option<Box<dyn EventSink>>,
+    timings: Arc<crate::telemetry::live::TimingRegistry>,
+    live_handle: Arc<crate::telemetry::live::LiveStatsHandle>,
 ) {
     // The output endpoint from config is what workers connect to as PUSH.
     // We bind a PULL socket at the same address to receive those events.
@@ -1051,16 +1094,32 @@ fn run_collector(
     // Collector-owned stats: accumulated lock-free per event, merged into the
     // shared telemetry once at loop exit (see telemetry::collector docs).
     let mut stats = CollectorStats::new();
+    // The live per-edge windows. Same ownership story as `stats` — this thread
+    // is the sole writer — but published continuously rather than at exit,
+    // because its consumer is a controller running inside the same run.
+    let mut live = crate::telemetry::live::LiveCollector::new(timings, live_handle);
 
     while running.load(Ordering::Relaxed) {
         let bytes = match &egress_edge {
             Some(edge) => match edge.try_pop() {
                 Some(b) => b,
-                None    => { std::thread::sleep(Duration::from_micros(200)); continue; }
+                None    => {
+                    // Idle: close any bucket whose second has elapsed. Without
+                    // this a quiet pipeline would publish nothing and a
+                    // controller would keep reading the last busy second — the
+                    // exact condition under which it must NOT act.
+                    live.seal_if_due(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64() - test_start);
+                    std::thread::sleep(Duration::from_micros(200));
+                    continue;
+                }
             },
             None => match pull.as_ref().unwrap().recv_bytes(0) {
                 Ok(b)                   => Bytes::from(b),
-                Err(zmq::Error::EAGAIN) => continue,
+                // A blocking recv parks here, so on the socket path buckets are
+                // sealed only when traffic resumes. Consumers therefore treat
+                // `LiveStats::t_s` as the snapshot's age rather than assuming
+                // it is current.
+                Err(zmq::Error::EAGAIN) => { live.seal_if_due(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64() - test_start); continue; }
                 Err(_)                  => continue,
             },
         };
@@ -1134,7 +1193,7 @@ fn run_collector(
                 serde_json::from_slice::<serde_json::Value>(&bytes).ok()
             };
         if let Some(ev) = ev_parsed {
-            stats.observe(recv_ts, test_start, &ev);
+            stats.observe(recv_ts, test_start, &ev, bytes.len(), &mut live);
         }
 
         recv_count += 1;

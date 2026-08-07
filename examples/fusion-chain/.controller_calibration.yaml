@@ -1,0 +1,125 @@
+# .controller_calibration.yaml — measuring the controller's significance floor
+# (roadmap M2, phase 5e).
+#
+# The floor is the smallest per-event gain that counts as a real gain rather
+# than run-to-run noise, and it CANNOT be a constant. RESULTS.md C7:
+#
+#   > Break-even is `S^2 / (2 * delta)`, so a near-zero delta drives the
+#   > estimate toward zero and produces confident-looking nonsense: the identity
+#   > control produced *finite* break-even in 13 of 20 morphs at a p50 of
+#   > 0.022 s, an order of magnitude "better" than fuse's real 0.204 s.
+#
+# So the floor is a NOISE measurement, and it has to be taken on the deployed
+# build under the workload that build will see — the phase-4 arms differed by
+# roughly fivefold between the uniform and skewed configurations.
+#
+# This config is the measuring instrument. It is the identity arm and nothing
+# else: ten `identity` morphs, which tear a stage down and bring it back with
+# the SAME topology. Any apparent change in the contracted edge's per-event gap
+# across one of those is measurement noise by construction, because nothing
+# about the pipeline changed.
+#
+# Two properties make the measurement valid, and both are easy to break:
+#
+#   * The source is SUSTAINED (`profile: steady`), not bursty. A morph that
+#     lands in an idle stretch has no traffic on one side of it and yields no
+#     sample; `bench/calibrate_controller.py` reports that case by name rather
+#     than quietly averaging fewer morphs than you asked for.
+#   * The load is below capacity. At saturation the per-edge gap is dominated by
+#     queueing, which is a property of the backlog rather than of the edge, and
+#     its run-to-run variation would be measuring the autoscaler.
+#
+# Usage:
+#   cd examples/fusion-chain && epico run -c .controller_calibration.yaml
+#   bench/calibrate_controller.py --edge normalize detect \
+#       examples/fusion-chain/logs/run_*/master_summary.json
+
+package: epico:controllercalib@1.0.0
+
+nodes:
+  - name: local
+    host: 127.0.0.1
+    force_tcp: false
+
+types:
+  reading:
+    sensor_id: string
+    value:     f64
+
+source:
+  kind: loadgen
+  profile: steady
+  rate: 20000
+  duration: 26
+  sensors: 100
+
+stages:
+  - name: ingest
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/ingest.rs
+    # Fixed replica count. A stage that is scaling during a transition adds a
+    # second source of variation to a measurement whose entire purpose is to
+    # attribute variation.
+    scaling: { min: 2, max: 2, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 5.0 }
+
+  - name: normalize
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/normalize.rs
+    scaling: { min: 2, max: 2, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 5.0 }
+
+  - name: detect
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/detect.rs
+    scaling: { min: 2, max: 2, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 5.0 }
+
+  - name: finalize
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/finalize.rs
+    scaling: { min: 2, max: 2, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 5.0 }
+
+edges:
+  - ingest -> normalize
+  - normalize -> detect
+  - detect -> finalize
+
+fusible:
+  - normalize -> detect
+
+# Ten identity morphs, 2 s apart, every one of them a no-op by construction.
+# N >= 10 is the plan's own bar for a distribution rather than a number.
+# Spaced wider than the analysis window (2 s) so consecutive morphs do not
+# contaminate each other's before/after samples.
+morphs:
+  - { at_s:  4.0, identity: normalize }
+  - { at_s:  6.0, identity: normalize }
+  - { at_s:  8.0, identity: normalize }
+  - { at_s: 10.0, identity: normalize }
+  - { at_s: 12.0, identity: normalize }
+  - { at_s: 14.0, identity: normalize }
+  - { at_s: 16.0, identity: normalize }
+  - { at_s: 18.0, identity: normalize }
+  - { at_s: 20.0, identity: normalize }
+  - { at_s: 22.0, identity: normalize }
+
+deploy:
+  host: localhost
+  this_host: local
+  ingress: ipc:///tmp/epico-controllercalib-push
+  source_format: json
+  event_format:  json
+
+  ingress_mode: inprocess
+  edge_impl: spsc
+  spsc_ring_cap: 512
+
+  credit_window: 16
+  batch_events:  1
+  resource_sample_interval_ms: 0

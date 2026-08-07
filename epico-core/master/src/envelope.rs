@@ -80,6 +80,13 @@ pub(crate) fn binary_to_telemetry_json(bytes: &[u8]) -> Option<serde_json::Value
     if let Some(v) = env.seq {
         map.insert("bench_seq".into(), serde_json::json!(v));
     }
+    // Carried for the collector's live per-key occupancy sketch. Per-key skew
+    // is the highest-value scission signal there is and is invisible in every
+    // aggregate, but it is already on the wire (bitmap bit 3), so surfacing it
+    // costs one map insert on a decode that was already header-only.
+    if let Some(v) = env.key_hash {
+        map.insert("bench_key_hash".into(), serde_json::json!(v));
+    }
     let hops: Vec<serde_json::Value> = env
         .hops
         .iter()

@@ -148,6 +148,37 @@ pub struct PipelineSpec {
     /// Deterministic morph schedule. Break-even needs morphs at known instants,
     /// repeated; a controller deciding for itself obstructs that measurement.
     pub morphs: Vec<MorphEntry>,
+    /// The cost-model controller, if the pipeline asks for one. Mutually
+    /// exclusive with `morphs:` — see [`RawController`].
+    pub controller: Option<RawController>,
+}
+
+/// The `controller:` block, passed through to the agent verbatim.
+///
+/// Deliberately NOT validated knob by knob here: every field is a policy
+/// tunable whose default is derived from M2's measurements and lives in the
+/// agent, and duplicating those defaults in the CLI is how the two drift apart.
+/// What the CLI does enforce is the mutual exclusion with `morphs:`, because
+/// that is a pipeline-authoring error worth catching before a build rather than
+/// halfway through a benchmark run.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RawController {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub period_s: Option<f64>,
+    #[serde(default)]
+    pub alpha: Option<f64>,
+    #[serde(default)]
+    pub cooldown_fuse_s: Option<f64>,
+    #[serde(default)]
+    pub cooldown_split_s: Option<f64>,
+    #[serde(default)]
+    pub significance_floor_us: Option<f64>,
+    #[serde(default)]
+    pub window_s: Option<u64>,
+    #[serde(default)]
+    pub min_rate_eps: Option<f64>,
 }
 
 /// One scheduled topology morph. Exactly one action per entry.
@@ -296,6 +327,10 @@ struct NewFormat {
     /// Scheduled morphs: `- { at_s: 10.0, fuse: normalize -> detect }`.
     #[serde(default)]
     morphs: Vec<RawMorph>,
+    /// The cost-model controller. An alternative producer of the same requests
+    /// `morphs:` emits, not a layer on top of it.
+    #[serde(default)]
+    controller: Option<RawController>,
     #[serde(default)]
     deploy: DeploySpec,
     /// Optional event source launched alongside the agent. See `SourceSpec`.
@@ -758,6 +793,28 @@ fn from_new_format(raw: NewFormat, yaml_dir: &Path) -> Result<PipelineSpec> {
         morphs.push(MorphEntry { at_s: m.at_s, action });
     }
 
+    // ── Controller ────────────────────────────────────────────────────────
+    // A scripted schedule and a cost-model controller are alternative
+    // producers of the same requests on the same channel. Running both would
+    // give a run whose morph history cannot be attributed to either, which
+    // silently ruins the measurement rather than failing. Caught here, before
+    // any cargo build is kicked off.
+    let controller = raw.controller.clone();
+    if let Some(c) = controller.as_ref() {
+        if c.enabled && !morphs.is_empty() {
+            bail!("`controller: {{ enabled: true }}` and a non-empty `morphs:` block are \
+                   mutually exclusive: a scripted schedule places morphs at KNOWN instants \
+                   so switch cost and break-even are measurable, which is exactly what a \
+                   controller deciding for itself destroys. Keep one.");
+        }
+        if c.enabled && fusible.is_empty() {
+            bail!("`controller: {{ enabled: true }}` with no `fusible:` pairs declared — \
+                   the controller can only contract pre-declared edges (index spaces are \
+                   widened at boot for those pairs only), so it would have nothing to \
+                   propose.");
+        }
+    }
+
     // Resolve this_host: explicit field wins, otherwise default to the
     // first node. This means a single-host YAML with no `this_host:`
     // still works — everything gets placed on the one node, and that's
@@ -880,6 +937,7 @@ fn from_new_format(raw: NewFormat, yaml_dir: &Path) -> Result<PipelineSpec> {
         spsc_ring_cap: raw.deploy.spsc_ring_cap.unwrap_or(256),
         fusible,
         morphs,
+        controller,
     })
 }
 
@@ -1003,8 +1061,10 @@ fn from_old_format(raw: OldFormat, yaml_dir: &Path) -> Result<PipelineSpec> {
         // Old-format YAMLs predate in-process edges; keep ZMQ path unchanged.
         edge_impl: "zmq".to_string(),
         spsc_ring_cap: 256,
-        // Old-format YAMLs predate runtime morphing: static topology only.
+        // Old-format YAMLs predate runtime morphing: static topology only, and
+        // so nothing for a controller to propose either.
         fusible: Vec::new(),
         morphs: Vec::new(),
+        controller: None,
     })
 }

@@ -204,6 +204,41 @@ fn cmd_validate(config_path: &Path, project_root: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+/// Copy the config this run executed into its own log directory.
+///
+/// Without this a finished run cannot say what it ran. `master.jsonl` records
+/// only the path of the GENERATED `target/epico/runtime.yaml`, which the next
+/// run overwrites — and a pipeline directory routinely holds several configs
+/// (`pipeline.yaml`, `.morph_test.yaml`, `.controller_test.yaml`, …) differing
+/// in exactly the fields that matter after the fact: `fusible:`, `morphs:`,
+/// `controller:`, scaling caps. Reading a run's results against the wrong one
+/// is silently wrong rather than obviously wrong.
+///
+/// Both files are written: the source is what a person wrote, the runtime is
+/// what the agent actually consumed, and the difference between them is where
+/// a generation bug would hide.
+///
+/// Best-effort by design. A run that cannot copy its config is still a valid
+/// run, so this warns and continues rather than failing the launch.
+fn archive_config(config_path: &Path, runtime_yaml: &Path, run_dir: &Path) {
+    let source = config_path.canonicalize().unwrap_or_else(|_| config_path.to_path_buf());
+    match std::fs::read_to_string(config_path) {
+        Ok(text) => {
+            // A header line naming the original, so the archived copy is
+            // self-identifying even once it has been moved or emailed.
+            let stamped = format!("# source: {}\n{}", source.display(), text);
+            if let Err(e) = std::fs::write(run_dir.join("config.yaml"), stamped) {
+                eprintln!("    (warning: could not archive {}: {e})", source.display());
+            }
+        }
+        Err(e) => eprintln!("    (warning: could not read {} to archive it: {e})",
+                            source.display()),
+    }
+    if let Err(e) = std::fs::copy(runtime_yaml, run_dir.join("runtime.yaml")) {
+        eprintln!("    (warning: could not archive runtime.yaml: {e})");
+    }
+}
+
 fn cmd_run(config_path: &Path, project_root: Option<&Path>, log_dir: &Path, aot: bool, jit: bool,
            no_build: bool, cold_start_opt: bool) -> Result<()> {
     if aot && jit {
@@ -283,6 +318,7 @@ fn cmd_run(config_path: &Path, project_root: Option<&Path>, log_dir: &Path, aot:
     std::fs::create_dir_all(&run_dir)
         .with_context(|| format!("creating run directory {}", run_dir.display()))?;
     std::env::set_var(epico_logger::RUN_DIR_ENV, &run_dir);
+    archive_config(config_path, &out.runtime_yaml, &run_dir);
     let log_dir_abs = run_dir;
 
     // Native source/sink (option A): build the per-pipeline agent with the

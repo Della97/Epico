@@ -13,6 +13,7 @@ use epico_logger::Logger;
 use epico_logger::error;
 use rand::Rng;
 
+use super::live::LiveCollector;
 use super::RunTelemetry;
 
 // Maximum number of raw per-event rows kept live in the collector's per-event
@@ -46,7 +47,21 @@ impl CollectorStats {
     /// Account one finished event (already parsed; EOS markers are filtered
     /// by the caller). No-op when the event carries no usable
     /// `bench_ts_wall` or its clock reads ahead of ours.
-    pub fn observe(&mut self, recv_ts: f64, test_start: f64, ev: &serde_json::Value) {
+    ///
+    /// `live` is folded from the SAME parsed hop list rather than from a second
+    /// walk of the JSON: the live per-edge windows and the summary-time
+    /// reservoir want different shapes of the same data, and re-deriving the
+    /// hops for the second consumer would put a second parse on the hot path.
+    /// `bytes` is the frame size, which the caller already holds and which
+    /// nothing downstream of the envelope can recover.
+    pub fn observe(
+        &mut self,
+        recv_ts: f64,
+        test_start: f64,
+        ev: &serde_json::Value,
+        bytes: usize,
+        live: &mut LiveCollector,
+    ) {
         let bench_ts = match ev["bench_ts_wall"].as_f64() {
             Some(v) if recv_ts > v => v,
             _ => return,
@@ -119,6 +134,18 @@ impl CollectorStats {
         // Algorithm R keeps the log a uniform, bounded sample of the whole
         // run; the reservoir is unordered — summary time sorts by recv_t_s.
         let recv_t_s = recv_ts - test_start;
+
+        // Live windows, folded before `hops_vec` is moved into the reservoir
+        // below. This is deliberately NOT derived from `per_event_log` at
+        // summary time the way `inter_stage` is: that log is a reservoir
+        // sample, uniform over the whole run, and so cannot answer "what is
+        // this edge doing right now" no matter how it is post-processed.
+        live.observe(
+            recv_t_s,
+            &hops_vec,
+            bytes,
+            ev.get("bench_key_hash").and_then(|v| v.as_u64()),
+        );
         self.events_seen += 1;
         if self.local.per_event_log.len() < EVENTS_LIVE_CAP {
             self.local.per_event_log.push((recv_t_s, lat_ms, hops_vec));

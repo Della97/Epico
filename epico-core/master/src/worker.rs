@@ -25,6 +25,19 @@ use crate::conversion::{extract_record_fields, extract_result_event_fields, Reco
 use crate::envelope::{EnvelopeFormat, EventEnvelope};
 use crate::host::HostState;
 use crate::spsc::{EdgeIn, EdgeOut};
+use crate::telemetry::live::{StageTiming, TimingAccum};
+
+/// Events between two flushes of the worker's local [`TimingAccum`] into the
+/// stage's shared counters. Small enough that a controller reading once per
+/// second never sees stale timing, large enough that the atomic traffic is
+/// negligible against the per-event work.
+const TIMING_FLUSH_EVENTS: u64 = 64;
+
+/// Upper bound on how long a partial window may sit unpublished. At low event
+/// rates 64 events can span many seconds, which would starve the controller of
+/// exactly the diagnostic it needs; the deadline is checked against the
+/// per-event `Instant` the loop already takes, so it costs no extra clock read.
+const TIMING_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// One logical stage's live instance inside a worker: its own `Store`, its own
 /// resolved `process-event`, its own cached field layout.
@@ -149,6 +162,10 @@ pub(crate) fn spawn_worker(
     event_format:   String,
     barrier:        Arc<StageEosBarrier>,
     stage_stop:     Arc<AtomicBool>,
+    // This stage's shared timing block, written by every replica. Mirrors the
+    // `live_replicas` pattern: the worker owns the measurement, a reader that
+    // keeps its own cursor owns the sampling rate. See `telemetry::live`.
+    timing:         Arc<StageTiming>,
     log:            Logger,
 ) -> WorkerHandle {
     let stage_clone       = stage.clone();
@@ -167,7 +184,7 @@ pub(crate) fn spawn_worker(
             stage_clone, replica_idx, in_ep, output_specs, input_edge, credit_window,
             engine_clone, chain_clone,
             heartbeat_clone, avg_lat_clone,
-            drain_clone, stage_stop, decision_ts, worker_ctx, event_format, barrier, log,
+            drain_clone, stage_stop, decision_ts, worker_ctx, event_format, barrier, timing, log,
         );
         done_clone.store(true, Ordering::Relaxed);
     });
@@ -354,6 +371,7 @@ fn run_wasm_worker(
     worker_ctx:     zmq::Context,
     event_format:   String,
     barrier:        Arc<StageEosBarrier>,
+    timing:         Arc<StageTiming>,
     log:            Logger,
 ) {
     let spawn_ts   = decision_ts;
@@ -703,6 +721,15 @@ fn run_wasm_worker(
     // with no extra round-trips.
     let refill_threshold: u32 = (credit_window / 2).max(1);
     let mut processed_since_refill: u32 = 0;
+    // ── Per-stage timing (D7) ────────────────────────────────────────────────
+    // The refill payload above carries the same numbers, but ONLY on the zmq
+    // path: an in-proc stage has no dispatcher to send them to, which is why
+    // every `worker_timing.*.total_us` in the phase-4 spsc/mpmc summaries reads
+    // 0.0. These counters are transport-independent, so the controller's
+    // compute-vs-overhead diagnosis works on the transports M2 actually
+    // measures. Accumulated locally, published on a window boundary.
+    let mut timing_acc = TimingAccum::default();
+    let mut last_timing_flush = Instant::now();
     // Per-half `(enter_ts, exit_ts)` for the event in flight, index-aligned with
     // `chain`. Hoisted so the hot loop allocates nothing.
     let mut hop_times: Vec<(f64, f64)> = Vec::with_capacity(chain.len());
@@ -715,6 +742,25 @@ fn run_wasm_worker(
     // Boot succeeded: this replica now counts toward the stage's live set for
     // the EOS barrier (see eos.rs — the LAST worker out forwards the marker).
     barrier.worker_started();
+
+    /// Account one finished event into the local timing window, publishing it
+    /// into the shared stage counters when the window closes. Every path out of
+    /// the event loop below (passthrough, serde bypass, typed fast path, and
+    /// the dynamic path) records exactly once, so `events` counts events rather
+    /// than iterations. `wasm_ns` is the summed per-half call time — 0 on the
+    /// host-native bypasses, which genuinely run no wasm.
+    macro_rules! record_timing {
+        ($total_t0:expr, $serde_ns:expr, $wasm_ns:expr) => {{
+            timing_acc.observe($total_t0.elapsed().as_nanos() as u64, $serde_ns, $wasm_ns);
+            if timing_acc.events >= TIMING_FLUSH_EVENTS
+                || $total_t0.saturating_duration_since(last_timing_flush)
+                    >= TIMING_FLUSH_INTERVAL
+            {
+                timing_acc.flush_into(&timing);
+                last_timing_flush = $total_t0;
+            }
+        }};
+    }
 
     // ── Event loop ────────────────────────────────────────────────────────────
     // Events may arrive batched: one ROUTER message carries
@@ -767,6 +813,7 @@ fn run_wasm_worker(
             send_all(&worker_outputs, event_owned.clone(), &never_drain);
             invocation_count += 1;
             processed_since_refill += 1;
+            record_timing!(total_t0, 0, 0);
             if worker_input.wants_credits() && processed_since_refill >= refill_threshold {
                 let total_ns = total_t0.elapsed().as_nanos() as u64;
                 let refill_payload = format!(
@@ -832,6 +879,7 @@ fn run_wasm_worker(
             send_all(&worker_outputs, out, &never_drain);
             invocation_count += 1;
             processed_since_refill += 1;
+            record_timing!(total_t0, serde_ns, 0);
             if worker_input.wants_credits() && processed_since_refill >= refill_threshold {
                 let total_ns = total_t0.elapsed().as_nanos() as u64;
                 let refill_payload = format!(
@@ -862,6 +910,7 @@ fn run_wasm_worker(
                     send_all(&worker_outputs, out_bytes, &never_drain);
                     invocation_count += 1;
                     processed_since_refill += 1;
+                    record_timing!(total_t0, serde_ns, latency_us.saturating_mul(1_000));
                     if worker_input.wants_credits()
                         && processed_since_refill >= refill_threshold
                     {
@@ -982,6 +1031,15 @@ fn run_wasm_worker(
         let total_ns = total_t0.elapsed().as_nanos() as u64;
         invocation_count += 1;
         processed_since_refill += 1;
+        // Wasm cost is summed from the per-half hop windows rather than from
+        // `latency_us`, which the wasm layer already floored to whole
+        // microseconds — at these payload sizes a call is often sub-µs, and
+        // flooring it to 0 is precisely what would make a compute-bound stage
+        // look edge-bound to the controller.
+        let wasm_ns: u64 = hop_times.iter()
+            .map(|(enter, exit)| ((exit - enter) * 1e9).max(0.0) as u64)
+            .sum();
+        record_timing!(total_t0, serde_ns, wasm_ns);
 
         // Send a refill once we've processed at least `refill_threshold`
         // events since the last one. With larger windows the refill batches credits and
@@ -1032,6 +1090,12 @@ fn run_wasm_worker(
             processed_since_refill = 0;
         }
     }
+
+    // Publish whatever the last window collected. A drain retires the replica
+    // mid-window, and during a morph that partial window is the most
+    // interesting one there is — it covers the moment the controller is trying
+    // to reason about.
+    timing_acc.flush_into(&timing);
 
     // EOS barrier: if the stage is finishing and this was the last live
     // replica, forward the marker — every sibling has already drained and

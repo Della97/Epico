@@ -1,0 +1,119 @@
+# .controller_test.yaml — the cost-model controller finding a fuse ON ITS OWN
+# (roadmap M2, phase 5d).
+#
+# This is `.morph_test.yaml` with the `morphs:` schedule REMOVED and
+# `controller:` enabled. Nothing tells the runtime what to do or when: it has to
+# read its own per-edge statistics, conclude that `normalize -> detect` is
+# edge-dominated and under pressure, and issue the fuse itself.
+#
+# What makes the conclusion available to it, and would void the test if changed:
+#
+#   * `normalize` and `detect` are minimal-compute, so the ~ms in-process edge
+#     between them genuinely dominates the ~tens-of-us wasm call. If the halves
+#     were made expensive, the CORRECT verdict would flip to "compute-bound,
+#     refuse" — which is what .controller_negative_test.yaml checks.
+#   * Sustained load rather than `pulse`: the controller reads a 5 s window and
+#     refuses to act on a stale snapshot, so a source that goes idle between
+#     bursts would (rightly) keep it holding.
+#   * max: 2 with a low `queue_up`, so the downstream stage pins at max
+#     replicas under load and the pressure clause is satisfied by something
+#     other than a momentary queue wobble.
+#   * cooldown_fuse_s is left at its 5 s default, so at most one fuse can be
+#     proposed in the run's first seconds — the assertion is "it found the
+#     morph", not "it morphed a lot".
+#
+# Run:  tests/controller_finds_the_fuse.sh   (from repo root)
+
+package: epico:controllertest@1.0.0
+
+nodes:
+  - name: local
+    host: 127.0.0.1
+    force_tcp: false
+
+types:
+  reading:
+    sensor_id: string
+    value:     f64
+
+# Sustained, not pulsed: the controller must see a live edge for several
+# consecutive seconds before it has a window to reason about at all.
+source:
+  kind: loadgen
+  profile: tp
+  count: 3000000
+  sensors: 100
+  blast: true
+
+stages:
+  - name: ingest
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/ingest.rs
+    scaling: { min: 1, max: 2, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 5.0 }
+
+  - name: normalize
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/normalize.rs
+    scaling: { min: 1, max: 2, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 5.0 }
+
+  - name: detect
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/detect.rs
+    scaling: { min: 1, max: 2, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 5.0 }
+
+  - name: finalize
+    placement: local
+    in:  reading
+    out: reading
+    src: ./stages/finalize.rs
+    scaling: { min: 1, max: 2, queue_up: 20, queue_down: 0, cooldown_up_s: 0.05, cooldown_down_s: 5.0 }
+
+edges:
+  - ingest -> normalize
+  - normalize -> detect
+  - detect -> finalize
+
+fusible:
+  - normalize -> detect
+
+# No `morphs:` block. That is the point of this fixture — enabling both is
+# refused at boot, because a scripted schedule and a controller are alternative
+# producers of the same requests rather than layers.
+
+controller:
+  enabled: true
+  # Faster than the 1.0 s default so the decision lands well inside a run this
+  # short; the rule itself is unchanged.
+  period_s: 0.25
+  # 100 us. The edge under test costs ~1-2 ms per event, so this is comfortably
+  # below the real signal while still an order of magnitude above the noise an
+  # identity redeploy produces. A deployment should calibrate rather than copy
+  # this — see the `significance_floor_us` docs in config.rs.
+  significance_floor_us: 100.0
+  window_s: 2
+  # 2 s rather than the 5 s default. The cooldown clock starts at boot, so it
+  # is also the warm-up before the FIRST decision — and this fixture has to fit
+  # a decision, a morph, and traffic on both sides of it into one short run.
+  # A deployment wants the default: >= 10x the 0.20 s break-even.
+  cooldown_fuse_s: 2.0
+
+deploy:
+  host: localhost
+  this_host: local
+  ingress: ipc:///tmp/epico-controllertest-push
+  source_format: json
+  event_format:  json
+
+  ingress_mode: inprocess
+  edge_impl: spsc
+  spsc_ring_cap: 512
+
+  credit_window: 16
+  batch_events:  1
+  resource_sample_interval_ms: 0
